@@ -154,6 +154,9 @@ export default defineConfig({
     title: "1y",
     description: "1y 编程语言官方文档 — The 1y Programming Language",
 
+    // GitHub Pages serves at https://okysu.github.io/1y/
+    base: "/1y/",
+
     // Clean URL without trailing .html
     cleanUrls: true,
 
