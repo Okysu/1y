@@ -72,6 +72,9 @@ pub fn register(env: &EnvRef) {
         ("cos", NativeFn { name: "cos", func: bi_cos }),
         ("log", NativeFn { name: "log", func: bi_log }),
         ("exp", NativeFn { name: "exp", func: bi_exp }),
+        // --- async (Phase 4.7: Task combinators) ---
+        ("task_all", NativeFn { name: "task_all", func: bi_task_all }),
+        ("task_any", NativeFn { name: "task_any", func: bi_task_any }),
     ];
     for (name, nf) in entries {
         env.borrow_mut().define(*name, Value::Native(std::rc::Rc::new(nf.clone())));
@@ -637,4 +640,121 @@ fn bi_exp(args: &[Value]) -> Result<Value, InterpreterError> {
     let v = one_arg(args, "exp")?;
     let f = num_to_f64(&v, "exp")?;
     f64_to_decimal(f.exp(), "exp")
+}
+
+// ---------------------------------------------------------------------------
+// Task combinators (Phase 4.7: colorless async)
+// ---------------------------------------------------------------------------
+
+/// `task_all([t1, t2, ...]) -> Task<Vec<value>>`
+///
+/// Returns a Task that completes when ALL input tasks complete.
+/// On each poll, checks every child task; if any is still Pending,
+/// the combined task is Pending. When all are Ready, collects their
+/// values into a Vec and completes.
+///
+/// Child tasks are consumed (marked Consumed) when they complete.
+fn bi_task_all(args: &[Value]) -> Result<Value, InterpreterError> {
+    let v = one_arg(args, "task_all")?;
+    let tasks: Vec<crate::value::TaskRef> = match &v {
+        Value::Vec(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for (i, item) in items.iter().enumerate() {
+                match item {
+                    Value::Task(t) => out.push(t.clone()),
+                    other => return Err(InterpreterError::TypeError {
+                        expected: "Task", got: other.type_name(),
+                        op: format!("task_all[{}]", i), span: None,
+                    }),
+                }
+            }
+            out
+        }
+        other => return Err(InterpreterError::TypeError {
+            expected: "Vec", got: other.type_name(), op: "task_all".into(), span: None,
+        }),
+    };
+
+    let combined = crate::value::TaskState::Pending(Box::new(move || {
+        let mut results = Vec::with_capacity(tasks.len());
+        for t in &tasks {
+            let val = {
+                let task_ref = t.borrow();
+                match &*task_ref {
+                    crate::value::TaskState::Ready(v) => v.clone(),
+                    crate::value::TaskState::Consumed => Value::Nil,
+                    crate::value::TaskState::Pending(f) => match f() {
+                        crate::value::TaskPoll::Ready(v) => v,
+                        crate::value::TaskPoll::Pending => return crate::value::TaskPoll::Pending,
+                    },
+                }
+            };
+            // Mark consumed if it was Ready or just became Ready.
+            {
+                let mut task_ref = t.borrow_mut();
+                if !matches!(*task_ref, crate::value::TaskState::Consumed) {
+                    *task_ref = crate::value::TaskState::Consumed;
+                }
+            }
+            results.push(val);
+        }
+        crate::value::TaskPoll::Ready(Value::vec(results))
+    }));
+    Ok(Value::Task(std::rc::Rc::new(std::cell::RefCell::new(combined))))
+}
+
+/// `task_any([t1, t2, ...]) -> Task<value>`
+///
+/// Returns a Task that completes when ANY input task completes.
+/// On each poll, checks every child task; the first one that is Ready
+/// (or becomes Ready during poll) completes the combined task with that
+/// value. If all are still Pending, the combined task is Pending.
+///
+/// Only the winning child task is consumed; others remain untouched.
+fn bi_task_any(args: &[Value]) -> Result<Value, InterpreterError> {
+    let v = one_arg(args, "task_any")?;
+    let tasks: Vec<crate::value::TaskRef> = match &v {
+        Value::Vec(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for (i, item) in items.iter().enumerate() {
+                match item {
+                    Value::Task(t) => out.push(t.clone()),
+                    other => return Err(InterpreterError::TypeError {
+                        expected: "Task", got: other.type_name(),
+                        op: format!("task_any[{}]", i), span: None,
+                    }),
+                }
+            }
+            out
+        }
+        other => return Err(InterpreterError::TypeError {
+            expected: "Vec", got: other.type_name(), op: "task_any".into(), span: None,
+        }),
+    };
+
+    let combined = crate::value::TaskState::Pending(Box::new(move || {
+        for t in &tasks {
+            let ready_val = {
+                let task_ref = t.borrow();
+                match &*task_ref {
+                    crate::value::TaskState::Ready(v) => Some(v.clone()),
+                    crate::value::TaskState::Consumed => None,
+                    crate::value::TaskState::Pending(f) => match f() {
+                        crate::value::TaskPoll::Ready(v) => Some(v),
+                        crate::value::TaskPoll::Pending => None,
+                    },
+                }
+            };
+            if let Some(v) = ready_val {
+                // Consume the winning task.
+                {
+                    let mut task_ref = t.borrow_mut();
+                    *task_ref = crate::value::TaskState::Consumed;
+                }
+                return crate::value::TaskPoll::Ready(v);
+            }
+        }
+        crate::value::TaskPoll::Pending
+    }));
+    Ok(Value::Task(std::rc::Rc::new(std::cell::RefCell::new(combined))))
 }

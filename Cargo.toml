@@ -38,6 +38,8 @@ webpki-roots = "0.26"
 libloading = "0.8"
 # Phase 4.7: stackful coroutines for colorless async (Zig-style)
 corosensei = "0.2"
+# Phase 4.8: mio for I/O multiplexing (epoll/kqueue/IOCP)
+mio = { version = "0.8", features = ["os-poll", "net"] }
 
 [dev-dependencies]
 proptest = "1"

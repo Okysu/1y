@@ -1040,6 +1040,14 @@ impl Interpreter {
                 }
             }
 
+            Expr::SharedExpr { expr, span: _ } => {
+                // `shared expr` — create a SharedRef wrapping the evaluated value.
+                let v = self.eval_expr(env, expr)?;
+                let cell = crate::value::SharedCell { value: v, version: 0 };
+                let sref: SharedRef = Rc::new(RefCell::new(cell));
+                Ok(Value::Shared(sref))
+            }
+
             // --- actors ---
             Expr::Spawn { name, args, span } => {
                 let ad = self.actors.get(name).cloned().ok_or_else(|| {

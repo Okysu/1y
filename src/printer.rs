@@ -363,6 +363,11 @@ fn print_expr(out: &mut String, w: &mut Writer, label: &str, e: &Expr) {
             print_expr(out, w, "expr", expr);
             w.pop();
         }
+        Expr::SharedExpr { expr, .. } => {
+            w.push();
+            print_expr(out, w, "expr", expr);
+            w.pop();
+        }
         Expr::Assign { target, value, .. } => {
             w.push();
             print_expr(out, w, "target", target);
@@ -439,6 +444,7 @@ fn expr_head(e: &Expr) -> String {
         Expr::Reply { .. } => "Reply".into(),
         Expr::Yield { .. } => "Yield".into(),
         Expr::Await { .. } => "Await".into(),
+        Expr::SharedExpr { .. } => "SharedExpr".into(),
         Expr::Assign { .. } => "Assign".into(),
         Expr::CompoundAssign { op, .. } => format!("CompoundAssign({})", op.as_str()),
         Expr::While { .. } => "While".into(),

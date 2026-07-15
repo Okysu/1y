@@ -296,6 +296,10 @@ pub enum Expr {
     /// If the Task is already complete, returns immediately (sync path).
     /// Any function can use `await` — there is no function coloring (Zig-style).
     Await { expr: Box<Expr>, span: Span },
+    /// `shared expr` — create a shared transactional cell wrapping the value.
+    /// Returns a `Value::Shared`. Can be used as an expression:
+    /// `let x = shared 0;` or as a statement: `shared x = 0;`.
+    SharedExpr { expr: Box<Expr>, span: Span },
 
     /// `target = value` — assignment (returns `nil`). `target` is an lvalue
     /// ([`Expr::Ident`], [`Expr::Field`], [`Expr::Index`]).
@@ -375,6 +379,7 @@ impl Expr {
             | Expr::Reply { span: s, .. }
             | Expr::Yield { span: s }
             | Expr::Await { span: s, .. }
+            | Expr::SharedExpr { span: s, .. }
             | Expr::Assign { span: s, .. }
             | Expr::CompoundAssign { span: s, .. }
             | Expr::While { span: s, .. }

@@ -144,6 +144,10 @@ fn bi_read(args: &[Value]) -> Result<Value, InterpreterError> {
 /// `socket.read_async(stream, n) -> Task<Str|Nil>` — async non-blocking read.
 /// Returns a Task that polls the stream (which must be in non-blocking mode).
 /// When data is available, completes with `Str`. On EOF, completes with `Nil`.
+///
+/// The stream is registered with the scheduler's mio::Poll for event-driven
+/// I/O multiplexing — the Task is only polled when mio reports the stream
+/// as readable, avoiding O(n) polling of all parked Tasks.
 fn bi_read_async(args: &[Value]) -> Result<Value, InterpreterError> {
     let r = opaque_at(args, 0, "socket.read_async")?;
     let n = match args.get(1) {
@@ -157,13 +161,12 @@ fn bi_read_async(args: &[Value]) -> Result<Value, InterpreterError> {
     };
     match &*r {
         NativeResource::TcpStream(s) => {
-            // Clone the Rc<RefCell<TcpStream>> so the poll closure can access it.
-            let s = s.clone();
-            let task = crate::value::TaskState::Pending(Box::new(move || {
+            let s_for_closure = s.clone();
+            let task_state = crate::value::TaskState::Pending(Box::new(move || {
                 use std::io::Read;
                 let mut buf = vec![0u8; n];
-                match s.borrow_mut().read(&mut buf) {
-                    Ok(0) => crate::value::TaskPoll::Ready(Value::Nil), // EOF
+                match s_for_closure.borrow_mut().read(&mut buf) {
+                    Ok(0) => crate::value::TaskPoll::Ready(Value::Nil),
                     Ok(read) => {
                         buf.truncate(read);
                         crate::value::TaskPoll::Ready(Value::str(
@@ -173,10 +176,16 @@ fn bi_read_async(args: &[Value]) -> Result<Value, InterpreterError> {
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         crate::value::TaskPoll::Pending
                     }
-                    Err(_) => crate::value::TaskPoll::Ready(Value::Nil), // error → treat as EOF
+                    Err(_) => crate::value::TaskPoll::Ready(Value::Nil),
                 }
             }));
-            Ok(Value::Task(std::rc::Rc::new(std::cell::RefCell::new(task))))
+            let task_ref = std::rc::Rc::new(std::cell::RefCell::new(task_state));
+            // Register the stream with the scheduler's mio::Poll for
+            // event-driven readiness notification. This makes the scheduler
+            // only poll this Task when the stream is actually readable.
+            // `s` is still alive here (only `s_for_closure` was moved).
+            crate::runtime::scheduler::register_readable(&s.borrow(), &task_ref);
+            Ok(Value::Task(task_ref))
         }
         _ => Err(InterpreterError::TypeError {
             expected: "TcpStream", got: "opaque", op: "socket.read_async".into(), span: None,

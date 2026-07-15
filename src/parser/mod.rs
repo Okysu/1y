@@ -214,7 +214,18 @@ impl Parser {
         let start = self.span_here();
         match *self.peek() {
             TokenKind::Keyword(Keyword::Let) => self.parse_let(start),
-            TokenKind::Keyword(Keyword::Shared) => self.parse_shared(start),
+            TokenKind::Keyword(Keyword::Shared) => {
+                // `shared name = value` → statement form
+                // `shared expr` (e.g. `let x = shared 0;`) → expression form
+                // Distinguish by peeking: statement form requires `shared ident [=|:]`.
+                if matches!(self.peek_at(1), TokenKind::Ident(_))
+                    && matches!(self.peek_at(2), TokenKind::Assign | TokenKind::Colon)
+                {
+                    self.parse_shared(start)
+                } else {
+                    self.parse_expr_stmt()
+                }
+            }
             TokenKind::Keyword(Keyword::Fn) => {
                 // `fn name(...)` → func def; `fn(...)` → lambda expr statement.
                 if matches!(self.peek_at(1), TokenKind::Ident(_)) {
@@ -959,6 +970,16 @@ impl Parser {
                 self.bump();
                 let e = self.parse_expr(0)?;
                 Ok(Expr::Await {
+                    expr: Box::new(e),
+                    span: start.union(self.prev_span()),
+                })
+            }
+            TokenKind::Keyword(Keyword::Shared) => {
+                // `shared expr` as an expression — creates a SharedRef.
+                // (The statement form `shared name = value` is handled in parse_stmt.)
+                self.bump();
+                let e = self.parse_expr(0)?;
+                Ok(Expr::SharedExpr {
                     expr: Box::new(e),
                     span: start.union(self.prev_span()),
                 })
