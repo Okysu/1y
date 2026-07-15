@@ -1,0 +1,238 @@
+// lib/http.1y — HTTP/1.1 server implemented in pure 1y (self-hosted).
+//
+// Built on the `socket` standard library. Provides:
+//
+//   http.serve(addr, handler)              — start a blocking HTTP server
+//   http.parse_request(raw)                — parse a raw HTTP request string
+//   http.response(status, body, headers)   — build a raw HTTP response string
+//   http.json_response(status, body)       — shortcut for JSON responses
+//   http.html_response(status, body)       — shortcut for HTML responses
+//   http.status_text(code)                 — human-readable status text
+//   http.not_found()                        — build a 404 response
+//
+// `handler` is a function that receives a request Map:
+//   \{ "method": "GET", "path": "/", "version": "HTTP/1.1",
+//     "headers": <Map>, "body": <Str> \}
+// and returns a Map:
+//   \{ "status": 200, "body": "<html>...</html>",
+//      "headers": ["Content-Type: text/html"] \}
+//
+// `headers` is a Vec of "Key: Value" strings — this avoids needing Map
+// iteration which 1y doesn't currently support natively.
+
+import socket;
+
+// ---------------------------------------------------------------------------
+// Status text lookup
+// ---------------------------------------------------------------------------
+
+fn status_text(code) -> Str {
+    match code {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        304 => "Not Modified",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        409 => "Conflict",
+        418 => "I'm a teapot",
+        422 => "Unprocessable Entity",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        501 => "Not Implemented",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        _ => "Unknown"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Response builders
+// ---------------------------------------------------------------------------
+
+// Build a raw HTTP response string.
+// `status`  — Int (e.g. 200)
+// `body`    — Str (response body)
+// `headers` — Vec of "Key: Value" strings (may be empty [])
+// Content-Length is always added automatically.
+fn response(status, body, headers) -> Str {
+    let reason = status_text(status);
+    let out = "HTTP/1.1 " + str(status) + " " + reason + "\r\n";
+
+    // Append caller-supplied headers.
+    let i = 0;
+    while i < count(headers) {
+        out = out + headers[i] + "\r\n";
+        i += 1
+    };
+
+    // Always add Content-Length.
+    out = out + "Content-Length: " + str(len(body)) + "\r\n";
+    out = out + "\r\n" + body;
+    out
+}
+
+// Shortcut: JSON response.
+fn json_response(status, body) -> Str {
+    response(status, body, ["Content-Type: application/json; charset=utf-8"])
+}
+
+// Shortcut: HTML response.
+fn html_response(status, body) -> Str {
+    response(status, body, ["Content-Type: text/html; charset=utf-8"])
+}
+
+// Shortcut: plain text response.
+fn text_response(status, body) -> Str {
+    response(status, body, ["Content-Type: text/plain; charset=utf-8"])
+}
+
+// Build a 404 Not Found response.
+fn not_found() -> Str {
+    html_response(404, "<h1>404 Not Found</h1>")
+}
+
+// ---------------------------------------------------------------------------
+// Request parser
+// ---------------------------------------------------------------------------
+
+// Find the index of the first occurrence of `needle` in `haystack`.
+// Returns -1 if not found.
+fn index_of(haystack, needle) -> Int {
+    let hl = len(haystack);
+    let nl = len(needle);
+    if nl == 0 { return 0 };
+    if nl > hl { return -1 };
+    let i = 0;
+    while i <= hl - nl {
+        if substring(haystack, i, i + nl) == needle {
+            return i
+        };
+        i += 1
+    };
+    -1
+}
+
+// Parse an HTTP request string into a Map.
+// Returns Nil on malformed input.
+fn parse_request(raw) {
+    // Split headers from body at the first blank line (\r\n\r\n).
+    let sep_idx = index_of(raw, "\r\n\r\n");
+
+    // Determine head and body based on separator position.
+    let head = if sep_idx >= 0 {
+        substring(raw, 0, sep_idx)
+    } else {
+        let sep2 = index_of(raw, "\n\n");
+        if sep2 >= 0 {
+            substring(raw, 0, sep2)
+        } else {
+            raw
+        }
+    };
+
+    let body = if sep_idx >= 0 {
+        substring(raw, sep_idx + 4, len(raw))
+    } else {
+        let sep2 = index_of(raw, "\n\n");
+        if sep2 >= 0 {
+            substring(raw, sep2 + 2, len(raw))
+        } else {
+            ""
+        }
+    };
+
+    // Split head into lines.
+    let lines = split(head, "\r\n");
+    if count(lines) == 0 { return nil };
+
+    // Parse request line: METHOD PATH VERSION
+    let first_line = lines[0];
+    let parts = split(first_line, " ");
+    if count(parts) < 2 { return nil };
+
+    let method = parts[0];
+    let path = parts[1];
+    let version = if count(parts) >= 3 { parts[2] } else { "HTTP/1.0" };
+
+    // Validate: method must be uppercase letters, path starts with /.
+    if len(method) == 0 or substring(path, 0, 1) != "/" { return nil };
+
+    // Parse headers into a Map.
+    // Note: \{} is an empty block in 1y, not an empty Map. We seed with a
+    // placeholder entry and build via assoc, then dissoc the placeholder.
+    let headers = \{ "_init": nil \};
+    let idx = 1;
+    while idx < count(lines) {
+        let line = lines[idx];
+        if len(line) > 0 {
+            let colon_idx = index_of(line, ":");
+            if colon_idx > 0 {
+                let key = trim(substring(line, 0, colon_idx));
+                let val = trim(substring(line, colon_idx + 1, len(line)));
+                headers = assoc(headers, key, val)
+            }
+        };
+        idx += 1
+    };
+
+    // Remove the placeholder key.
+    headers = dissoc(headers, "_init");
+
+    \{ "method": method, "path": path, "version": version, "headers": headers, "body": body \}
+}
+
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
+
+// Start a blocking HTTP server.
+// `addr`     — "host:port" string (e.g. "127.0.0.1:8080")
+// `handler`  — function(req_map) -> \{ "status": Int, "body": Str, "headers": Vec \}
+fn serve(addr, handler) {
+    let listener = socket.listen(addr);
+    println("1y http server listening on " + addr);
+
+    loop {
+        let stream = socket.accept(listener);
+        let raw = socket.read(stream, 65536);
+
+        if is_nil(raw) {
+            socket.close(stream);
+            continue
+        };
+
+        let req = parse_request(raw);
+        if is_nil(req) {
+            socket.write(stream, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+            socket.close(stream);
+            continue
+        };
+
+        // Call the handler. If it throws, return a 500.
+        let resp = try {
+            handler(req)
+        } rescue {
+            \{ "status": 500, "body": "Internal Server Error", "headers": [] \}
+        };
+
+        // Normalize the handler's return value.
+        let status = get(resp, "status");
+        let s = if is_nil(status) { 200 } else { status };
+
+        let body = get(resp, "body");
+        let b = if is_nil(body) { "" } else { body };
+
+        let headers = get(resp, "headers");
+        let h = if is_nil(headers) { [] } else { headers };
+
+        let resp_str = response(s, b, h);
+        socket.write(stream, resp_str);
+        socket.close(stream)
+    }
+}

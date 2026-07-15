@@ -1,0 +1,51 @@
+// examples/http_server.1y — HTTP server demo using the self-hosted http library.
+//
+// Run with:  1y run examples/http_server.1y
+// Then open: http://127.0.0.1:8080/
+//
+// This example demonstrates:
+//   1. Importing a pure-1y library (lib/http.1y)
+//   2. Defining route handlers
+//   3. Serving HTML and JSON responses
+//
+// Note: `import lib.http` resolves to examples/lib/http.1y.
+
+import lib.http as http;
+
+// Simple route handler.
+fn handler(req) {
+    let path = get(req, "path");
+    let method = get(req, "method");
+
+    println(method + " " + path);
+
+    // Route: GET /
+    if path == "/" {
+        let body = "<!DOCTYPE html>\n<html><head><title>1y HTTP Server</title></head>\n<body>\n<h1>Hello from 1y!</h1>\n<p>This page is served by a web server written entirely in 1y.</p>\n<ul>\n<li><a href=\"/json\">/json - JSON response</a></li>\n<li><a href=\"/hello\">/hello - Greeting</a></li>\n<li><a href=\"/status\">/status - Server status</a></li>\n</ul>\n</body></html>";
+        return \{ "status": 200, "body": body, "headers": ["Content-Type: text/html; charset=utf-8"] \}
+    };
+
+    // Route: GET /json
+    if path == "/json" {
+        let body = "\{ \"message\": \"Hello, World!\", \"language\": \"1y\", \"self_hosted\": true \}";
+        return \{ "status": 200, "body": body, "headers": ["Content-Type: application/json; charset=utf-8"] \}
+    };
+
+    // Route: GET /hello
+    if path == "/hello" {
+        return \{ "status": 200, "body": "Hello, World!", "headers": ["Content-Type: text/plain; charset=utf-8"] \}
+    };
+
+    // Route: GET /status
+    if path == "/status" {
+        let body = "\{ \"status\": \"running\", \"server\": \"1y-self-hosted\" \}";
+        return \{ "status": 200, "body": body, "headers": ["Content-Type: application/json; charset=utf-8"] \}
+    };
+
+    // 404 for everything else.
+    \{ "status": 404, "body": "<h1>404 Not Found</h1><p>No route for " + path + "</p>", "headers": ["Content-Type: text/html; charset=utf-8"] \}
+}
+
+println("Starting 1y HTTP server on http://127.0.0.1:8080/");
+println("Press Ctrl+C to stop.");
+http.serve("127.0.0.1:8080", handler)
