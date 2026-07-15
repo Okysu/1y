@@ -1,0 +1,240 @@
+// Phase 3.5 example program for the `1y` language.
+// Demonstrates the "infrastructure" additions: loops, compound assignment,
+// higher-order collection functions, string operations, and math functions.
+//
+// Run with:  1y run examples/phase3.5.1y
+
+// ---------------------------------------------------------------------------
+// 1. while loop + compound assignment
+// ---------------------------------------------------------------------------
+
+println("=== while + compound assignment ===");
+
+let i = 0;
+let sum = 0;
+while i < 10 {
+    sum += i;       // compound assignment: sum = sum + i
+    i += 1
+};
+println("sum 0..9 = " + str(sum));          // 45
+
+// ---------------------------------------------------------------------------
+// 2. for...in over different iterables
+// ---------------------------------------------------------------------------
+
+println("=== for...in ===");
+
+// Vec: iterate elements
+let total = 0;
+for x in [10, 20, 30] {
+    total += x
+};
+println("vec sum = " + str(total));         // 60
+
+// Str: iterate characters
+let chars = "";
+for c in "hi" {
+    chars += c + "-"
+};
+println("chars = " + chars);                 // h-i-
+
+// Map: iterate [key, value] pairs
+let kv_sum = 0;
+for pair in { "a": 1, "b": 2, "c": 3 } {
+    kv_sum += pair[1]
+};
+println("map value sum = " + str(kv_sum));   // 6
+
+// ---------------------------------------------------------------------------
+// 3. loop / break / continue
+// ---------------------------------------------------------------------------
+
+println("=== loop / break / continue ===");
+
+// loop with break value — find first multiple of 7 >= 50
+let n = 50;
+let found = loop {
+    if n % 7 == 0 { break n };
+    n += 1
+};
+println("first multiple of 7 >= 50: " + str(found));   // 56
+
+// continue: sum odd numbers 1..10
+let odd_sum = 0;
+let k = 0;
+while k < 10 {
+    k += 1;
+    if k % 2 == 0 { continue };
+    odd_sum += k
+};
+println("odd sum 1..10 = " + str(odd_sum));   // 25 (1+3+5+7+9)
+
+// ---------------------------------------------------------------------------
+// 4. Higher-order functions: map / filter / fold / reduce / find / each
+// ---------------------------------------------------------------------------
+
+println("=== higher-order functions ===");
+
+let nums = [1, 2, 3, 4, 5, 6];
+
+// map: square each element
+let squares = map(nums, fn(x) { x * x });
+println("squares = " + str(squares));        // [1, 4, 9, 16, 25, 36]
+
+// filter: keep even numbers
+let evens = filter(nums, fn(x) { x % 2 == 0 });
+println("evens = " + str(evens));            // [2, 4, 6]
+
+// fold: sum with initial value
+let grand_total = fold(nums, 0, fn(acc, x) { acc + x });
+println("fold sum = " + str(grand_total));   // 21
+
+// reduce: product without initial value
+let product = reduce(nums, fn(a, b) { a * b });
+println("reduce product = " + str(product)); // 720
+
+// find: first element > 3
+let first_big = find(nums, fn(x) { x > 3 });
+println("first > 3 = " + str(first_big));    // 4
+
+// each: side-effect over collection
+let each_count = 0;
+each(nums, fn(x) { each_count += 1 });
+println("each visited = " + str(each_count)); // 6
+
+// Chained pipeline: filter → map → fold
+let pipeline_result = nums
+    |> filter(fn(x) { x % 2 == 0 })
+    |> map(fn(x) { x * 10 })
+    |> fold(0, fn(a, b) { a + b });
+println("pipeline = " + str(pipeline_result)); // 120 (20+40+60)
+
+// ---------------------------------------------------------------------------
+// 5. String operations
+// ---------------------------------------------------------------------------
+
+println("=== string operations ===");
+
+let s = "  hello, world  ";
+let trimmed = trim(s);
+println("trimmed = \"" + trimmed + "\"");        // "hello, world"
+
+let parts = split("a,b,c,d", ",");
+println("split count = " + str(len(parts)));      // 4
+
+let joined = join([1, 2, 3], "-");
+println("joined = " + joined);                    // 1-2-3
+
+let replaced = replace("hello world", "world", "1y");
+println("replaced = " + replaced);                // hello 1y
+
+println("contains 'world': " + str(contains(trimmed, "world")));  // true
+println("substring(0,5) = " + substring(trimmed, 0, 5));           // hello
+
+// Unicode-aware length
+println("len('你好') = " + str(len("你好")));      // 2
+
+// ---------------------------------------------------------------------------
+// 6. Math functions
+// ---------------------------------------------------------------------------
+
+println("=== math functions ===");
+
+println("min(3, 7) = " + str(min(3, 7)));          // 3
+println("max(3.5, 2) = " + str(max(3.5, 2)));      // 3.5
+println("floor(3.9) = " + str(floor(3.9)));        // 3
+println("ceil(3.1) = " + str(ceil(3.1)));          // 4
+println("round(2.5) = " + str(round(2.5)));        // 3
+println("sqrt(144) = " + str(sqrt(144)));          // 12
+
+// Pythagorean theorem: sqrt(3² + 4²) = 5
+println("hypotenuse(3,4) = " + str(sqrt(9 + 16))); // 5
+
+// Trigonometry
+println("sin(0) = " + str(sin(0)));                // 0
+println("cos(0) = " + str(cos(0)));                // 1
+
+// Logarithms
+println("log(100, 10) = " + str(log(100, 10)));    // 2
+println("log(256, 2) = " + str(log(256, 2)));      // 8
+
+// Exponential
+println("exp(0) = " + str(exp(0)));                // 1
+
+// ---------------------------------------------------------------------------
+// 7. Practical: iterative Fibonacci (no recursion, no stack overflow)
+// ---------------------------------------------------------------------------
+
+println("=== practical: iterative fibonacci ===");
+
+fn fib_iter(n) -> Int {
+    let a = 0;
+    let b = 1;
+    let count = 0;
+    while count < n {
+        let temp = a + b;
+        a = b;
+        b = temp;
+        count += 1
+    };
+    a
+};
+println("fib(10) = " + str(fib_iter(10)));         // 55
+println("fib(50) = " + str(fib_iter(50)));         // 12586269025
+
+// ---------------------------------------------------------------------------
+// 8. Practical: word frequency counter
+// ---------------------------------------------------------------------------
+
+println("=== practical: word frequency ===");
+
+fn word_freq(text) -> Int {
+    let words = split(text, " ");
+    let total = 0;
+    each(words, fn(w) {
+        if len(trim(w)) > 0 { total += 1 }
+    });
+    total
+};
+println("word count = " + str(word_freq("the quick brown fox")));  // 4
+
+// ---------------------------------------------------------------------------
+// 9. Practical: CSV parsing with map + filter
+// ---------------------------------------------------------------------------
+
+println("=== practical: CSV parsing ===");
+
+let csv = "name,age\nAlice,30\nBob,25\nCharlie,35";
+let lines = split(csv, "\n");
+let data_lines = filter(lines, fn(line) {
+    not contains(line, "name")
+});
+let names = map(data_lines, fn(line) {
+    let fields = split(line, ",");
+    fields[0]
+});
+println("names = " + str(names));    // ["Alice", "Bob", "Charlie"]
+
+// ---------------------------------------------------------------------------
+// 10. Practical: numeric statistics with reduce + min/max
+// ---------------------------------------------------------------------------
+
+println("=== practical: statistics ===");
+
+let data = [42, 17, 89, 3, 56, 71, 28];
+
+let mean = fold(data, 0, fn(a, b) { a + b }) / len(data);
+println("mean = " + str(mean));      // 43.714...
+
+// Find min and max in one pass via loop
+let lo = data[0];
+let hi = data[0];
+for x in data {
+    lo = min(lo, x);
+    hi = max(hi, x)
+};
+println("min = " + str(lo));         // 3
+println("max = " + str(hi));         // 89
+println("range = " + str(hi - lo));  // 86
+
+println("=== Phase 3.5 complete ===");

@@ -1,0 +1,241 @@
+// Phase 3 example program for the `1y` language.
+// Demonstrates transactional memory: `shared` refs, `transact` with
+// snapshot isolation + atomic commit/rollback, nested transactions,
+// `retry`, COW collections, and actors coordinating over shared state.
+//
+// Run with:  1y run examples/phase3.1y
+
+// ---------------------------------------------------------------------------
+// 1. Basic `shared` declaration + read
+// ---------------------------------------------------------------------------
+
+println("=== shared declaration ===");
+
+shared answer = 42;
+println("answer = " + str(answer));          // 42
+
+// A `shared` binding is a versioned mutable cell. Reading the name auto-
+// dereferences the cell and returns its current value.
+
+// ---------------------------------------------------------------------------
+// 2. Direct write outside a transaction (bumps the version)
+// ---------------------------------------------------------------------------
+
+println("=== direct write ===");
+
+shared counter = 0;
+counter = 10;
+counter = counter + 5;
+println("counter = " + str(counter));        // 15
+
+// Outside a `transact`, assigning to a `shared` ref writes through directly
+// and bumps the cell's version (used for conflict detection later).
+
+// ---------------------------------------------------------------------------
+// 3. `transact` — atomic commit of multiple writes
+// ---------------------------------------------------------------------------
+
+println("=== atomic commit ===");
+
+shared a = 0;
+shared b = 0;
+transact {
+    a = a + 10;
+    b = b + 20;
+    a = a + 1
+};
+println("a = " + str(a) + ", b = " + str(b));   // a = 11, b = 20
+
+// The transaction buffers writes in a write-set and applies them all at
+// once on commit. The body's tail value is the transaction's result.
+
+let r = transact {
+    a = a + 1;
+    a * 2
+};
+println("transact returned: " + str(r));         // (11+1)*2 = 24
+
+// ---------------------------------------------------------------------------
+// 4. Snapshot isolation — read your own writes inside the transaction
+// ---------------------------------------------------------------------------
+
+println("=== snapshot isolation ===");
+
+shared x = 0;
+let snap = transact {
+    x = x + 1;
+    // Reading x again sees the buffered write (1), not the committed 0.
+    x = x + 1;
+    x
+};
+println("snap = " + str(snap) + ", x = " + str(x));   // snap = 2, x = 2
+
+// ---------------------------------------------------------------------------
+// 5. Atomic rollback on exception
+// ---------------------------------------------------------------------------
+
+println("=== rollback on exception ===");
+
+shared balance = 100;
+try {
+    transact {
+        balance = balance + 50;
+        raise "something went wrong"
+    }
+} rescue as _e {
+    println("caught: " + _e)
+};
+println("balance after rollback = " + str(balance));   // still 100
+
+// The exception unwinds the transaction; all buffered writes are discarded
+// and the committed value is untouched.
+
+// ---------------------------------------------------------------------------
+// 6. Nested transactions — inner commit merges into the parent
+// ---------------------------------------------------------------------------
+
+println("=== nested commit ===");
+
+shared n = 0;
+transact {
+    n = n + 1;
+    transact {
+        n = n + 1
+    };
+    n
+};
+println("n = " + str(n));                       // 0 -> 1 -> 2
+
+// A nested `transact` does not write through directly. Its writes merge
+// into the outer transaction's write-set and are applied together when
+// the outermost transaction commits.
+
+// ---------------------------------------------------------------------------
+// 7. Nested rollback — only the inner writes are discarded
+// ---------------------------------------------------------------------------
+
+println("=== nested rollback ===");
+
+shared m = 0;
+transact {
+    m = m + 1;                                  // m = 1 (in parent write-set)
+    try {
+        transact {
+            m = m + 10;                         // m = 11 (in inner write-set)
+            raise "inner fail"
+        }
+    } rescue as _e {
+        nil
+    };
+    m
+};
+println("m = " + str(m));                       // inner rolled back -> m = 1
+
+// ---------------------------------------------------------------------------
+// 8. `retry` — restart the transaction on a condition
+// ---------------------------------------------------------------------------
+
+println("=== retry ===");
+
+// `let` variables are NOT buffered by the transaction, so they persist
+// across retries. Only `shared` writes are discarded on retry. This makes
+// `retry` useful for waiting until a condition can be met.
+let attempts = 0;
+shared ready = 0;
+let result = transact {
+    attempts = attempts + 1;
+    if attempts < 3 { retry };
+    ready = 99;
+    ready + attempts
+};
+println("result = " + str(result) + ", attempts = " + str(attempts));  // 102, 3
+
+// ---------------------------------------------------------------------------
+// 9. COW collections — shared vector with rollback
+// ---------------------------------------------------------------------------
+
+println("=== COW collections ===");
+
+shared data = [1, 2, 3];
+let before = count(data);
+try {
+    transact {
+        data = push(data, 4);
+        data = push(data, 5);
+        raise "rollback me"
+    }
+} rescue as _e {
+    nil
+};
+let after = count(data);
+println("before = " + str(before) + ", after = " + str(after));   // 3, 3
+
+// `push` returns a new vector (structural sharing). The transaction
+// buffered the new vectors, but on rollback the shared ref keeps pointing
+// at the original [1, 2, 3].
+
+// ---------------------------------------------------------------------------
+// 10. Actors coordinating over shared transactional state
+// ---------------------------------------------------------------------------
+
+println("=== shared bank (actors + transact) ===");
+
+// Two accounts live in `shared` refs. A transfer actor debits one and
+// credits the other inside a single `transact`, so the transfer is atomic:
+// either both sides move, or neither does.
+
+shared acct_a = 1000;
+shared acct_b = 0;
+
+actor Teller {
+    on transfer(amount) {
+        transact {
+            acct_a = acct_a - amount;
+            acct_b = acct_b + amount;
+            reply(acct_a)
+        }
+    }
+    on total() {
+        reply(acct_a + acct_b)
+    }
+}
+
+let teller = spawn Teller();
+
+// A few atomic transfers.
+fn loop_n(n) {
+    if n > 0 {
+        teller ? transfer(1);
+        loop_n(n - 1)
+    }
+}
+
+loop_n(5);
+let total = teller ? total();
+println("after 5 transfers: acct_a + acct_b = " + str(total));   // 1000
+
+// A failed transfer (raises mid-transaction) leaves both accounts intact.
+shared acct_c = 200;
+shared acct_d = 0;
+actor SafeTransfer {
+    on move(amount) {
+        try {
+            transact {
+                acct_c = acct_c - amount;
+                if amount > 50 { raise "too big" };
+                acct_d = acct_d + amount;
+                reply(acct_d)
+            }
+        } rescue as _e {
+            reply(-1)
+        }
+    }
+}
+
+let st = spawn SafeTransfer();
+let ok1 = st ? move(10);        // ok: c=190, d=10 -> replies 10
+let ok2 = st ? move(100);       // too big -> rolled back: c=190, d=10 -> replies -1
+println("move 10 -> " + str(ok1) + ", move 100 -> " + str(ok2));
+println("acct_c = " + str(acct_c) + ", acct_d = " + str(acct_d));   // 190, 10
+
+println("=== Done ===");

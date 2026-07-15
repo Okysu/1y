@@ -1,0 +1,249 @@
+// Phase 1 example program for the `1y` language.
+// Demonstrates the tree-walking evaluator: arbitrary-precision arithmetic,
+// persistent collections, pattern matching, closures, exceptions, pipes,
+// and custom types.
+
+// ---------------------------------------------------------------------------
+// 1. Arbitrary-precision arithmetic (no overflow)
+// ---------------------------------------------------------------------------
+
+fn factorial(n) {
+    if n <= 1 { 1 } else { n * factorial(n - 1) }
+}
+
+println("=== Arithmetic ===");
+println("100! =");
+println(factorial(100));
+
+// true division promotes to Decimal; evenly divisible stays Int
+println("7 / 2 = ");
+println(7 / 2);
+println("6 / 2 = ");
+println(6 / 2);
+
+// mixed arithmetic auto-promotes Int -> Decimal
+println("1 + 0.5 = ");
+println(1 + 0.5);
+
+// ---------------------------------------------------------------------------
+// 2. Persistent collections (structural sharing)
+// ---------------------------------------------------------------------------
+
+println("=== Persistent collections ===");
+
+let v = [1, 2, 3];
+let v2 = push(v, 4);
+
+// `v` is unchanged — persistence means "mutations" return a new collection
+println("v after push(v, 4):");
+println(count(v));        // 3
+println("v2:");
+println(count(v2));       // 4
+
+let m = { x: 1, y: 2 };
+let m2 = assoc(m, "z", 3);
+println("m after assoc:");
+println(count(m));        // 2
+
+// ---------------------------------------------------------------------------
+// 3. Closures and higher-order functions
+// ---------------------------------------------------------------------------
+
+println("=== Closures ===");
+
+fn make_adder(x) {
+    fn(y) { x + y }
+}
+
+let add10 = make_adder(10);
+println("make_adder(10)(5) =");
+println(add10(5));        // 15
+
+// recursive Fibonacci
+fn fib(n) {
+    if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
+}
+println("fib(15) =");
+println(fib(15));         // 610
+
+// ---------------------------------------------------------------------------
+// 4. Custom types: struct and enum
+// ---------------------------------------------------------------------------
+
+println("=== Custom types ===");
+
+type Point = { x: Int, y: Int }
+
+fn length(p) {
+    // field access on a struct
+    let sq = p.x * p.x + p.y * p.y;
+    sq
+}
+
+let origin = Point({ x: 3, y: 4 });
+println("Point(3, 4) squared length =");
+println(length(origin));  // 25
+
+enum Shape {
+    Circle(Int),
+    Rect(Int, Int)
+}
+
+fn area(s) {
+    match s {
+        Circle(r) => r * r,
+        Rect(w, h) => w * h
+    }
+}
+
+println("Circle(5) area =");
+println(area(Circle(5)));   // 25
+println("Rect(3, 4) area =");
+println(area(Rect(3, 4)));  // 12
+
+// ---------------------------------------------------------------------------
+// 5. Pattern matching with guards and Or-patterns
+// ---------------------------------------------------------------------------
+
+println("=== Pattern matching ===");
+
+fn classify(n) {
+    match n {
+        0 => "zero",
+        1 | 2 | 3 => "low",
+        x if x < 10 => "medium",
+        _ => "high"
+    }
+}
+
+println("classify(0) =");
+println(classify(0));      // zero
+println("classify(2) =");
+println(classify(2));      // low
+println("classify(7) =");
+println(classify(7));      // medium
+println("classify(100) =");
+println(classify(100));    // high
+
+// vec pattern with rest
+fn head(xs) {
+    match xs {
+        [h, ..] => h,
+        _ => nil
+    }
+}
+
+println("head([42, 2, 3]) =");
+println(head([42, 2, 3])); // 42
+
+// struct destructuring
+fn describe_point(p) {
+    match p {
+        Point { x: 0, y: 0 } => "origin",
+        Point { x: px, y: py } => "point"
+    }
+}
+
+println("describe_point(Point(\{x:0, y:0\})) =");
+println(describe_point(Point({ x: 0, y: 0 })));   // origin
+println("describe_point(Point(\{x:3, y:4\})) =");
+println(describe_point(Point({ x: 3, y: 4 })));   // point
+
+// ---------------------------------------------------------------------------
+// 6. Exceptions: try / raise / rescue
+// ---------------------------------------------------------------------------
+
+println("=== Exceptions ===");
+
+fn safe_div(a, b) {
+    try {
+        if b == 0 { raise "division by zero" } else { a / b }
+    } rescue as e {
+        "caught: " + e
+    }
+}
+
+println("safe_div(10, 2) =");
+println(safe_div(10, 2));   // 5
+println("safe_div(10, 0) =");
+println(safe_div(10, 0));   // caught: division by zero
+
+// rescue by variant type
+enum Result { Ok(Int), Err(String) }
+
+fn try_parse(ok) {
+    try {
+        if ok { raise Ok(42) } else { raise Err("bad input") }
+    } rescue Ok as v {
+        v
+    } rescue Err as e {
+        e
+    }
+}
+
+println("try_parse(true) =");
+println(try_parse(true));   // Ok(42)
+
+// ---------------------------------------------------------------------------
+// 7. Pipe operator
+// ---------------------------------------------------------------------------
+
+println("=== Pipe ===");
+
+let double = fn(x) { x * 2 };
+let inc = fn(x) { x + 1 };
+
+// 5 |> double |> inc  ==  inc(double(5)) == 11
+println("5 |> double |> inc =");
+println(5 |> double |> inc);
+
+// pipe with extra args: 5 |> add(10) == add(5, 10) == 15
+let add = fn(a, b) { a + b };
+println("5 |> add(10) =");
+println(5 |> add(10));
+
+// ---------------------------------------------------------------------------
+// 8. String interpolation
+// ---------------------------------------------------------------------------
+
+println("=== Strings ===");
+
+let name = "world";
+let n = 42;
+println("hello, {name}! answer = {n}");
+
+// string concatenation
+println("hello" + " " + "world");
+
+// ---------------------------------------------------------------------------
+// 9. Block expressions and assignment
+// ---------------------------------------------------------------------------
+
+println("=== Blocks & assignment ===");
+
+let result = {
+    let a = 10;
+    let b = 20;
+    a + b
+};
+println("block result =");
+println(result);    // 30
+
+let x = 1;
+x = 99;
+println("after assignment, x =");
+println(x);         // 99
+
+// index assignment
+let vec = [1, 2, 3];
+vec[0] = 99;
+println("vec[0] after assignment =");
+println(vec[0]);    // 99
+
+// field assignment
+let p = Point({ x: 1, y: 2 });
+p.x = 42;
+println("p.x after assignment =");
+println(p.x);       // 42
+
+println("=== Done ===");

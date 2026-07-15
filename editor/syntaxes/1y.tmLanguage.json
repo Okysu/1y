@@ -1,0 +1,179 @@
+{
+  "name": "1y",
+  "scopeName": "source.1y",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#keywords" },
+    { "include": "#types" },
+    { "include": "#identifiers" },
+    { "include": "#operators" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.1y",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.block.1y",
+          "begin": "/\\*",
+          "end": "\\*/",
+          "patterns": [
+            { "include": "#comments" }
+          ]
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.triple.1y",
+          "begin": "\"\"\"",
+          "end": "\"\"\"",
+          "patterns": [
+            { "include": "#string-interpolation" },
+            { "include": "#string-escapes" }
+          ]
+        },
+        {
+          "name": "string.quoted.double.1y",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            { "include": "#string-interpolation" },
+            { "include": "#string-escapes" }
+          ]
+        }
+      ]
+    },
+    "string-escapes": {
+      "patterns": [
+        {
+          "name": "constant.character.escape.1y",
+          "match": "\\\\(n|r|t|\\\\|\"|\\{|\\}|u\\{[0-9a-fA-F]+\\}|x[0-9a-fA-F]{2})"
+        }
+      ]
+    },
+    "string-interpolation": {
+      "patterns": [
+        {
+          "name": "meta.interpolation.1y",
+          "match": "(\\\\\\{|\\\\\\})",
+          "captures": {
+            "0": { "name": "constant.character.escape.1y" }
+          }
+        },
+        {
+          "name": "meta.interpolation.1y",
+          "begin": "(?<!\\\\)\\{",
+          "end": "\\}",
+          "beginCaptures": {
+            "0": { "name": "punctuation.definition.interpolation.begin.1y" }
+          },
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.interpolation.end.1y" }
+          },
+          "patterns": [
+            { "include": "#comments" },
+            { "include": "#strings" },
+            { "include": "#numbers" },
+            { "include": "#keywords" },
+            { "include": "#identifiers" },
+            { "include": "#operators" }
+          ]
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.decimal.1y",
+          "match": "\\b[0-9][0-9_]*\\.[0-9][0-9_]*([eE][+-]?[0-9]+)?\\b"
+        },
+        {
+          "name": "constant.numeric.integer.1y",
+          "match": "\\b[0-9][0-9_]*\\b"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.1y",
+          "match": "\\b(if|else|match|while|for|in|loop|break|continue|return|try|rescue|ensure|raise|retry)\\b"
+        },
+        {
+          "name": "keyword.declaration.1y",
+          "match": "\\b(let|fn|enum|type|struct|import|lazy|as)\\b"
+        },
+        {
+          "name": "keyword.concurrency.1y",
+          "match": "\\b(spawn|actor|state|on|reply|receive|shared|transact)\\b"
+        },
+        {
+          "name": "keyword.operator.logical.1y",
+          "match": "\\b(and|or|not)\\b"
+        },
+        {
+          "name": "constant.language.1y",
+          "match": "\\b(true|false|nil)\\b"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "support.type.primitive.1y",
+          "match": "\\b(Int|Decimal|Str|Bool|Vec|Map|Set|Func|Nil)\\b"
+        },
+        {
+          "name": "entity.name.type.1y",
+          "match": "\\b([A-Z][a-zA-Z0-9_]*)\\b"
+        }
+      ]
+    },
+    "identifiers": {
+      "patterns": [
+        {
+          "name": "entity.name.function.1y",
+          "match": "\\b([a-z_][a-zA-Z0-9_]*)\\s*(?=\\()"
+        },
+        {
+          "name": "variable.1y",
+          "match": "\\b[a-z_][a-zA-Z0-9_]*\\b"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.arrow.1y",
+          "match": "(->|=>|\\|>)"
+        },
+        {
+          "name": "keyword.operator.assignment.1y",
+          "match": "(=|\\+=|-=|\\*=|/=|%=)"
+        },
+        {
+          "name": "keyword.operator.comparison.1y",
+          "match": "(==|!=|<=|>=|<|>)"
+        },
+        {
+          "name": "keyword.operator.arithmetic.1y",
+          "match": "([+\\-*/%])"
+        },
+        {
+          "name": "keyword.operator.other.1y",
+          "match": "(!|\\*|\\|\\||\\|\\||::|\\.\\.)"
+        },
+        {
+          "name": "punctuation.separator.1y",
+          "match": "[,;:.]"
+        }
+      ]
+    }
+  }
+}

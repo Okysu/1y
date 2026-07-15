@@ -1,0 +1,41 @@
+[package]
+name = "onely"
+version = "0.1.0"
+edition = "2021"
+description = "Interpreter for the 1y programming language (streaming concurrent functional)"
+license = "MIT OR Apache-2.0"
+
+# The binary is named `1y` (numeric-leading names are illegal as crate names
+# but allowed as explicit [[bin]] targets).
+[[bin]]
+name = "1y"
+path = "src/main.rs"
+
+[lib]
+name = "onely"
+path = "src/lib.rs"
+
+[dependencies]
+num-bigint = "0.4"
+num-traits = "0.2"
+bigdecimal = "0.4"
+thiserror = "1"
+im = "15"
+serialport = "4"
+# Phase 4.5: crypto
+sha2 = "0.10"
+sha1 = "0.10"
+md-5 = "0.10"
+hmac = "0.12"
+base64 = "0.22"
+hex = "0.4"
+rand = "0.8"
+# Phase 4.5: tls (rustls with ring provider — pure Rust, no system OpenSSL)
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std", "logging"] }
+rustls-pemfile = "2"
+webpki-roots = "0.26"
+# Phase 4.6: ffi (dynamic library loading)
+libloading = "0.8"
+
+[dev-dependencies]
+proptest = "1"

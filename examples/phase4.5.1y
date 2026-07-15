@@ -1,0 +1,99 @@
+// Phase 4.5 example program for the `1y` language.
+// Demonstrates the crypto, tls, and ffi modules.
+//
+// Run with:  1y run examples/phase4.5.1y
+
+import crypto;
+import tls;
+import ffi;
+
+// ---------------------------------------------------------------------------
+// 1. crypto: hashing (known test vectors)
+// ---------------------------------------------------------------------------
+
+println("=== crypto: hashing ===");
+
+// SHA-256("abc") — well-known test vector.
+println("sha256(abc) = " + crypto.sha256("abc"));
+println("sha256(abc) == ba78...15ad: "
+    + str(crypto.sha256("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+
+println("sha512(abc) = " + crypto.sha512("abc"));
+println("sha1(abc)   = " + crypto.sha1("abc"));
+println("md5(abc)    = " + crypto.md5("abc"));
+
+// ---------------------------------------------------------------------------
+// 2. crypto: HMAC
+// ---------------------------------------------------------------------------
+
+println("=== crypto: HMAC ===");
+
+let mac = crypto.hmac_sha256("secret-key", "message to authenticate");
+println("hmac_sha256 len = " + str(len(mac)));        // 64 hex chars = 32 bytes
+println("hmac_sha256     = " + mac);
+
+let mac512 = crypto.hmac_sha512("secret-key", "message to authenticate");
+println("hmac_sha512 len = " + str(len(mac512)));      // 128 hex chars = 64 bytes
+
+// ---------------------------------------------------------------------------
+// 3. crypto: base64 / hex encoding
+// ---------------------------------------------------------------------------
+
+println("=== crypto: encoding ===");
+
+let original = "Hello, 1y crypto module!";
+let b64 = crypto.base64_encode(original);
+let decoded = crypto.base64_decode(b64);
+println("base64_encode = " + b64);
+println("base64 roundtrip ok: " + str(decoded == original));
+
+let hexed = crypto.hex_encode(original);
+let unhexed = crypto.hex_decode(hexed);
+println("hex_encode    = " + hexed);
+println("hex roundtrip ok: " + str(unhexed == original));
+
+// ---------------------------------------------------------------------------
+// 4. crypto: cryptographically-secure randomness (CSPRNG)
+// ---------------------------------------------------------------------------
+
+println("=== crypto: CSPRNG ===");
+
+// random_bytes returns a Vec<Int> of 0–255 values.
+let bytes = crypto.random_bytes(8);
+println("random_bytes(8) = " + str(bytes));
+
+// secure_int / secure_float use OsRng (unlike `random` module's xorshift).
+println("secure_int(1000) = " + str(crypto.secure_int(1000)));
+println("secure_float()   = " + str(crypto.secure_float()));
+
+// ---------------------------------------------------------------------------
+// 5. tls: module structure (no live network connection)
+// ---------------------------------------------------------------------------
+
+println("=== tls (module structure) ===");
+
+println("tls module = " + str(tls));                   // <module tls>
+// The connect/read/write/close/peer_addr functions are available as exports.
+println("tls.connect is a function: " + str(is_func(tls.connect)));
+println("tls.read is a function: " + str(is_func(tls.read)));
+println("tls.write is a function: " + str(is_func(tls.write)));
+// A real connection looks like:
+//   let s = tls.connect("example.com", 443);
+//   tls.write(s, "GET / HTTP/1.0\r\nHost: example.com\r\n\r\n");
+//   println(tls.read_line(s));
+//   tls.close(s);
+
+// ---------------------------------------------------------------------------
+// 6. ffi: reserved interface (not yet implemented)
+// ---------------------------------------------------------------------------
+
+println("=== ffi (reserved interface) ===");
+
+println("ffi module = " + str(ffi));                    // <module ffi>
+println("ffi.is_loaded = " + str(ffi.is_loaded("libc.so.6")));   // false
+// ffi.load / ffi.symbol / ffi.call are reserved and will raise a
+// "not yet implemented" RuntimeError if invoked. They establish the API
+// surface for a future dynamic-loading backend (libloading).
+
+println("=== done ===");
+println("Phase 4.5 demo complete.");

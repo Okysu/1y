@@ -1,0 +1,100 @@
+{
+  "name": "onely-vscode",
+  "displayName": "1y Language Support",
+  "description": "Language support for the 1y programming language: syntax highlighting, LSP diagnostics, completions, and inline suggestions.",
+  "version": "0.1.0",
+  "publisher": "onely",
+  "license": "MIT OR Apache-2.0",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Language Packs"
+  ],
+  "activationEvents": [
+    "onLanguage:1y"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "1y",
+        "aliases": [
+          "1y",
+          "onely"
+        ],
+        "extensions": [
+          ".1y"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "1y",
+        "scopeName": "source.1y",
+        "path": "./syntaxes/1y.tmLanguage.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "onely.showOutput",
+        "title": "1y: Show Output Channel",
+        "category": "1y"
+      },
+      {
+        "command": "onely.restartServer",
+        "title": "1y: Restart Language Server",
+        "category": "1y"
+      }
+    ],
+    "configuration": {
+      "title": "1y",
+      "properties": {
+        "1y.executablePath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the `1y` interpreter binary. If empty, the extension looks for `1y` on PATH."
+        },
+        "1y.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Trace language server communication in the output channel."
+        },
+        "1y.inlineSuggestions.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable inline suggestions (completion snippets) as you type."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build -- --minify",
+    "esbuild-server": "esbuild ./src/server.ts --bundle --outfile=dist/server.js --external:vscode --format=cjs --platform=node",
+    "esbuild-extension": "esbuild ./src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node",
+    "build": "npm run esbuild-server && npm run esbuild-extension",
+    "build:dev": "npm run esbuild-server -- --sourcemap && npm run esbuild-extension -- --sourcemap",
+    "watch": "npm run esbuild-extension -- --sourcemap --watch",
+    "lint": "tsc --noEmit",
+    "package": "npm run build -- --minify && vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.80.0",
+    "esbuild": "^0.21.0",
+    "typescript": "^5.4.0",
+    "@vscode/vsce": "^2.27.0"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1",
+    "vscode-languageserver": "^9.0.1",
+    "vscode-languageserver-textdocument": "^1.0.11"
+  }
+}

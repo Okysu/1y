@@ -1,0 +1,27 @@
+# Source files — only the bundled dist/ is needed at runtime.
+src/**
+
+# TypeScript config — build-time only.
+tsconfig.json
+
+# Source maps — not needed in the published extension.
+dist/**/*.map
+
+# Dev tooling.
+.vscode/**
+.gitignore
+.gitattributes
+
+# Tests (none yet, but be explicit).
+test/**
+tests/**
+**/*.test.ts
+**/*.spec.ts
+
+# node_modules — esbuild bundles all dependencies into dist/*.js, so we
+# don't need to ship the raw node_modules tree. This dramatically reduces
+# the VSIX size and eliminates the "too many JS files" warning.
+node_modules/**
+
+# Build artifacts we don't ship.
+*.log

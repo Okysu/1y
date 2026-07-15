@@ -1,0 +1,123 @@
+// Phase 0 example program for the `1y` language.
+// Exercises every front-end feature: literals, collections, pipe, control
+// flow, custom types, actor, shared/transact, modules, exceptions.
+
+// --- modules ---
+import io
+import net.socket as socket
+lazy import heavy_math_lib
+
+// --- numeric literals (arbitrary precision) ---
+let big = 170141183460469231731687303715884105727
+let precise = 3.141592653589793238462643383279502884197
+let separated = 1_000_000_000
+let exponent = 1.5e10
+
+// --- collections (persistent / immutable) ---
+let xs = [1, 2, 3, big, precise]
+let point_map = { x: 1, y: 2 }
+let tags = #{1, 2, 3}
+
+// --- pipe operator ---
+let sum_sq = xs |> filter(fn(x) { x > 0 }) |> map(fn(x) { x * x }) |> reduce(add, 0)
+
+// --- function definition ---
+fn add(a, b) { a + b }
+
+fn factorial(n) {
+    if n <= 1 {
+        1
+    } else {
+        n * factorial(n - 1)
+    }
+}
+
+// --- lambda ---
+let double = fn(x: Number) -> Number { x * 2 }
+
+// --- algebraic data types ---
+enum Option<T> {
+    Some(T),
+    None
+}
+
+enum Result<T, E> {
+    Ok(T),
+    Err(E)
+}
+
+// --- record type ---
+type Point = { x: Number, y: Number }
+
+// --- pattern matching ---
+fn describe(opt) {
+    match opt {
+        Some(x) if x > 0 => "positive",
+        Some(x) => "non-positive",
+        None => "nothing",
+        Ok(v) => "ok",
+        Err(_) | Err(msg) => "error"
+    }
+}
+
+// --- actor (message passing) ---
+actor Counter {
+    state count = 0
+
+    on inc() {
+        count = count + 1
+    }
+
+    on get() -> Number {
+        reply(count)
+    }
+}
+
+// --- shared mutable state (COW / STM) ---
+shared counter = 0
+
+fn bump() {
+    transact {
+        counter = counter + 1
+    }
+}
+
+// implicit single-statement transaction
+fn push_item(queue, item) {
+    queue.push(item)
+}
+
+// --- exceptions ---
+fn risky(n) {
+    if n == 0 {
+        raise "division by zero"
+    } else {
+        100 / n
+    }
+}
+
+fn safe_div(n) {
+    try {
+        risky(n)
+    } rescue IOError as e {
+        -1
+    } ensure {
+        cleanup()
+    }
+}
+
+// --- spawn and message passing ---
+let c = spawn Counter()
+c ! inc()
+let n = c ? get()
+
+// --- block expression & assignment ---
+let block_value = {
+    let a = 1
+    let b = 2
+    a + b
+}
+
+// --- string interpolation ---
+let name = "world"
+let greeting = "hello, {name}! sum = {sum_sq}"

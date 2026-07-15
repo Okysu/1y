@@ -1,0 +1,146 @@
+// Phase 4 example program for the `1y` language.
+// Demonstrates the module system: `import` (eager + lazy + alias) and the
+// standard library (env / io / json / random / process / socket / serial).
+//
+// Run with:  1y run examples/phase4.1y
+
+// ---------------------------------------------------------------------------
+// 1. import + alias: bind a std module under a different name
+// ---------------------------------------------------------------------------
+
+println("=== import + alias ===");
+
+import io as fs;            // alias: `fs` is the io module
+import env;                 // default bind name = last segment
+import process as proc;     // alias `proc`
+import json;                // default bind name
+import random;
+
+env.set("ONELY_PHASE4_DEMO", "ok");
+println("env.get = " + str(env.get("ONELY_PHASE4_DEMO")));   // ok
+println("proc.pid = " + str(proc.pid()));                     // <pid>
+
+// Module value displays as `<module name>`
+println("io module = " + str(fs));                            // <module io>
+
+// ---------------------------------------------------------------------------
+// 2. io: file write / read / append / exists
+// ---------------------------------------------------------------------------
+
+println("=== io (file) ===");
+
+let path = "phase4_demo_tmp.txt";
+fs.write(path, "hello\n");
+fs.append(path, "world\n");
+println("exists = " + str(fs.exists(path)));                  // true
+println("content = " + trim(fs.read_to_string(path)));        // hello\nworld
+
+// ---------------------------------------------------------------------------
+// 3. json: parse / stringify / pretty / roundtrip / bigint
+// ---------------------------------------------------------------------------
+
+println("=== json ===");
+
+// Escape { and } so 1y doesn't treat them as string interpolation.
+let raw = json.parse("\{\"name\": \"Alice\", \"age\": 30, \"tags\": [\"a\", \"b\"]\}");
+let serialized = json.stringify(raw);
+println("stringified = " + serialized);
+
+// Round-trip preserves structure.
+let back = json.parse(serialized);
+println("name = " + str(back.name));        // Alice
+println("age = " + str(back.age));          // 30
+println("tags[0] = " + str(back.tags[0]));  // a
+
+// pretty adds newlines/indentation
+let pretty_str = json.pretty(raw, 2);
+println("pretty has newlines: " + str(contains(pretty_str, "\n")));
+
+// BigInt precision preserved through JSON.
+let big = json.parse("99999999999999999999999");
+println("bigint = " + str(big));            // 99999999999999999999999
+
+// ---------------------------------------------------------------------------
+// 4. random: deterministic PRNG (xorshift64) — reseedable
+// ---------------------------------------------------------------------------
+
+println("=== random ===");
+
+random.seed(42);
+let r1 = random.int(100);
+let r2 = random.int(100);
+println("random.int(100) #1 = " + str(r1));
+println("random.int(100) #2 = " + str(r2));
+
+// Reseeding reproduces the same sequence.
+random.seed(42);
+let r1b = random.int(100);
+let r2b = random.int(100);
+println("reseed reproduces #1: " + str(r1 == r1b));   // true
+println("reseed reproduces #2: " + str(r2 == r2b));   // true
+
+// range / float / bool / pick / shuffle
+println("range(10,20) = " + str(random.range(10, 20)));
+println("float in [0,1): " + str(random.float()));
+println("bool: " + str(random.bool()));
+println("pick: " + str(random.pick([100, 200, 300])));
+println("shuffle: " + str(random.shuffle([1, 2, 3, 4, 5])));
+
+// ---------------------------------------------------------------------------
+// 5. process: pid / cwd / set_cwd / sleep_ms / exec_status
+// ---------------------------------------------------------------------------
+
+println("=== process ===");
+
+println("pid = " + str(proc.pid()));
+println("cwd = " + proc.cwd());
+proc.sleep_ms(5);     // tiny sleep, returns Nil
+println("slept 5ms ok");
+
+// exec_status runs a command and returns the exit code.
+// Use `cmd /c` on Windows; tests run in CI so keep it harmless.
+let code = proc.exec_status("cmd", ["/c", "echo hi"]);
+println("echo exit code = " + str(code));    // 0
+
+// ---------------------------------------------------------------------------
+// 6. lazy import: loading deferred until first use
+// ---------------------------------------------------------------------------
+
+println("=== lazy import ===");
+
+// `lazy import` binds a placeholder; the module is only loaded when the name
+// is actually evaluated. Useful for optional dependencies or fast startup.
+lazy import random as rnd;
+// Until `rnd` is touched, no work is done. First access triggers loading:
+println("lazy rnd.int(10) = " + str(rnd.int(10)));
+println("lazy rnd type = " + str(rnd));     // <module random>
+
+// ---------------------------------------------------------------------------
+// 7. socket + serial: import without using (no live hardware / server)
+// ---------------------------------------------------------------------------
+
+println("=== socket + serial (import only) ===");
+
+import socket;
+import serial;
+
+println("socket module = " + str(socket));   // <module socket>
+println("serial module = " + str(serial));   // <module serial>
+
+// serial.list() returns available port names (empty Vec if none).
+let ports = serial.list();
+println("serial ports count = " + str(count(ports)));
+
+// socket functions are accessible as module exports (without calling them
+// against a live server). Field access returns the Native function value.
+println("socket.connect is a function: " + str(is_func(socket.connect)));
+println("socket.listen is a function: " + str(is_func(socket.listen)));
+
+// ---------------------------------------------------------------------------
+// 8. cleanup
+// ---------------------------------------------------------------------------
+
+// Reuse io to remove the temp file we created. There's no `delete` in the io
+// module yet, so leave the file — it's overwritten on next run anyway.
+println("=== done ===");
+println("Phase 4 demo complete.");

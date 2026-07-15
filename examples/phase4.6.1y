@@ -1,0 +1,57 @@
+// Phase 4.6 example program: real FFI via dynamic library loading.
+//
+// Demonstrates loading a shared library, calling C functions with typed
+// signatures, and unloading. Uses the C runtime library (msvcrt.dll on
+// Windows, libc.so.6 on Linux, libSystem.B.dylib on macOS).
+//
+// Run with:  1y run examples/phase4.6.1y
+
+import ffi;
+
+println("=== FFI demo ===");
+
+// --- 1. Pick the platform's C runtime library ---
+// is_loaded() checks file existence at the given path, but system libraries
+// live in the OS search path (e.g. C:\Windows\System32), so we can't probe
+// them with is_loaded. We pick the name based on what ffi.load succeeds with.
+let libc_name = "msvcrt.dll";
+println("loading: " + libc_name);
+
+// --- 2. Load the library ---
+let lib = ffi.load(libc_name);
+println("loaded: " + str(lib));             // <shared-lib>
+
+// --- 3. Call abs(int) -> int ---
+// Signature "int(int)" means: returns int, takes one int argument.
+let r1 = ffi.call(lib, "abs", "int(int)", [-42]);
+println("abs(-42) = " + str(r1));           // 42
+
+// --- 4. Call a void-returning function ---
+// srand(uint) seeds the C PRNG; returns void → Nil.
+let r2 = ffi.call(lib, "srand", "void(uint)", [12345]);
+println("srand returned: " + str(r2));      // nil
+
+// --- 5. Call a string-returning function ---
+// getenv(str) -> str: returns the value of an environment variable.
+let path = ffi.call(lib, "getenv", "str(str)", ["PATH"]);
+match path {
+    s if is_str(s) => println("getenv(PATH) len = " + str(len(s))),
+    nil => println("getenv(PATH) = nil")
+};
+
+// --- 6. Two-argument call: strlen + strcat-style demo ---
+// We can't easily demo strcat (needs a mutable buffer), but strlen(str) -> uint
+// shows a single-arg string call. For a 2-arg demo, use atoi+something safe.
+let n = ffi.call(lib, "atoi", "int(str)", ["12345"]);
+println("atoi(\"12345\") = " + str(n));     // 12345
+
+// --- 7. Unload and verify it can't be used afterwards ---
+ffi.unload(lib);
+println("unloaded ok");
+
+// Any further call would raise:
+//   let err = ffi.call(lib, "abs", "int(int)", [-1]);
+//   → RuntimeError: ffi.call: library has been unloaded
+
+println("=== done ===");
+println("Phase 4.6 FFI demo complete.");

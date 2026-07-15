@@ -1,0 +1,255 @@
+// Phase 2 example program for the `1y` language.
+// Demonstrates the actor runtime: spawn, `!` (fire-and-forget),
+// `?` (request/reply), state, multi-actor isolation, self-reference,
+// internal functions, and state machines.
+//
+// Run with:  1y run examples/phase2.1y
+
+// ---------------------------------------------------------------------------
+// 1. Basic spawn + synchronous request/reply
+// ---------------------------------------------------------------------------
+
+println("=== Basic spawn + request/reply ===");
+
+actor Greeter {
+    on hello() { reply("hello, world") }
+    on hi(name) { reply("hi, " + name + "!") }
+}
+
+let g = spawn Greeter();
+println("g ? hello() =");
+println(g ? hello());              // hello, world
+println("g ? hi(\"alice\") =");
+println(g ? hi("alice"));         // hi, alice!
+
+// ---------------------------------------------------------------------------
+// 2. Actor with mutable state (persists across requests)
+// ---------------------------------------------------------------------------
+
+println("=== Actor state ===");
+
+actor Counter {
+    state count = 0
+    on inc() { count = count + 1; reply(count) }
+    on dec() { count = count - 1; reply(count) }
+    on get() { reply(count) }
+    on reset() { count = 0; reply(nil) }
+}
+
+let c = spawn Counter();
+let n1 = c ? inc();  // 1
+let n2 = c ? inc();  // 2
+let n3 = c ? inc();  // 3
+let n4 = c ? dec();  // 2
+let n5 = c ? get();  // 2
+println("inc: " + str(n1));
+println("inc: " + str(n2));
+println("inc: " + str(n3));
+println("dec: " + str(n4));
+println("get: " + str(n5));
+c ? reset();
+let n6 = c ? get();
+println("after reset: " + str(n6));  // 0
+
+// ---------------------------------------------------------------------------
+// 3. Fire-and-forget send (`!`) — processed at end of program
+// ---------------------------------------------------------------------------
+
+println("=== Fire-and-forget (`!`) ===");
+
+actor Logger {
+    state entries = []
+    on log(msg) {
+        // push returns a new vector (persistence); reassign to update state
+        entries = push(entries, msg);
+        reply(nil)
+    }
+    on dump() { reply(entries) }
+}
+
+let logger = spawn Logger();
+// `!` enqueues without waiting; the handler runs during the end-of-program drain.
+logger ! log("first");
+logger ! log("second");
+logger ! log("third");
+// Synchronous `?` to read — note: the `!` messages above have NOT been
+// processed yet (they drain at end of program), so this returns [].
+let dump_before = logger ? dump();
+println("dump before drain: " + str(count(dump_before)));
+
+// ---------------------------------------------------------------------------
+// 4. Multiple actors with isolated state
+// ---------------------------------------------------------------------------
+
+println("=== Isolated state ===");
+
+let c1 = spawn Counter();
+let c2 = spawn Counter();
+c1 ? inc();
+c1 ? inc();
+c1 ? inc();
+c2 ? inc();
+let c1n = c1 ? get();
+let c2n = c2 ? get();
+println("c1 count: " + str(c1n));   // 3
+println("c2 count: " + str(c2n));   // 1
+
+// ---------------------------------------------------------------------------
+// 5. Actor with constructor args + internal function
+// ---------------------------------------------------------------------------
+
+println("=== Constructor args + internal fn ===");
+
+actor accumulator {
+    state total = 0
+    fn squared(x) { x * x }
+    on add(n) { total = total + n; reply(total) }
+    on add_sq(n) { total = total + squared(n); reply(total) }
+    on get() { reply(total) }
+}
+
+let acc = spawn accumulator();
+acc ? add(10);
+acc ? add_sq(3);      // total = 10 + 9 = 19
+acc ? add(5);         // total = 24
+let acc_total = acc ? get();
+println("accumulator total: " + str(acc_total));  // 24
+
+// ---------------------------------------------------------------------------
+// 6. Actor calling a global function
+// ---------------------------------------------------------------------------
+
+println("=== Global function call ===");
+
+fn format_currency(amount) { "$" + str(amount) }
+
+actor Wallet {
+    state balance = 0
+    on deposit(n) { balance = balance + n; reply(format_currency(balance)) }
+    on withdraw(n) {
+        balance = balance - n;
+        reply(format_currency(balance))
+    }
+}
+
+let w = spawn Wallet();
+let d1 = w ? deposit(100);
+let d2 = w ? deposit(50);
+let d3 = w ? withdraw(30);
+println("deposit 100: " + d1);    // $100
+println("deposit 50: " + d2);     // $150
+println("withdraw 30: " + d3);    // $120
+
+// ---------------------------------------------------------------------------
+// 7. Self-reference: an actor that sends to itself
+// ---------------------------------------------------------------------------
+
+println("=== Self-reference ===");
+
+actor pinger {
+    state hops = 0
+    on start() {
+        hops = hops + 1;
+        // self is bound to the actor's own reference; `!` enqueues a
+        // fire-and-forget message that is processed during the end-of-program drain
+        if hops < 3 { self ! tick() };
+        reply(hops)
+    }
+    on tick() {
+        hops = hops + 1;
+        println("  tick processed, hops = " + str(hops));
+        if hops < 3 { self ! tick() };
+        reply(nil)
+    }
+    on get() { reply(hops) }
+}
+
+let p = spawn pinger();
+let h = p ? start();
+// `?` is synchronous, so `h` is 1 immediately. The `! tick()` self-sends
+// are queued and only processed when the program ends (drain phase).
+// The "tick processed" lines below appear during that drain.
+println("hops after start: " + str(h));       // 1
+
+// ---------------------------------------------------------------------------
+// 8. Actor as a state machine
+// ---------------------------------------------------------------------------
+
+println("=== State machine ===");
+
+actor TrafficLight {
+    state color = "red"
+    on cycle() {
+        color = match color {
+            "red" => "green",
+            "green" => "yellow",
+            "yellow" => "red",
+            _ => "red"
+        };
+        reply(color)
+    }
+    on current() { reply(color) }
+}
+
+let tl = spawn TrafficLight();
+println("start: " + (tl ? current()));             // red
+println("cycle 1: " + (tl ? cycle()));             // green
+println("cycle 2: " + (tl ? cycle()));             // yellow
+println("cycle 3: " + (tl ? cycle()));             // red
+println("cycle 4: " + (tl ? cycle()));             // green
+
+// ---------------------------------------------------------------------------
+// 9. Message dispatch by name (multiple handlers)
+// ---------------------------------------------------------------------------
+
+println("=== Message dispatch ===");
+
+actor Calculator {
+    on add(a, b) { reply(a + b) }
+    on sub(a, b) { reply(a - b) }
+    on mul(a, b) { reply(a * b) }
+    on div(a, b) { reply(a / b) }
+}
+
+let calc = spawn Calculator();
+let s = calc ? add(3, 4);
+let d = calc ? sub(10, 3);
+let m = calc ? mul(5, 6);
+let q = calc ? div(20, 4);
+println("3 + 4 = " + str(s));     // 7
+println("10 - 3 = " + str(d));    // 7
+println("5 * 6 = " + str(m));     // 30
+println("20 / 4 = " + str(q));    // 5
+
+// ---------------------------------------------------------------------------
+// 10. Actor with stateful map (key-value store)
+// ---------------------------------------------------------------------------
+
+println("=== Key-value store ===");
+
+actor KVStore {
+    // Note: `{}` parses as an empty block (Nil), not an empty map.
+    // Initialize with a placeholder entry to get a real Map.
+    state data = dissoc({ __init: 0 }, "__init")
+    on put(key, val) { data = assoc(data, key, val); reply(nil) }
+    on get(key) { reply(get(data, key)) }
+    on has(key) { reply(get(data, key) != nil) }
+    on delete(key) { data = dissoc(data, key); reply(nil) }
+    on size() { reply(count(data)) }
+}
+
+let store = spawn KVStore();
+store ? put("name", "alice");
+store ? put("city", "paris");
+store ? put("age", "30");
+let name_val = store ? get("name");
+let has_city = store ? has("city");
+println("name: " + name_val);              // alice
+println("has city: " + str(has_city));     // true
+store ? delete("city");
+let has_city2 = store ? has("city");
+let store_size = store ? size();
+println("has city after delete: " + str(has_city2)); // false
+println("size: " + str(store_size));       // 2
+
+println("=== Done ===");

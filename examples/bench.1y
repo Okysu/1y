@@ -1,0 +1,113 @@
+// Benchmark script for the `1y` interpreter.
+//
+// Exercises core interpreter paths: integer arithmetic, deep recursion,
+// closures, persistent collections, pattern matching, and JSON round-trips.
+// Run with external timing, e.g.:
+//
+//   hyperfine --warmup 1 '1y run examples/bench.1y'
+//   # or
+//   (Measure-Command { 1y.exe run examples/bench.1y }).TotalSeconds
+//
+// All output goes to stdout; the final line prints "bench done" so a harness
+// can confirm completion.
+
+// ---------------------------------------------------------------------------
+// 1. fib(28) — naive recursive, stresses function-call overhead
+// ---------------------------------------------------------------------------
+
+fn fib(n) -> Int {
+    if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
+}
+println("fib(28) = " + str(fib(28)));          // 317811
+
+// ---------------------------------------------------------------------------
+// 2. factorial(500) — big-integer arithmetic
+// ---------------------------------------------------------------------------
+
+fn fact(n) -> Int {
+    if n <= 1 { 1 } else { n * fact(n - 1) }
+}
+let f500 = fact(500);
+println("fact(500) digits = " + str(len(str(f500))));   // 1135
+
+// ---------------------------------------------------------------------------
+// 3. Sum 0..1_000_000 via loop — loop + compound-assign throughput
+// ---------------------------------------------------------------------------
+
+let total = 0;
+let i = 0;
+while i < 1_000_000 {
+    total += i;
+    i += 1
+};
+println("sum 0..1M = " + str(total));           // 499999500000
+
+// ---------------------------------------------------------------------------
+// 4. Persistent vector: build a 10_000-element vec via push
+// ---------------------------------------------------------------------------
+
+let v = [];
+let k = 0;
+while k < 10_000 {
+    v = push(v, k);
+    k += 1
+};
+println("vec len = " + str(count(v)));          // 10000
+println("vec last = " + str(v[9999]));          // 9999
+
+// ---------------------------------------------------------------------------
+// 5. Map assoc/dissoc churn — persistent map operations
+// ---------------------------------------------------------------------------
+
+// `{}` is an empty block in 1y, so seed the map with one entry.
+let m = { "0": 0 };
+let j = 1;
+while j < 1_000 {
+    m = assoc(m, str(j), j);
+    j += 1
+};
+println("map size = " + str(count(m)));         // 1000
+println("map get '500' = " + str(get(m, "500")));  // 500
+
+// ---------------------------------------------------------------------------
+// 6. Pattern matching: classify 5_000 values
+// ---------------------------------------------------------------------------
+
+enum Shape { Circle(Int), Rect(Int, Int), Empty }
+
+let matched_area = 0;
+let idx = 0;
+while idx < 5_000 {
+    let s = match idx % 3 {
+        0 => Circle(idx),
+        1 => Rect(idx, idx + 1),
+        _ => Empty
+    };
+    let area = match s {
+        Circle(r) => r * r,
+        Rect(w, h) => w * h,
+        Empty => 0
+    };
+    matched_area += area;
+    idx += 1
+};
+println("matched area sum = " + str(matched_area));
+
+// ---------------------------------------------------------------------------
+// 7. JSON round-trip × 1_000 — stdlib + collection churn
+// ---------------------------------------------------------------------------
+
+import json;
+
+let json_count = 0;
+let n = 0;
+while n < 1_000 {
+    let data = \{ "id": n, "name": "item", "vals": [1, 2, 3] \};
+    let s = json.stringify(data);
+    let back = json.parse(s);
+    json_count += back.id;
+    n += 1
+};
+println("json roundtrip id sum = " + str(json_count));  // 499500
+
+println("bench done");
