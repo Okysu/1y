@@ -75,6 +75,7 @@ pub fn register(env: &EnvRef) {
         // --- async (Phase 4.7: Task combinators) ---
         ("task_all", NativeFn { name: "task_all", func: bi_task_all }),
         ("task_any", NativeFn { name: "task_any", func: bi_task_any }),
+        ("task_ready", NativeFn { name: "task_ready", func: bi_task_ready }),
     ];
     for (name, nf) in entries {
         env.borrow_mut().define(*name, Value::Native(std::rc::Rc::new(nf.clone())));
@@ -757,4 +758,21 @@ fn bi_task_any(args: &[Value]) -> Result<Value, InterpreterError> {
         crate::value::TaskPoll::Pending
     }));
     Ok(Value::Task(std::rc::Rc::new(std::cell::RefCell::new(combined))))
+}
+
+/// `task_ready(value) -> Task`
+///
+/// Creates a Task that is immediately completed with `value`.
+/// Useful for:
+///   - wrapping a synchronous value into a Task to unify interfaces
+///   - seeding `task_all` / `task_any` with a known value
+///   - prototyping async code without real I/O
+///
+/// Example:
+///   let t = task_ready(42);
+///   let v = await t;       # v == 42, no suspension
+fn bi_task_ready(args: &[Value]) -> Result<Value, InterpreterError> {
+    let v = one_arg(args, "task_ready")?;
+    let task = crate::value::TaskState::Ready(v);
+    Ok(Value::Task(std::rc::Rc::new(std::cell::RefCell::new(task))))
 }

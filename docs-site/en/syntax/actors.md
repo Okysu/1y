@@ -177,7 +177,7 @@ let counter = spawn(0) {
 counter ? Inc(30);       # returns true; state is now 30
 counter ? Inc(80);       # returns false (30+80 exceeds 100); state unchanged
 let now = counter ? Get; # returns 30
-io.write("current count: " + now);
+println("current count: " + str(now));
 ```
 
 Note that `Inc` here uses `?` rather than `!`: we want to know whether the increment succeeded, so we need `reply(true/false)`. If it were simply "just add it," `counter ! Inc(30)` would do, and the Actor would not need to `reply` at all.

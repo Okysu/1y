@@ -200,15 +200,15 @@ counter ! Inc(5)
 ```1y
 let counter = shared 0;
 transact {
-    let v = *counter + 1;
-    *counter = v;
+    let v = counter + 1;
+    counter = v;
     v
 }
 ```
 
 - `shared expr` creates a transactional cell.
-- `*cell` reads the current value.
-- `*cell = expr` writes within a transaction.
+- Reading the cell uses the ordinary variable name (e.g. `counter`).
+- `cell = expr` writes within a transaction (same syntax as ordinary assignment).
 - `transact { ... }` provides snapshot isolation, atomic commit, rollback.
 - `retry` re-runs the transaction (max 64 attempts).
 - Nesting is supported (inner transactions commit to the outer).

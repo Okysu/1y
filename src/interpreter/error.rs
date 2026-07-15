@@ -101,6 +101,53 @@ impl InterpreterError {
             _ => None,
         }
     }
+
+    /// Extract the span carried by this error, if any.
+    pub fn span(&self) -> Option<Span> {
+        match self {
+            InterpreterError::UserException { span, .. }
+            | InterpreterError::NameError { span, .. }
+            | InterpreterError::TypeError { span, .. }
+            | InterpreterError::ArityError { span, .. }
+            | InterpreterError::IndexError { span, .. }
+            | InterpreterError::PatternMatchFail { span, .. }
+            | InterpreterError::DivisionByZero { span, .. }
+            | InterpreterError::RuntimeError { span, .. }
+            | InterpreterError::Return { span, .. }
+            | InterpreterError::Reply { span, .. }
+            | InterpreterError::Retry { span, .. }
+            | InterpreterError::Break { span, .. }
+            | InterpreterError::Continue { span, .. }
+            | InterpreterError::ImportError { span, .. } => *span,
+        }
+    }
+
+    /// Render this error with source context (`^^^` underline + line:col).
+    /// Falls back to the plain Display if no span is available.
+    pub fn render(&self, source: &str) -> String {
+        let msg = self.to_string();
+        match self.span() {
+            Some(span) => {
+                let mut out = String::new();
+                out.push_str(&format!("error: {}\n", msg));
+                out.push_str(&format!("  --> {}\n", span));
+                let line_idx = (span.start.line as usize).saturating_sub(1);
+                let line_str = source.lines().nth(line_idx).unwrap_or("");
+                out.push_str(&format!("   | {}\n", line_str));
+                let start_col = span.start.col.max(1) as usize;
+                let end_col = if span.start.line == span.end.line {
+                    span.end.col.max(1) as usize
+                } else {
+                    line_str.chars().count() + 1
+                };
+                let pad = " ".repeat(start_col.saturating_sub(1));
+                let carets = "^".repeat(end_col.saturating_sub(start_col).max(1));
+                out.push_str(&format!("   | {}{}\n", pad, carets));
+                out
+            }
+            None => format!("error: {}\n", msg),
+        }
+    }
 }
 
 impl std::fmt::Display for InterpreterError {

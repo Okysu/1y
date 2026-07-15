@@ -105,10 +105,10 @@ import io;
 let lib = ffi.load("libc.so.6");
 
 let absval = ffi.call(lib, "abs", "int(int)", [-42]);
-io.write("abs(-42) = " + absval);
+println("abs(-42) = " + str(absval));
 
 let len = ffi.call(lib, "strlen", "uint(str)", ["hello"]);
-io.write("strlen(hello) = " + len);
+println("strlen(hello) = " + str(len));
 
 ffi.unload(lib);
 ```

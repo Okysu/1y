@@ -6,7 +6,7 @@ title: Software Transactional Memory
 
 The Actor model banishes sharing through isolation, but some situations genuinely require **sharing** — multiple components reading and writing the same configuration, atomic updates across several data structures, or a buffer shared between producers and consumers. For these cases 1y provides **Software Transactional Memory (STM)**: it replaces the hard-to-reason-about concept of "locks" with "transactions," a concept programmers already know well from databases.
 
-This page covers the complete syntax of STM: `shared` to create transactional cells, `*cell` to read and write, `transact` to open a transaction, `retry` to retry, plus nested transactions and the rules for accessing cells outside a transaction.
+This page covers the complete syntax of STM: `shared` to create transactional cells, direct read/write to access them, `transact` to open a transaction, `retry` to retry, plus nested transactions and the rules for accessing cells outside a transaction.
 
 ## Creating a Transactional Cell: shared
 
@@ -20,19 +20,19 @@ let config = shared { host: "localhost", port: 8080 };
 
 `shared` accepts any 1y value as the initial value. The cell itself is a **shared reference** — multiple transactions can read and write it concurrently, but every access is protected by STM's isolation and atomicity. You can think of a cell as "a replaceable label": the value the label points to is immutable, but the label itself can be swapped to point at a new value.
 
-## Reading and Writing Cells: *cell
+## Reading and Writing Cells
 
-Reads and writes to a cell use the `*` prefix operator:
+Reads and writes to a cell use the **same syntax as ordinary variables** — no special prefix operator is needed. The binding name refers to the cell; reading it yields the current value, assigning to it swaps the value:
 
-- `*cell` reads the cell's current value.
-- `*cell = expr` sets the cell's value to the result of `expr`.
+- `counter` reads the cell's current value.
+- `counter = expr` sets the cell's value to the result of `expr`.
 
 ```1y
-let v = *counter;       # read
-*counter = v + 1;       # write
+let v = counter;       # read
+counter = v + 1;       # write
 ```
 
-The meaning of `*` depends on context: inside a transaction, reads and writes go through snapshot isolation; outside a transaction, they take effect directly (see [Access Outside a Transaction](#access-outside-a-transaction)). This uniform syntax lets you reuse the same read/write logic in and out of transactions, deciding only whether to wrap it in `transact`.
+The meaning depends on context: inside a transaction, reads and writes go through snapshot isolation; outside a transaction, they take effect directly (see [Access Outside a Transaction](#access-outside-a-transaction)). This uniform syntax lets you reuse the same read/write logic in and out of transactions, deciding only whether to wrap it in `transact`.
 
 ## Transactions: transact
 
@@ -41,8 +41,8 @@ The meaning of `*` depends on context: inside a transaction, reads and writes go
 ```1y
 let counter = shared 0;
 let result = transact {
-    let v = *counter + 1;
-    *counter = v;
+    let v = counter + 1;
+    counter = v;
     v           # the transaction's return value
 };
 ```
@@ -63,11 +63,11 @@ let alice = shared 100;
 let bob = shared 50;
 
 transact {
-    let a = *alice;
-    let b = *bob;
+    let a = alice;
+    let b = bob;
     if a >= 30 {
-        *alice = a - 30;
-        *bob = b + 30;
+        alice = a - 30;
+        bob = b + 30;
     }
 };
 ```
@@ -92,8 +92,8 @@ This "do first, check later" strategy is efficient when conflicts are infrequent
 ```1y
 # Wait until the balance is sufficient, then debit
 transact {
-    if *alice >= amount {
-        *alice = *alice - amount;
+    if alice >= amount {
+        alice = alice - amount;
     } else {
         retry        # not enough balance; retry the transaction
     }
@@ -112,14 +112,14 @@ Key points:
 
 ```1y
 transact {
-    *counter = *counter + 1;
+    counter = counter + 1;
     transact {
         # the inner commit goes to the outer snapshot;
         # if the outer rolls back, this rolls back too
-        *counter = *counter + 10;
+        counter = counter + 10;
     };
     # what's read here is the outer snapshot, already including the inner writes
-    *counter
+    counter
 };
 ```
 
@@ -133,14 +133,14 @@ Nested transactions make "composition" natural: you can split a complex transact
 
 ## Access Outside a Transaction
 
-Outside a `transact` block, `*cell` and `*cell =` are still available, but with different semantics:
+Outside a `transact` block, reading and writing a cell are still available, with different semantics:
 
-- **Read outside a transaction** `*cell`: reads the cell's current value directly — no snapshot, no retry.
-- **Write outside a transaction** `*cell = expr`: writes directly, taking effect immediately, bypassing the transaction protocol.
+- **Read outside a transaction** `counter`: reads the cell's current value directly — no snapshot, no retry.
+- **Write outside a transaction** `counter = expr`: writes directly, taking effect immediately, bypassing the transaction protocol.
 
 ```1y
 let counter = shared 0;
-*counter = *counter + 1;   # outside a transaction: a direct, non-atomic read-modify-write
+counter = counter + 1;   # outside a transaction: a direct, non-atomic read-modify-write
 ```
 
 Access outside a transaction is an "escape hatch," suited to single-threaded initialization, one-time assignment, and other scenarios known to be free of contention. **Whenever there is concurrent access, put it inside `transact`**, otherwise you bypass STM's isolation guarantees and reintroduce data races.
@@ -153,16 +153,16 @@ import io;
 let counter = shared 0;
 
 # Multiple transactions increment concurrently; STM guarantees the final count is correct
-let bump = () => {
+fn bump() {
     transact {
-        let v = *counter + 1;
-        *counter = v;
+        let v = counter + 1;
+        counter = v;
         v
     }
 };
 
-io.write("after increment: " + bump());
-io.write("after increment: " + bump());
+println("after increment: " + str(bump()));
+println("after increment: " + str(bump()));
 ```
 
 Even if `bump` is called concurrently, each transaction's "read-modify-write" is atomic: conflicting transactions retry automatically, and the final value of `counter` is exactly the number of calls — no lost updates. Compared with a lock-based version — where you'd carefully pick lock granularity and worry about deadlock — the STM version has almost no concurrency details left for you to fret over.
@@ -172,8 +172,8 @@ Even if `bump` is called concurrently, each transaction's "read-modify-write" is
 | Element | Syntax | Purpose |
 |---------|--------|---------|
 | Create cell | `shared expr` | Create a transactional cell |
-| Read | `*cell` | Read current value (snapshot inside a transaction) |
-| Write | `*cell = expr` | Write a value (enrolled in commit inside a transaction) |
+| Read | `counter` | Read current value (snapshot inside a transaction) |
+| Write | `counter = expr` | Write a value (enrolled in commit inside a transaction) |
 | Transaction | `transact { ... }` | Snapshot isolation + atomic commit |
 | Retry | `retry` | Proactively rerun the transaction (cap 64) |
 | Nesting | `transact` inside `transact` | Inner commits to the outer |

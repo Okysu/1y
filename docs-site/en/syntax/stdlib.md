@@ -51,7 +51,7 @@ io.append("log.txt", "step two done");
 
 if io.exists("data.bin") {
     let line = io.read_line();   # read a line from standard input
-    io.write("-", line);
+    print("-" + line);
 }
 ```
 

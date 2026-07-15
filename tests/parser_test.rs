@@ -432,6 +432,45 @@ fn parse_never_panics_on_garbage() {
 }
 
 // ==========================================================================
+// shared expression form + error location regression
+// ==========================================================================
+
+#[test]
+fn parse_shared_as_expression() {
+    // `let x = shared 0` — shared used as an expression, not a statement.
+    let out = parse("let x = shared 0");
+    assert!(out.errors.is_empty(), "expected no errors, got {:?}", out.errors);
+    assert!(matches!(&out.program.stmts.as_slice(), [Stmt::Let { .. }]));
+}
+
+#[test]
+fn parse_shared_statement_form() {
+    // `shared x = 0` — statement form (declares a shared binding).
+    let out = parse("shared x = 0");
+    assert!(out.errors.is_empty(), "expected no errors, got {:?}", out.errors);
+}
+
+#[test]
+fn parse_error_has_line_col() {
+    // The arrow-lambda syntax `() => {}` is NOT supported; 1y uses `fn() {}`.
+    // This test verifies the parser reports the error with line/col info.
+    let src = "let f = () => { 1 }";
+    let out = parse(src);
+    assert_eq!(out.errors.len(), 1);
+    let e = &out.errors[0];
+    // The error should point at the `)` on line 1.
+    assert_eq!(e.span.start.line, 1);
+    assert!(e.span.start.col >= 5 && e.span.start.col <= 15);
+}
+
+#[test]
+fn parse_lambda_fn_form_supported() {
+    // The correct lambda syntax is `fn(params) { body }`.
+    let out = parse("let f = fn() { 1 }");
+    assert!(out.errors.is_empty(), "expected no errors, got {:?}", out.errors);
+}
+
+// ==========================================================================
 // AST snapshot tests (golden-string comparison)
 // ==========================================================================
 

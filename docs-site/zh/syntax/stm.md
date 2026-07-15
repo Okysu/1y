@@ -6,7 +6,7 @@ title: 事务内存 (STM)
 
 Actor 模型用隔离消灭了共享，但有些场景确实需要**共享**——多个组件读写同一份配置、跨多个数据结构做原子更新、生产者与消费者共享一个缓冲区。1y 为这类场景提供**软件事务内存（Software Transactional Memory，STM）**：用"事务"这个程序员早已熟悉的概念，取代难以推理的"锁"。
 
-本页介绍 STM 的全部语法：`shared` 创建事务性单元、`*cell` 读写、`transact` 开启事务、`retry` 重试，以及嵌套事务与事务外的访问规则。
+本页介绍 STM 的全部语法：`shared` 创建事务性单元、直接读写访问、`transact` 开启事务、`retry` 重试，以及嵌套事务与事务外的访问规则。
 
 ## 创建事务性单元：shared
 
@@ -20,19 +20,19 @@ let config = shared { host: "localhost", port: 8080 };
 
 `shared` 接受任意 1y 值作为初始值。单元本身是**共享的引用**——多个事务可以同时读写它，但所有访问都受 STM 的隔离与原子性保护。你可以把一个 cell 想象成"一个可替换的标签"：标签指向的值不可变，但标签本身可以被换成指向新值。
 
-## 读写单元：*cell
+## 读写单元
 
-对 cell 的读写使用 `*` 前缀运算符：
+对 cell 的读写**与普通变量语法相同**——不需要任何前缀运算符。绑定名就指向 cell；读取它得到当前值，赋值给它则替换值：
 
-- `*cell` 读取单元的当前值。
-- `*cell = expr` 把单元的值设为 `expr` 的结果。
+- `counter` 读取单元的当前值。
+- `counter = expr` 把单元的值设为 `expr` 的结果。
 
 ```1y
-let v = *counter;       # 读
-*counter = v + 1;       # 写
+let v = counter;       # 读
+counter = v + 1;       # 写
 ```
 
-`*` 的语义取决于上下文：在事务内，读写走快照隔离；在事务外，读写直接生效（见[事务外访问](#事务外访问)）。这种统一的语法让你可以在事务内外复用同一段读写逻辑，只需决定是否把它包进 `transact`。
+语义取决于上下文：在事务内，读写走快照隔离；在事务外，读写直接生效（见[事务外访问](#事务外访问)）。这种统一的语法让你可以在事务内外复用同一段读写逻辑，只需决定是否把它包进 `transact`。
 
 ## 事务：transact
 
@@ -41,8 +41,8 @@ let v = *counter;       # 读
 ```1y
 let counter = shared 0;
 let result = transact {
-    let v = *counter + 1;
-    *counter = v;
+    let v = counter + 1;
+    counter = v;
     v           # 事务的返回值
 };
 ```
@@ -63,11 +63,11 @@ let alice = shared 100;
 let bob = shared 50;
 
 transact {
-    let a = *alice;
-    let b = *bob;
+    let a = alice;
+    let b = bob;
     if a >= 30 {
-        *alice = a - 30;
-        *bob = b + 30;
+        alice = a - 30;
+        bob = b + 30;
     }
 };
 ```
@@ -92,8 +92,8 @@ transact {
 ```1y
 # 等待账户余额充足后再扣款
 transact {
-    if *alice >= amount {
-        *alice = *alice - amount;
+    if alice >= amount {
+        alice = alice - amount;
     } else {
         retry        # 余额不够，重试事务
     }
@@ -112,13 +112,13 @@ transact {
 
 ```1y
 transact {
-    *counter = *counter + 1;
+    counter = counter + 1;
     transact {
         # 内层提交到外层快照；若外层回滚，这里也一并回滚
-        *counter = *counter + 10;
+        counter = counter + 10;
     };
     # 此处读到的是外层快照，已包含内层的写入
-    *counter
+    counter
 };
 ```
 
@@ -132,14 +132,14 @@ transact {
 
 ## 事务外访问
 
-在 `transact` 块之外，`*cell` 与 `*cell =` 仍然可用，但语义不同：
+在 `transact` 块之外，读写 cell 仍然可用，但语义不同：
 
-- **事务外读** `*cell`：直接读取单元的当前值，无快照、无重试。
-- **事务外写** `*cell = expr`：直接写入，立即生效，不经过事务协议。
+- **事务外读** `counter`：直接读取单元的当前值，无快照、无重试。
+- **事务外写** `counter = expr`：直接写入，立即生效，不经过事务协议。
 
 ```1y
 let counter = shared 0;
-*counter = *counter + 1;   # 事务外：直接读改写，非原子
+counter = counter + 1;   # 事务外：直接读改写，非原子
 ```
 
 事务外的访问是"逃生舱"，适合单线程初始化、一次性赋值等确定无竞争的场景。**只要存在并发访问，就应放进 `transact`**，否则会绕过 STM 的隔离保证，引入数据竞争。
@@ -152,16 +152,16 @@ import io;
 let counter = shared 0;
 
 # 多个事务并发自增，STM 保证最终结果正确
-let bump = () => {
+fn bump() {
     transact {
-        let v = *counter + 1;
-        *counter = v;
+        let v = counter + 1;
+        counter = v;
         v
     }
 };
 
-io.write("自增后：" + bump());
-io.write("自增后：" + bump());
+println("自增后：" + str(bump()));
+println("自增后：" + str(bump()));
 ```
 
 即便 `bump` 被并发调用，每个事务的"读-改-写"也是原子的：冲突的事务自动重试，最终 `counter` 的值恰好等于调用次数，不会丢失更新。对比锁版本——那里你需要小心地选择锁粒度、避免死锁——STM 版本几乎没有需要你操心的并发细节。
@@ -171,8 +171,8 @@ io.write("自增后：" + bump());
 | 元素 | 语法 | 作用 |
 |------|------|------|
 | 创建单元 | `shared expr` | 创建事务性 cell |
-| 读 | `*cell` | 读当前值（事务内走快照） |
-| 写 | `*cell = expr` | 写值（事务内纳入提交） |
+| 读 | `counter` | 读当前值（事务内走快照） |
+| 写 | `counter = expr` | 写值（事务内纳入提交） |
 | 事务 | `transact { ... }` | 快照隔离 + 原子提交 |
 | 重试 | `retry` | 主动重跑事务（上限 64 次） |
 | 嵌套 | `transact` 内 `transact` | 内层提交到外层 |

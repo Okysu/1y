@@ -51,7 +51,7 @@ io.append("log.txt", "第二步完成");
 
 if io.exists("data.bin") {
     let line = io.read_line();   # 从标准输入读一行
-    io.write("-", line);
+    print("-" + line);
 }
 ```
 

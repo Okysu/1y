@@ -38,14 +38,14 @@ fn main() {
                     }
                     match interp.run(&src) {
                         Ok(()) => Ok(()),
-                        Err(e) => Err(format!("{}", e)),
+                        Err(e) => Err(e.render(&src)),
                     }
                 })
                 .expect("spawn interpreter thread")
                 .join()
                 .expect("interpreter thread panicked");
             if let Err(e) = result {
-                eprintln!("error: {}", e);
+                eprintln!("{}", e);
                 std::process::exit(1);
             }
         }
