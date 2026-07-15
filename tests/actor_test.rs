@@ -428,3 +428,102 @@ fn test_handler_name_does_not_shadow_builtin() {
         other => panic!("expected Int 221, got {:?}", other),
     }
 }
+
+// ---------------------------------------------------------------------------
+// yield — inline mailbox draining (Phase 4.6)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_yield_drains_fire_and_forget_messages() {
+    // `yield` should process `!` messages that were queued before it,
+    // making their side effects visible to subsequent `?` requests.
+    let src = r#"
+        actor Counter {
+            state count = 0
+            on inc() { count = count + 1 }
+            on get() { reply(count) }
+        }
+        let c = spawn Counter();
+        c ! inc();
+        c ! inc();
+        c ! inc();
+        // Without yield, these `!` messages would only be drained at
+        // program exit. With yield, they are processed here.
+        yield;
+        c ? get()
+    "#;
+    match eval_val(src) {
+        Value::Int(n) => assert_eq!(n.to_string(), "3", "yield should drain 3 inc messages"),
+        other => panic!("expected Int 3, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_yield_returns_nil() {
+    let src = r#"
+        actor A { on ping() { reply(nil) } }
+        let a = spawn A();
+        a ! ping();
+        yield
+    "#;
+    match eval_val(src) {
+        Value::Nil => {}
+        other => panic!("yield should return Nil, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_yield_with_no_actors_is_noop() {
+    // yield with no live actors should just return Nil.
+    assert_eq!(eval_val("yield"), Value::Nil);
+}
+
+#[test]
+fn test_yield_processes_multiple_actors() {
+    // yield should drain mailboxes of ALL live actors, not just one.
+    let src = r#"
+        actor Box {
+            state val = 0
+            on set(v) { val = v }
+            on get() { reply(val) }
+        }
+        let a = spawn Box();
+        let b = spawn Box();
+        a ! set(10);
+        b ! set(20);
+        yield;
+        let va = a ? get();
+        let vb = b ? get();
+        va + vb
+    "#;
+    match eval_val(src) {
+        Value::Int(n) => assert_eq!(n.to_string(), "30"),
+        other => panic!("expected Int 30, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_yield_in_a_loop_for_event_processing() {
+    // Simulate an event loop: queue messages, yield to process them,
+    // repeat. This is the pattern used by the HTTP server.
+    let src = r#"
+        actor Sum {
+            state total = 0
+            on add(n) { total = total + n }
+            on total() { reply(total) }
+        }
+        let s = spawn Sum();
+        let i = 0;
+        while i < 5 {
+            s ! add(i);
+            yield;
+            i = i + 1
+        };
+        s ? total()
+    "#;
+    // 0 + 1 + 2 + 3 + 4 = 10
+    match eval_val(src) {
+        Value::Int(n) => assert_eq!(n.to_string(), "10"),
+        other => panic!("expected Int 10, got {:?}", other),
+    }
+}

@@ -36,6 +36,8 @@ rustls-pemfile = "2"
 webpki-roots = "0.26"
 # Phase 4.6: ffi (dynamic library loading)
 libloading = "0.8"
+# Phase 4.7: stackful coroutines for colorless async (Zig-style)
+corosensei = "0.2"
 
 [dev-dependencies]
 proptest = "1"

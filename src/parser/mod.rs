@@ -949,6 +949,20 @@ impl Parser {
                     span: start.union(self.prev_span()),
                 })
             }
+            TokenKind::Keyword(Keyword::Yield) => {
+                self.bump();
+                Ok(Expr::Yield {
+                    span: start.union(self.prev_span()),
+                })
+            }
+            TokenKind::Keyword(Keyword::Await) => {
+                self.bump();
+                let e = self.parse_expr(0)?;
+                Ok(Expr::Await {
+                    expr: Box::new(e),
+                    span: start.union(self.prev_span()),
+                })
+            }
             TokenKind::Keyword(Keyword::Transact) => {
                 self.bump();
                 let body = self.parse_expr(0)?;

@@ -10,6 +10,7 @@
 //!   - `accept(listener) -> Opaque`     — accept a connection, returns TcpStream
 //!   - `connect(addr) -> Opaque`        — connect to a remote, returns TcpStream
 //!   - `read(stream, n) -> Str | Nil`   — read up to n bytes (Nil on EOF)
+//!   - `read_async(stream, n) -> Task`  — async read, returns Task<Str|Nil>
 //!   - `read_line(stream) -> Str | Nil` — read until newline (Nil on EOF)
 //!   - `write(stream, data)`            — write a string to the stream
 //!   - `close(resource)`                — close a listener or stream
@@ -32,6 +33,7 @@ pub fn build() -> ModuleRef {
             ("accept", NativeFn { name: "accept", func: bi_accept }),
             ("connect", NativeFn { name: "connect", func: bi_connect }),
             ("read", NativeFn { name: "read", func: bi_read }),
+            ("read_async", NativeFn { name: "read_async", func: bi_read_async }),
             ("read_line", NativeFn { name: "read_line", func: bi_read_line }),
             ("write", NativeFn { name: "write", func: bi_write }),
             ("close", NativeFn { name: "close", func: bi_close }),
@@ -77,10 +79,18 @@ fn bi_accept(args: &[Value]) -> Result<Value, InterpreterError> {
     let r = opaque_at(args, 0, "socket.accept")?;
     match &*r {
         NativeResource::TcpListener(l) => {
-            let (stream, _addr) = l.borrow().accept().map_err(|e| InterpreterError::RuntimeError {
-                msg: format!("socket.accept: {}", e), span: None,
-            })?;
-            Ok(Value::Opaque(Rc::new(NativeResource::TcpStream(Rc::new(RefCell::new(stream))))))
+            match l.borrow().accept() {
+                Ok((stream, _addr)) => {
+                    Ok(Value::Opaque(Rc::new(NativeResource::TcpStream(Rc::new(RefCell::new(stream))))))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Non-blocking mode: no pending connection — return Nil.
+                    Ok(Value::Nil)
+                }
+                Err(e) => Err(InterpreterError::RuntimeError {
+                    msg: format!("socket.accept: {}", e), span: None,
+                }),
+            }
         }
         _ => Err(InterpreterError::TypeError {
             expected: "TcpListener", got: "opaque", op: "socket.accept".into(), span: None,
@@ -111,17 +121,65 @@ fn bi_read(args: &[Value]) -> Result<Value, InterpreterError> {
         NativeResource::TcpStream(s) => {
             use std::io::Read;
             let mut buf = vec![0u8; n];
-            let read = s.borrow_mut().read(&mut buf).map_err(|e| InterpreterError::RuntimeError {
-                msg: format!("socket.read: {}", e), span: None,
-            })?;
-            if read == 0 {
-                return Ok(Value::Nil);
-            }
+            let read = match s.borrow_mut().read(&mut buf) {
+                Ok(0) => return Ok(Value::Nil), // EOF
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Non-blocking mode: no data available yet — return Nil.
+                    return Ok(Value::Nil);
+                }
+                Err(e) => return Err(InterpreterError::RuntimeError {
+                    msg: format!("socket.read: {}", e), span: None,
+                }),
+            };
             buf.truncate(read);
             Ok(Value::str(String::from_utf8_lossy(&buf).to_string()))
         }
         _ => Err(InterpreterError::TypeError {
             expected: "TcpStream", got: "opaque", op: "socket.read".into(), span: None,
+        }),
+    }
+}
+
+/// `socket.read_async(stream, n) -> Task<Str|Nil>` — async non-blocking read.
+/// Returns a Task that polls the stream (which must be in non-blocking mode).
+/// When data is available, completes with `Str`. On EOF, completes with `Nil`.
+fn bi_read_async(args: &[Value]) -> Result<Value, InterpreterError> {
+    let r = opaque_at(args, 0, "socket.read_async")?;
+    let n = match args.get(1) {
+        Some(Value::Int(n)) => num_traits::ToPrimitive::to_usize(n).unwrap_or(0),
+        Some(v) => return Err(InterpreterError::TypeError {
+            expected: "Int", got: v.type_name(), op: "socket.read_async".into(), span: None,
+        }),
+        None => return Err(InterpreterError::ArityError {
+            expected: 2, got: args.len(), callee: "socket.read_async".into(), span: None,
+        }),
+    };
+    match &*r {
+        NativeResource::TcpStream(s) => {
+            // Clone the Rc<RefCell<TcpStream>> so the poll closure can access it.
+            let s = s.clone();
+            let task = crate::value::TaskState::Pending(Box::new(move || {
+                use std::io::Read;
+                let mut buf = vec![0u8; n];
+                match s.borrow_mut().read(&mut buf) {
+                    Ok(0) => crate::value::TaskPoll::Ready(Value::Nil), // EOF
+                    Ok(read) => {
+                        buf.truncate(read);
+                        crate::value::TaskPoll::Ready(Value::str(
+                            String::from_utf8_lossy(&buf).to_string(),
+                        ))
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        crate::value::TaskPoll::Pending
+                    }
+                    Err(_) => crate::value::TaskPoll::Ready(Value::Nil), // error → treat as EOF
+                }
+            }));
+            Ok(Value::Task(std::rc::Rc::new(std::cell::RefCell::new(task))))
+        }
+        _ => Err(InterpreterError::TypeError {
+            expected: "TcpStream", got: "opaque", op: "socket.read_async".into(), span: None,
         }),
     }
 }

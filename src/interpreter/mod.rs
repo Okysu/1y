@@ -118,6 +118,9 @@ pub struct Interpreter {
     module_load_stack: Vec<PathBuf>,
     /// Directory of the entry file, used for relative `import` resolution.
     entry_dir: Option<PathBuf>,
+    /// Async scheduler (Phase 4.7: Zig-style colorless async).
+    /// Holds coroutines for actor handlers that may `await`.
+    scheduler: crate::runtime::scheduler::Scheduler,
 }
 
 impl Default for Interpreter {
@@ -142,6 +145,7 @@ impl Interpreter {
             module_cache: HashMap::new(),
             module_load_stack: Vec::new(),
             entry_dir: None,
+            scheduler: crate::runtime::scheduler::Scheduler::new(),
         }
     }
 
@@ -985,6 +989,56 @@ impl Interpreter {
                     span: Some(*span),
                 })
             }
+            Expr::Yield { .. } => {
+                // Drain all pending `!` messages from live actors' mailboxes.
+                // Uses async drain (coroutine-based) so handlers can `await`.
+                self.drain_mailboxes_async()?;
+                Ok(Value::Nil)
+            }
+            Expr::Await { expr, span } => {
+                // Zig-style colorless async: evaluate the expression to get a
+                // Task, then suspend the current coroutine until the task is
+                // ready. If not in a coroutine, poll synchronously (blocking).
+                let task_val = self.eval_expr(env, expr)?;
+                let task_ref = match &task_val {
+                    Value::Task(t) => t.clone(),
+                    other => {
+                        return Err(InterpreterError::TypeError {
+                            expected: "Task",
+                            got: other.type_name(),
+                            op: "await".into(),
+                            span: Some(*span),
+                        })
+                    }
+                };
+                if crate::runtime::scheduler::in_coroutine() {
+                    // Inside a coroutine: suspend and let scheduler poll.
+                    let v = crate::runtime::scheduler::await_task(task_ref);
+                    Ok(v)
+                } else {
+                    // Not in a coroutine: poll synchronously (busy-wait).
+                    // This is the fallback for top-level await.
+                    loop {
+                        let ready = {
+                            let t = task_ref.borrow();
+                            match &*t {
+                                crate::value::TaskState::Ready(v) => Some(v.clone()),
+                                crate::value::TaskState::Consumed => Some(Value::Nil),
+                                crate::value::TaskState::Pending(f) => match f() {
+                                    crate::value::TaskPoll::Ready(v) => Some(v),
+                                    crate::value::TaskPoll::Pending => None,
+                                },
+                            }
+                        };
+                        if let Some(v) = ready {
+                            *task_ref.borrow_mut() = crate::value::TaskState::Consumed;
+                            return Ok(v);
+                        }
+                        // Spin briefly to avoid 100% CPU.
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+            }
 
             // --- actors ---
             Expr::Spawn { name, args, span } => {
@@ -994,9 +1048,12 @@ impl Interpreter {
                         span: Some(*span),
                     }
                 })?;
-                // The actor's environment is a child of the global so it can
-                // see top-level functions/types but not caller locals.
-                let actor_env = Environment::child(&self.global);
+                // The actor's environment is a child of the caller's environment,
+                // giving it access to module-level functions and imports (like
+                // `socket`, `parse_request`) via the scope chain. Actor isolation
+                // is provided by `state` decls (own mutable bindings) and message
+                // passing — the parent chain is effectively read-only to the actor.
+                let actor_env = Environment::child(env);
                 // Evaluate constructor args in the caller's environment.
                 let mut arg_vals = Vec::with_capacity(args.len());
                 for a in args {
@@ -1495,6 +1552,80 @@ impl Interpreter {
                 }
             }
             i += 1;
+        }
+        Ok(())
+    }
+
+    /// Like `drain_mailboxes`, but each handler runs in its own coroutine,
+    /// enabling `await` inside handlers. Used by the HTTP server event loop.
+    ///
+    /// # Safety
+    /// This method uses raw pointers to share `self` across coroutines.
+    /// It is safe because: (1) single-threaded, (2) corosensei's `suspend`
+    /// returns control to this function, which never accesses `self` while
+    /// a coroutine is running, (3) coroutines are resumed one at a time.
+    pub fn drain_mailboxes_async(&mut self) -> Result<(), InterpreterError> {
+        // Collect all pending messages from all actors.
+        let mut pending: Vec<(ActorRef, Value)> = Vec::new();
+        for actor_ref in &self.live_actors {
+            loop {
+                let env_opt = actor_ref.borrow_mut().mailbox.pop_front();
+                match env_opt {
+                    Some(env) => pending.push((actor_ref.clone(), env.msg)),
+                    None => break,
+                }
+            }
+        }
+
+        // Spawn a coroutine for each pending message.
+        let self_ptr: *mut Interpreter = self;
+        for (actor_ref, msg) in pending {
+            // Clone the handler + env out so the coroutine closure is 'static.
+            let handler_name = match &msg {
+                Value::Variant { name, .. } => name.as_str().to_string(),
+                _ => continue, // skip non-variant messages
+            };
+            let oc = match actor_ref.borrow().handlers.get(&handler_name) {
+                Some(h) => h.clone(),
+                None => continue, // no handler — skip
+            };
+            let call_env = Environment::child(&actor_ref.borrow().env);
+            if let Value::Variant { args, .. } = &msg {
+                if oc.params.len() != args.len() {
+                    return Err(InterpreterError::ArityError {
+                        expected: oc.params.len(),
+                        got: args.len(),
+                        callee: format!("on {}", handler_name),
+                        span: Some(Span::dummy()),
+                    });
+                }
+                for (param, arg) in oc.params.iter().zip(args.iter()) {
+                    call_env.borrow_mut().define(param.name.clone(), arg.clone());
+                }
+            }
+
+            // Spawn coroutine: the closure captures the raw pointer to self.
+            // SAFETY: self_ptr is valid for the duration of run_until_complete
+            // because `self` outlives the scheduler. The coroutine only
+            // accesses the interpreter while running (not while suspended),
+            // and the scheduler only runs one coroutine at a time.
+            self.scheduler.spawn_handler(move || {
+                // SAFETY: the coroutine runs inside drain_mailboxes_async,
+                // which holds a unique borrow on self. The scheduler never
+                // accesses self_ptr while this coroutine is suspended.
+                let interp: &mut Interpreter = unsafe { &mut *self_ptr };
+                match interp.eval_expr(&call_env, &oc.body) {
+                    Ok(_) => Ok(Value::Nil),
+                    Err(InterpreterError::Reply { value, .. }) => Ok(value),
+                    Err(e) => Err(e),
+                }
+            });
+        }
+
+        // Run the scheduler until all coroutines complete or park on I/O.
+        let results = self.scheduler.run_until_complete();
+        for r in results {
+            r?;
         }
         Ok(())
     }

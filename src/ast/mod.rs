@@ -288,6 +288,14 @@ pub enum Expr {
     Return { value: Option<Box<Expr>>, span: Span },
     /// `reply expr` — only valid inside an `on` handler.
     Reply { value: Box<Expr>, span: Span },
+    /// `yield` — drain all pending `!` messages from live actors' mailboxes.
+    /// Returns `nil`. Used in event loops (e.g. HTTP server) to process
+    /// fire-and-forget messages without waiting for program exit.
+    Yield { span: Span },
+    /// `await expr` — suspend the current coroutine until the Task completes.
+    /// If the Task is already complete, returns immediately (sync path).
+    /// Any function can use `await` — there is no function coloring (Zig-style).
+    Await { expr: Box<Expr>, span: Span },
 
     /// `target = value` — assignment (returns `nil`). `target` is an lvalue
     /// ([`Expr::Ident`], [`Expr::Field`], [`Expr::Index`]).
@@ -365,6 +373,8 @@ impl Expr {
             | Expr::Retry { span: s }
             | Expr::Return { span: s, .. }
             | Expr::Reply { span: s, .. }
+            | Expr::Yield { span: s }
+            | Expr::Await { span: s, .. }
             | Expr::Assign { span: s, .. }
             | Expr::CompoundAssign { span: s, .. }
             | Expr::While { span: s, .. }

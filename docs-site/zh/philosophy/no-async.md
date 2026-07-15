@@ -1,82 +1,130 @@
 ---
-title: 为什么不实现 async/await
+title: 无色异步 —— 为什么没有 `async` 关键字
 ---
 
-# 为什么不实现 async/await
+# 无色异步 —— 为什么没有 `async` 关键字
 
-`async/await` 已成为现代语言的标配:JavaScript、Python、Rust、C#、Kotlin 都采纳了它。在这样的大潮中,1y 选择**不**实现 async/await。这不是疏忽,也不是技术能力的不足,而是一个深思熟虑的设计决定。本章解释这个决定的理由。
+`async/await` 已经成为现代语言的标配：JavaScript、Python、Rust、C#、Kotlin 纷纷采纳。1y 走了一条不同的路：**没有 `async` 关键字，但有 `await`**。这并不矛盾——它是*无色异步*，与 Zig 采用的方案一致。本章解释原因。
 
-## async/await 解决了什么问题
+## 真正的问题：函数染色
 
-要理解 1y 的选择,先要承认 async/await 解决的真问题:**在单线程里处理大量 I/O 时,阻塞式 I/O 会浪费线程资源**。一个线程阻塞在 socket 读上,就占着一个 OS 线程什么都不做。若想同时处理一万个连接,要么开一万个线程(内存爆炸),要么用非阻塞 I/O + 事件循环。
+`async/await` 最深的代价不在语法，而在**函数染色**。一旦引入 `async`，函数就分裂成两个世界：
 
-`async/await` 是"用同步的写法写非阻塞代码"的语法糖:把函数编译成状态机,在 `await` 点让出控制权,让事件循环去服务其他连接。这确实让高并发服务端的代码可读了。
+- **async 函数**只能被其他 async 函数调用，或在 async 运行时里调度；
+- **普通函数**不能调用 async 函数（或只能阻塞等待）。
 
-## async/await 引入了什么复杂度
+这种分裂是传染性的：一旦底层函数变成 `async`，调用链上的每个函数都得变成 `async`。社区称之为"async 传染"。它的实际后果包括：
 
-然而,这个语法糖的代价是**函数着色(function coloring)**。一旦引入 async,函数就被分成两个世界:
+- **API 碎片化**：同一个功能往往要同时提供 sync 和 async 两套接口（如 Rust 的 `Read` vs `AsyncRead`）。
+- **类型复杂度**：Rust 的 `Future` 牵扯出 `Pin`、`Poll`、`Waker`、`Send` 约束——足以劝退新手。
+- **运行时碎片化**：tokio、async-std、smol、embassy 互不兼容；选运行时等于选生态。
+- **调试困难**：async 栈追踪是断的，常常指向运行时内部而非业务代码。
+- **取消语义模糊**：future 被 drop 时，资源清理的时机不直观，容易泄漏。
 
-- **async 函数**只能被其他 async 函数调用,或在异步运行时里调度;
-- **普通函数**不能调用 async 函数(或只能阻塞等待)。
+这些复杂度不是"习惯就好"——它们是**结构性的**，根源在于函数有两种颜色这一基本事实。
 
-这个割裂会传染:一个底层函数一旦变成 async,所有调用链上的函数都得变 async。社区里称之为"async 传染病"。它带来的实际后果包括:
+## 1y 的答案：无色异步（Zig 风格）
 
-- **API 分裂**:同一个功能往往要提供同步与异步两套接口(如 Rust 的 `Read` 与 `AsyncRead`)。
-- **类型复杂度**:Rust 的 `Future` 牵出 `Pin`、`Poll`、`Waker`、`Send` 边界,足以劝退初学者。
-- **执行器割裂**:tokio、async-std、smol、embassy 互不兼容,选择运行时即选择生态。
-- **调试困难**:异步调用栈是断裂的,堆栈追踪常常指向运行时内部,而非业务代码。
-- **取消语义模糊**:一个 future 被丢弃时,资源清理的时机不直观,容易泄漏。
+1y 不通过给函数染色来解决并发问题。规则很简单：
 
-这些复杂度并非"用得久了就习惯了"——它们是**结构性的**,源于"函数有两种颜色"这一基本事实。
+> **没有 `async` 关键字。任何函数都能用 `await`。函数就是函数。**
 
-## 1y 的替代方案:阻塞 I/O + Actor
+这正是 Zig async 模型背后的洞见。编译器/运行时根据*正在 await 的是什么*来决定调用是否挂起，而不是根据函数定义上的标记。具体来说：
 
-1y 用另一种方式解决高并发 I/O 问题:**保留阻塞式 I/O,用 Actor 提供并发**。
-
-关键洞察是:Actor 本身就是轻量级的执行单元。1y 的运行时把大量 Actor 复用(multiplex)在一组 OS 线程上,当某个 Actor 阻塞在 I/O 时,运行时调度其他 Actor 到其他线程执行。从程序员视角,代码是简单的阻塞调用;从运行时视角,并发度由 Actor 数量决定,而非线程数量。
+- 调用 `await socket.read_async(stream, n)` 的函数**可能**在那一挂起点挂起——但它仍然是普通 `fn`，可以从任何地方调用。
+- 只调用同步代码的函数永远不会挂起——不需要标记。
+- 同一个函数可以两者都做：同步工作，然后 `await` 一个 Task，然后更多同步工作。
 
 ```1y
-actor Fetcher {
-  on Fetch(url, reply) {
-    # 这是阻塞调用,但 Actor 模型让它不会拖垮整个系统
-    let body = http_get(url)
-    reply ! body
-  }
+// 普通 fn。没有 async 标记。但它能用 await。
+fn handler(req) {
+    let stream = get(req, "stream");
+    // 暂无数据时挂起协程。
+    // 等待期间其他连接继续被服务。
+    let raw = await socket.read_async(stream, 65536);
+    // 普通同步调用——无需标记。
+    let parsed = parse_request(raw);
+    // 再 await 一次——比如给 SSE 流调速。
+    await process.sleep_async(500);
+    build_response(parsed)
 }
-
-# 启动一万个 Fetcher 同时抓取,毫不费力
-let fetchers = List.map(urls, url => {
-  let f = spawn Fetcher
-  f ! Fetch(url, self)
-})
 ```
 
-注意这段代码的简洁:**没有 `async`、没有 `await`、没有 `Pin`、没有运行时选择**。每个 Actor 内部的代码就是普通的顺序代码,读起来像同步程序。并发性体现在"启动了一万个 Actor",而不是"给每个函数加了 `async` 修饰符"。
+注意这里**没有**什么：没有 `async fn`，没有 `.await` 后缀，没有 `Pin<Box<dyn Future>>`，没有运行时选择。函数读起来和同步代码一模一样。唯一的新关键字是 `await`，而且它在*任何*函数里都能用。
 
-## 心智模型的统一
+## 工作原理：Task + 协程
 
-async/await 最大的隐性成本不是写代码,而是**心智模型的分裂**。程序员必须时刻思考:
+底层上，1y 使用有栈协程（通过 `corosensei` 库）配合协作式调度器：
 
-- 这个函数是 async 吗?
-- 我应该 `.await` 还是 `spawn`?
-- 这个 future 是 `Send` 吗?能跨线程吗?
-- 这个锁是异步锁还是同步锁?
-- 这段代码会不会阻塞运行时?
+1. **`Task`** —— 代表异步操作的值。`socket.read_async(stream, n)` 返回 `Task<Str|Nil>`。`process.sleep_async(ms)` 返回 `Task<Nil>`。Task 有三种状态：`Pending`、`Ready(value)`、`Consumed`。
 
-在 1y 中,这些问题**不存在**。所有函数都是一种颜色——普通函数。所有 I/O 都是阻塞的,但阻塞的是 Actor,不是整个系统。所有"并发"都通过 spawn Actor 来表达。心智模型只有一个:**"启动一个 Actor 处理这件事"**。
+2. **`await task`** —— 挂起当前协程，向调度器注册该 Task。当 Task 变为 `Ready` 时，调度器用 Task 的值恢复协程。如果在协程外（顶层）调用，`await` 退化为同步忙轮询。
 
-## 权衡:我们放弃了什么
+3. **`yield`** —— 并发心跳。在 Actor 事件循环里（如 `http.serve`），`yield` 为每条待处理消息派生一个协程并运行调度器。`await` 了尚未就绪 Task 的协程保持挂起；调度器每轮 tick 轮询它们的 Task，就绪后恢复执行。
 
-诚实地说,这个决定是有代价的。
+4. **调度器** —— 单线程、协作式。`run_until_complete` 先跑所有就绪协程，再轮询挂起的 Task，重复直到全部完成或全部挂起（等 I/O）。并发不派生 OS 线程。
 
-- **细粒度并发控制更弱**。在某些场景下(如事件循环里精细地交错多个 I/O),async/await 的表达力确实更强。1y 程序员需要把这些场景改写成多个 Actor 协作,有时更啰嗦。
-- **极高性能场景的下限更低**。零拷贝、零分配的异步框架(如 Rust 的某些库)在极端性能下有优势。1y 的 Actor 调度开销虽小,但不是零。
-- **与 async 生态互操作需要 FFI 桥接**。复用 Rust 的 async 库时,需要在 FFI 边界把异步调用包成阻塞调用。
+关键性质：**当协程 await 时，其他协程在跑**。慢 handler 不会阻塞其他进行中的连接。
+
+## 为什么这比彩色 async/await 更好
+
+| | 彩色 `async/await` | 1y 的无色 `await` |
+|---|---|---|
+| 函数标记 | 需要 `async fn` | 普通 `fn`——无标记 |
+| 调用 async 函数 | 必须在 async 上下文里 | 任何函数都能 `await` |
+| 传染性 | 有——async 沿调用链向上传染 | 无——函数只有一种颜色 |
+| 运行时 | tokio/async-std/smol（互不兼容） | 内置调度器，无需选择 |
+| 类型复杂度 | `Future` + `Pin` + `Poll` + `Waker` | `Task`——一个普通值 |
+| 心智模型 | "这个是 async 吗？要 `.await` 吗？" | "返回 Task 就 `await` 它" |
+
+## 与 Actor 的关系
+
+无色异步不取代 Actor——而是互补。Actor 提供*结构化并发*（隔离、消息传递、监督）。`await` 提供*细粒度挂起*，在单个 Actor 的 handler 内部。
+
+典型模式：每个连接派生一个 Actor，让 handler `await` 异步 I/O。Actor 模型给你隔离和基于消息的 API；`await` 让你在 handler 里做非阻塞 I/O，而不用把函数拆成 sync/async 两个世界。
+
+```1y
+actor Connection {
+    on Handle(stream, handler) {
+        // Actor handler 内部 await——无色异步。
+        let raw = await socket.read_async(stream, 65536);
+        let resp = handler(parse_request(raw));
+        socket.write(stream, build_response(resp));
+        socket.close(stream)
+    }
+}
+
+// accept 循环：派生 Connection actor，yield 推进它们。
+fn serve(addr, handler) {
+    let listener = socket.listen(addr);
+    socket.set_nonblocking(listener, true);
+    loop {
+        let stream = socket.accept(listener);
+        if is_nil(stream) {
+            try { yield } rescue { nil };
+            process.sleep_ms(1)
+        } else {
+            let conn = spawn Connection();
+            conn ! Handle(stream, handler)
+        };
+        try { yield } rescue { nil }
+    }
+}
+```
+
+## 权衡：我们放弃了什么
+
+诚实地说，这个设计有代价。
+
+- **协作式，非抢占式。** 永不 `await` 的协程会一直跑到完成。没有抢占。长 CPU 密集循环应定期 yield 或卸载到 `process.exec`。
+- **单线程。** 真正的多核并行需要多进程（通过 `process`）或未来的多线程调度器工作。无色异步给的是并发，不是并行。
+- **轮询式 I/O。** 当前调度器每次 `yield` 轮询所有挂起 Task。几百个连接没问题；上万连接需要 `epoll`/`kqueue` 支持的轮询器（如 `mio`）。
+- **暂无 `Task.all` / `Task.race`。** 只提供 `await`。并发组合通过派生多个 Actor 完成。这是刻意的极简——与 Zig"一个原语做好"的哲学一致。
 
 ## 为什么这个权衡值得
 
-1y 的目标用户是**写业务逻辑的程序员**,不是写高性能网络框架的工程师。对前者,心智简单比极限吞吐更重要;代码正确比代码快更重要;能信任并发原语比能微调调度更重要。
+1y 的目标用户是**写业务逻辑的程序员**，不是构建高性能网络框架的工程师。对前者，心智简单比峰值吞吐更重要；正确性比速度更重要；能信任并发原语比微调调度更重要。
 
-`async/await` 把"如何高效利用线程"的工程问题暴露给了每一个应用程序员;1y 选择把这个问题留给运行时,让程序员只关心"我要并发地做什么"。这是一种价值排序——**简单性优先,性能其次**,而性能由 Rust 实现的运行时来兜底。
+彩色 `async/await` 把"如何高效使用线程"这个工程问题暴露给每个应用程序员，然后逼他们维护两个平行的函数宇宙。1y 把线程问题留给运行时，让程序员写**一种函数**——既能做同步工作，又能 `await` 异步 I/O——零仪式感。
 
-当 async 生态的复杂度已经让"学习 Rust 的异步"成为一门独立学问时,1y 希望证明:对于绝大多数应用场景,**阻塞 I/O + Actor 足够好,而且快乐得多**。这不是对 async/await 的否定,而是对"它是否应当成为所有语言的默认选择"的质疑。1y 给出了一个不同的答案。
+这不是否认 async/await 的力量；而是拒绝**函数染色**。Zig 证明了可以有不带颜色分裂的异步挂起。1y 沿着这条路走：**有 `await` 无 `async`，并发不染色。**

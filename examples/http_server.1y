@@ -6,11 +6,15 @@
 // This example demonstrates:
 //   1. Importing a pure-1y library (lib/http.1y)
 //   2. Defining route handlers
-//   3. Serving HTML and JSON responses
+//   3. Actor-based concurrent connection handling (Connection actor + yield)
+//   4. Colorless async: the /slow handler uses `await process.sleep_async`
+//      — note the handler is a plain `fn`, no `async` marker. A slow /slow
+//      request does NOT block other connections.
 //
 // Note: `import lib.http` resolves to examples/lib/http.1y.
 
 import lib.http as http;
+import process;
 
 // Simple route handler.
 fn handler(req) {
@@ -40,6 +44,16 @@ fn handler(req) {
     if path == "/status" {
         let body = "\{ \"status\": \"running\", \"server\": \"1y-self-hosted\" \}";
         return \{ "status": 200, "body": body, "headers": ["Content-Type: application/json; charset=utf-8"] \}
+    };
+
+    // Route: GET /slow — simulates a slow handler (500ms) for concurrency testing.
+    // Uses `await process.sleep_async` — colorless async: `handler` is a plain
+    // `fn`, no `async` marker. The coroutine suspends for 500ms while other
+    // connections keep being served. Compare with `process.sleep_ms` which
+    // would block the whole event loop.
+    if path == "/slow" {
+        await process.sleep_async(500);
+        return \{ "status": 200, "body": "slow done", "headers": ["Content-Type: text/plain; charset=utf-8"] \}
     };
 
     // 404 for everything else.

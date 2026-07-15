@@ -1,25 +1,19 @@
 ---
-title: Why No async/await
+title: Colorless Async — Why No `async` Keyword
 ---
 
-# Why No async/await
+# Colorless Async — Why No `async` Keyword
 
-`async/await` has become a standard feature of modern languages: JavaScript, Python, Rust, C#, and Kotlin have all adopted it. Against this tide, 1y chooses **not** to implement async/await. This is not an oversight, nor a lack of technical capability — it is a deliberate design decision. This chapter explains the reasoning.
+`async/await` has become a standard feature of modern languages: JavaScript, Python, Rust, C#, and Kotlin have all adopted it. 1y takes a different path: **there is no `async` keyword, but there is `await`**. This is not a contradiction — it is *colorless async*, the same approach Zig takes. This chapter explains why.
 
-## What Problem async/await Solves
+## The Real Problem: Function Coloring
 
-To understand 1y's choice, first acknowledge the real problem async/await solves: **when handling a lot of I/O in a single thread, blocking I/O wastes thread resources**. A thread blocked on a socket read occupies an OS thread while doing nothing. To handle ten thousand connections simultaneously, you either spawn ten thousand threads (memory blowup) or use non-blocking I/O with an event loop.
-
-`async/await` is syntactic sugar for "writing non-blocking code in a synchronous style": the function is compiled into a state machine that yields control at `await` points, letting the event loop service other connections. This genuinely makes high-concurrency server code readable.
-
-## What Complexity async/await Introduces
-
-However, the price of this sugar is **function coloring**. Once async is introduced, functions split into two worlds:
+The deepest cost of `async/await` is not syntax — it is **function coloring**. Once `async` exists, functions split into two worlds:
 
 - **async functions** can only be called by other async functions, or scheduled inside an async runtime;
 - **plain functions** cannot call async functions (or can only block on them).
 
-This split is contagious: once a low-level function becomes async, every function on the call chain must become async too. The community calls it "async contagion." Its practical consequences include:
+This split is contagious: once a low-level function becomes `async`, every function on the call chain must become `async` too. The community calls it "async contagion." Its practical consequences include:
 
 - **API fragmentation**: the same feature often needs both sync and async interfaces (e.g. Rust's `Read` vs `AsyncRead`).
 - **Type complexity**: Rust's `Future` pulls in `Pin`, `Poll`, `Waker`, and `Send` bounds — enough to deter newcomers.
@@ -29,55 +23,108 @@ This split is contagious: once a low-level function becomes async, every functio
 
 These complexities are not "you get used to it" — they are **structural**, stemming from the basic fact that functions come in two colors.
 
-## 1y's Alternative: Blocking I/O + Actors
+## 1y's Answer: Colorless Async (Zig-style)
 
-1y solves the high-concurrency I/O problem a different way: **keep blocking I/O, and use Actors for concurrency**.
+1y solves the concurrency problem without coloring functions. The rule is simple:
 
-The key insight is that an Actor is itself a lightweight unit of execution. 1y's runtime multiplexes a large number of Actors onto a pool of OS threads; when one Actor blocks on I/O, the runtime schedules other Actors onto other threads. From the programmer's view, the code is a plain blocking call; from the runtime's view, concurrency is determined by the number of Actors, not the number of threads.
+> **There is no `async` keyword. Any function can use `await`. A function is just a function.**
+
+This is the same insight behind Zig's async model. The compiler/runtime decides whether a call suspends or not based on *what is being awaited*, not based on a marker on the function definition. Concretely:
+
+- A function that calls `await socket.read_async(stream, n)` **may** suspend at that point — but it is still a plain `fn`, callable from anywhere.
+- A function that calls only synchronous code never suspends — no marker needed.
+- The same function can do both: synchronous work, then `await` a Task, then more synchronous work.
 
 ```1y
-actor Fetcher {
-  on Fetch(url, reply) {
-    # This is a blocking call, but the Actor model means it won't
-    # bring down the whole system.
-    let body = http_get(url)
-    reply ! body
-  }
+// A plain fn. No `async` marker. Yet it can `await`.
+fn handler(req) {
+    let stream = get(req, "stream");
+    // Suspends the coroutine if no data is available yet.
+    // Other connections keep being served while this one waits.
+    let raw = await socket.read_async(stream, 65536);
+    // Plain synchronous call — no marker needed.
+    let parsed = parse_request(raw);
+    // Another await — e.g. pacing an SSE stream.
+    await process.sleep_async(500);
+    build_response(parsed)
 }
-
-# Spin up ten thousand Fetchers to fetch concurrently — effortless.
-let fetchers = List.map(urls, url => {
-  let f = spawn Fetcher
-  f ! Fetch(url, self)
-})
 ```
 
-Note the simplicity: **no `async`, no `await`, no `Pin`, no runtime choice**. The code inside each Actor is ordinary sequential code that reads like a synchronous program. Concurrency shows up as "spawned ten thousand Actors," not as "added an `async` modifier to each function."
+Note what is **not** here: no `async fn`, no `.await` suffix, no `Pin<Box<dyn Future>>`, no runtime choice. The function reads exactly like synchronous code. The only new keyword is `await`, and it works in *any* function.
 
-## A Unified Mental Model
+## How It Works: Tasks + Coroutines
 
-The biggest hidden cost of async/await is not writing the code — it is the **fragmentation of the mental model**. The programmer must constantly ask:
+Under the hood, 1y uses stackful coroutines (via the `corosensei` library) with a cooperative scheduler:
 
-- Is this function async?
-- Should I `.await` it or `spawn` it?
-- Is this future `Send`? Can it cross threads?
-- Is this lock an async lock or a sync lock?
-- Will this code block the runtime?
+1. **`Task`** — a value representing an async operation. `socket.read_async(stream, n)` returns `Task<Str|Nil>`. `process.sleep_async(ms)` returns `Task<Nil>`. A Task is in one of three states: `Pending`, `Ready(value)`, or `Consumed`.
 
-In 1y, these questions **do not exist**. All functions are one color — plain functions. All I/O is blocking, but what it blocks is an Actor, not the whole system. All "concurrency" is expressed by spawning Actors. There is a single mental model: **"spawn an Actor to handle this."**
+2. **`await task`** — suspends the current coroutine and registers the Task with the scheduler. When the Task becomes `Ready`, the scheduler resumes the coroutine with the Task's value. If called outside a coroutine (top-level), `await` falls back to a synchronous busy-poll.
+
+3. **`yield`** — the concurrency heartbeat. Inside an Actor-based event loop (e.g. `http.serve`), `yield` drains all pending `!` messages by spawning a coroutine per message and running the scheduler. Coroutines that `await` a not-yet-ready Task stay parked; the scheduler polls their Tasks each tick and resumes them when ready.
+
+4. **Scheduler** — single-threaded, cooperative. `run_until_complete` runs all ready coroutines, then polls parked Tasks, repeating until everything is done or everything is parked (waiting on I/O). No OS threads are spawned for concurrency.
+
+The key property: **when a coroutine awaits, other coroutines run**. A slow handler does not block other in-flight connections.
+
+## Why This Beats Colored async/await
+
+| | Colored `async/await` | 1y's colorless `await` |
+|---|---|---|
+| Function marker | `async fn` required | plain `fn` — no marker |
+| Calling an async fn | must be in an async context | any function can `await` |
+| Contagion | yes — async spreads up the call chain | none — functions are one color |
+| Runtime | tokio/async-std/smol (incompatible) | built-in scheduler, no choice needed |
+| Type complexity | `Future` + `Pin` + `Poll` + `Waker` | `Task` — a plain value |
+| Mental model | "is this async? should I `.await`?" | "if it returns a Task, `await` it" |
+
+## Relationship to Actors
+
+Colorless async does not replace Actors — it complements them. Actors provide *structured concurrency* (isolation, message passing, supervision). `await` provides *fine-grained suspension* inside a single Actor's handler.
+
+Typical pattern: spawn one Actor per connection, let the handler `await` async I/O. The Actor model gives you isolation and message-based APIs; `await` gives you non-blocking I/O inside a handler without splitting your functions into sync/async worlds.
+
+```1y
+actor Connection {
+    on Handle(stream, handler) {
+        // await inside an Actor handler — colorless async.
+        let raw = await socket.read_async(stream, 65536);
+        let resp = handler(parse_request(raw));
+        socket.write(stream, build_response(resp));
+        socket.close(stream)
+    }
+}
+
+// The accept loop: spawn Connection actors, yield to advance them.
+fn serve(addr, handler) {
+    let listener = socket.listen(addr);
+    socket.set_nonblocking(listener, true);
+    loop {
+        let stream = socket.accept(listener);
+        if is_nil(stream) {
+            try { yield } rescue { nil };
+            process.sleep_ms(1)
+        } else {
+            let conn = spawn Connection();
+            conn ! Handle(stream, handler)
+        };
+        try { yield } rescue { nil }
+    }
+}
+```
 
 ## Trade-offs: What We Give Up
 
-To be honest, this decision has a cost.
+To be honest, this design has costs.
 
-- **Weaker fine-grained concurrency control.** In some scenarios (such as finely interleaving multiple I/O operations inside one event loop), async/await is genuinely more expressive. 1y programmers must recast these scenarios as multiple cooperating Actors, which is sometimes more verbose.
-- **A lower ceiling in extreme-performance scenarios.** Zero-copy, zero-allocation async frameworks (such as certain Rust libraries) have an edge under extreme performance. 1y's Actor scheduling overhead is small but not zero.
-- **Interop with the async ecosystem needs an FFI bridge.** When reusing Rust's async libraries, you must wrap async calls into blocking calls at the FFI boundary.
+- **Cooperative, not preemptive.** A coroutine that never `await`s will run to completion. There is no preemption. Long CPU-bound loops should yield periodically or be offloaded to `process.exec`.
+- **Single-threaded.** True multi-core parallelism requires multiple processes (via `process`) or future work on a multi-threaded scheduler. Colorless async gives concurrency, not parallelism.
+- **Polling-based I/O.** The current scheduler polls parked Tasks each `yield`. For a few hundred connections this is fine; for tens of thousands, an `epoll`/`kqueue`-backed poller (like `mio`) would be needed.
+- **No `Task.all` / `Task.race` yet.** Only `await` is provided. Concurrent composition is done by spawning multiple Actors. This is a deliberate minimalism — matching Zig's philosophy of one primitive well.
 
 ## Why This Trade-off Is Worth It
 
 1y's target users are **programmers writing business logic**, not engineers building high-performance networking frameworks. For the former, mental simplicity matters more than peak throughput; correctness matters more than speed; being able to trust concurrency primitives matters more than fine-tuning scheduling.
 
-`async/await` exposes the engineering problem of "how to use threads efficiently" to every application programmer; 1y leaves that problem to the runtime and lets the programmer focus only on "what do I want to do concurrently." This is a value ordering — **simplicity first, performance second** — with performance backstopped by a runtime implemented in Rust.
+Colored `async/await` exposes the engineering problem of "how to use threads efficiently" to every application programmer, and then forces them to maintain two parallel function universes. 1y leaves the threading problem to the runtime and lets the programmer write **one kind of function** that can do both synchronous work and `await` async I/O — with zero ceremony.
 
-When the complexity of the async ecosystem has turned "learning Rust's async" into a discipline of its own, 1y wants to show that for the overwhelming majority of application scenarios, **blocking I/O + Actors is good enough — and far more pleasant**. This is not a denial of async/await; it is a question of whether it should be the default for every language. 1y offers a different answer.
+This is not a denial of async/await's power; it is a rejection of **function coloring**. Zig proved that you can have async suspension without the color split. 1y follows that path: **`await` without `async`, concurrency without colors.**

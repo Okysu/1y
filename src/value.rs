@@ -152,6 +152,33 @@ impl Clone for NativeResource {
 pub type ResourceRef = Rc<NativeResource>;
 
 // ---------------------------------------------------------------------------
+// Async Task (Phase 4.7: Zig-style colorless async)
+// ---------------------------------------------------------------------------
+
+/// The result of polling a [`Task`].
+pub enum TaskPoll {
+    /// The task has completed with this value.
+    Ready(Value),
+    /// The task is not ready yet; poll again later.
+    Pending,
+}
+
+/// Internal state of a Task.
+pub enum TaskState {
+    /// Pending: holds a poll function that checks if the underlying operation
+    /// (timer, I/O) has completed.
+    Pending(Box<dyn Fn() -> TaskPoll>),
+    /// Ready: the task has completed; the value can be extracted by `await`.
+    Ready(Value),
+    /// Consumed: the value has already been extracted by `await`.
+    /// Polling or awaiting a consumed task is an error.
+    Consumed,
+}
+
+/// A shared, mutable async task.
+pub type TaskRef = Rc<RefCell<TaskState>>;
+
+// ---------------------------------------------------------------------------
 // Module (Phase 4)
 // ---------------------------------------------------------------------------
 
@@ -224,6 +251,12 @@ pub enum Value {
     Opaque(ResourceRef),
     /// A deferred import — loaded on first access.
     LazyImport { path: Rc<String> },
+
+    // --- async (Phase 4.7: Zig-style colorless async) ---
+    /// A pending async task, created by functions like `socket.read_async`.
+    /// `await` suspends the current coroutine until the task is ready, then
+    /// extracts the inner value. Tasks are single-use.
+    Task(TaskRef),
 }
 
 impl Value {
@@ -284,6 +317,7 @@ impl Value {
             Value::Module(_) => "Module",
             Value::Opaque(_) => "Opaque",
             Value::LazyImport { .. } => "LazyImport",
+            Value::Task(_) => "Task",
         }
     }
 
@@ -341,6 +375,8 @@ impl PartialEq for Value {
                 Value::LazyImport { path: a },
                 Value::LazyImport { path: b },
             ) => a == b,
+            // Tasks: identity (same Rc).
+            (Value::Task(a), Value::Task(b)) => Rc::ptr_eq(a, b),
             // Different type tags are never equal.
             _ => false,
         }
@@ -429,6 +465,10 @@ impl Hash for Value {
             Value::LazyImport { path } => {
                 17u8.hash(state);
                 path.hash(state);
+            }
+            Value::Task(t) => {
+                18u8.hash(state);
+                Rc::as_ptr(t).hash(state);
             }
         }
     }
@@ -522,6 +562,7 @@ impl std::fmt::Display for Value {
                 NativeResource::SharedLib(_) => write!(f, "<shared-lib>"),
             },
             Value::LazyImport { path } => write!(f, "<lazy-import {}>", path),
+            Value::Task(_) => write!(f, "<task>"),
         }
     }
 }

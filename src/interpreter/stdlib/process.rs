@@ -24,6 +24,7 @@ pub fn build() -> ModuleRef {
             ("cwd", NativeFn { name: "cwd", func: bi_cwd }),
             ("set_cwd", NativeFn { name: "set_cwd", func: bi_set_cwd }),
             ("sleep_ms", NativeFn { name: "sleep_ms", func: bi_sleep_ms }),
+            ("sleep_async", NativeFn { name: "sleep_async", func: bi_sleep_async }),
         ],
     )
 }
@@ -128,4 +129,27 @@ fn bi_sleep_ms(args: &[Value]) -> Result<Value, InterpreterError> {
     };
     std::thread::sleep(std::time::Duration::from_millis(ms));
     Ok(Value::Nil)
+}
+
+/// `process.sleep_async(ms) -> Task` — async sleep, completed after `ms` milliseconds.
+/// Use with `await` to sleep without blocking the event loop.
+fn bi_sleep_async(args: &[Value]) -> Result<Value, InterpreterError> {
+    let ms = match args.first() {
+        Some(Value::Int(n)) => num_traits::ToPrimitive::to_u64(n).unwrap_or(0),
+        Some(v) => return Err(InterpreterError::TypeError {
+            expected: "Int", got: v.type_name(), op: "process.sleep_async".into(), span: None,
+        }),
+        None => return Err(InterpreterError::ArityError {
+            expected: 1, got: 0, callee: "process.sleep_async".into(), span: None,
+        }),
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+    let task = crate::value::TaskState::Pending(Box::new(move || {
+        if std::time::Instant::now() >= deadline {
+            crate::value::TaskPoll::Ready(Value::Nil)
+        } else {
+            crate::value::TaskPoll::Pending
+        }
+    }));
+    Ok(Value::Task(std::rc::Rc::new(std::cell::RefCell::new(task))))
 }

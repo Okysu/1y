@@ -1,8 +1,13 @@
 // lib/http.1y — HTTP/1.1 server implemented in pure 1y (self-hosted).
 //
-// Built on the `socket` standard library. Provides:
+// Built on the `socket` and `process` standard libraries. Uses Actor-based
+// concurrency + Zig-style colorless async: each connection runs in a spawned
+// `Connection` actor, and the handler body may `await` any `Task` (e.g.
+// `socket.read_async`, `process.sleep_async`) without blocking the event loop.
+// `yield` drains the mailbox batch and advances all parked coroutines.
 //
-//   http.serve(addr, handler)              — start a blocking HTTP server
+// Provides:
+//   http.serve(addr, handler)              — start an Actor-based HTTP server
 //   http.parse_request(raw)                — parse a raw HTTP request string
 //   http.response(status, body, headers)   — build a raw HTTP response string
 //   http.json_response(status, body)       — shortcut for JSON responses
@@ -17,10 +22,16 @@
 //   \{ "status": 200, "body": "<html>...</html>",
 //      "headers": ["Content-Type: text/html"] \}
 //
+// `handler` may itself call `await` on any Task (e.g. for SSE streaming,
+// slow backends, or timed delays) — this is the core of colorless async:
+// no `async` keyword is needed on the handler, and a slow handler does NOT
+// block other in-flight connections.
+//
 // `headers` is a Vec of "Key: Value" strings — this avoids needing Map
 // iteration which 1y doesn't currently support natively.
 
 import socket;
+import process;
 
 // ---------------------------------------------------------------------------
 // Status text lookup
@@ -188,33 +199,53 @@ fn parse_request(raw) {
 }
 
 // ---------------------------------------------------------------------------
-// Server
+// Connection actor
 // ---------------------------------------------------------------------------
 
-// Start a blocking HTTP server.
-// `addr`     — "host:port" string (e.g. "127.0.0.1:8080")
-// `handler`  — function(req_map) -> \{ "status": Int, "body": Str, "headers": Vec \}
-fn serve(addr, handler) {
-    let listener = socket.listen(addr);
-    println("1y http server listening on " + addr);
-
-    loop {
-        let stream = socket.accept(listener);
-        let raw = socket.read(stream, 65536);
+// Each accepted connection is handled by a spawned `Connection` actor.
+// The actor receives `Handle(stream, handler)` as a fire-and-forget message
+// (`!`). It reads the request, dispatches to the user handler, and writes
+// the response — all inside the `on Handle` body.
+//
+// The handler body runs inside a coroutine (set up by `yield`'s async drain).
+// Reading the request uses `await socket.read_async` so a slow client does
+// NOT block other connections — the coroutine suspends until data arrives,
+// and the scheduler runs other ready coroutines in the meantime.
+//
+// The user-supplied `handler` may also `await` any Task (e.g.
+// `process.sleep_async` for SSE pacing) — this is colorless async: no `async`
+// marker on the function, same calling convention as a sync call.
+actor Connection {
+    // `on Handle(stream, handler)` — process one HTTP connection.
+    //
+    // `stream`  — the TcpStream from `socket.accept` (non-blocking mode)
+    // `handler` — the user-supplied request handler function
+    on Handle(stream, handler) {
+        // Async read: suspends the coroutine on WouldBlock, yields control
+        // back to the scheduler so other connections can progress. Returns
+        // Str on data, Nil on EOF.
+        let raw = await socket.read_async(stream, 65536);
 
         if is_nil(raw) {
             socket.close(stream);
-            continue
+            reply nil
         };
+
+        // Switch to blocking mode for the response write — by now the request
+        // is fully read and the response is small, so a blocking write is fine
+        // and avoids WouldBlock errors in `socket.write`.
+        socket.set_nonblocking(stream, false);
 
         let req = parse_request(raw);
         if is_nil(req) {
             socket.write(stream, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
             socket.close(stream);
-            continue
+            reply nil
         };
 
         // Call the handler. If it throws, return a 500.
+        // The handler may itself `await` Tasks — colorless async means no
+        // marker is needed on the handler's definition.
         let resp = try {
             handler(req)
         } rescue {
@@ -234,5 +265,58 @@ fn serve(addr, handler) {
         let resp_str = response(s, b, h);
         socket.write(stream, resp_str);
         socket.close(stream)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
+
+// Start an Actor-based HTTP server with non-blocking accept + colorless async.
+//
+// `addr`     — "host:port" string (e.g. "127.0.0.1:8080")
+// `handler`  — function(req_map) -> \{ "status": Int, "body": Str, "headers": Vec \}
+//
+// Architecture:
+//   1. Listener is set to non-blocking mode.
+//   2. Main loop calls `socket.accept` (non-blocking) — returns Nil if no
+//      pending connection.
+//   3. On a new connection: `spawn Connection()` + `conn ! Handle(stream, handler)`
+//      — the message is queued, accept loop continues immediately. The stream
+//      stays in non-blocking mode so the handler's `await socket.read_async`
+//      can suspend on WouldBlock instead of blocking the whole event loop.
+//   4. `yield` drains all queued `!` messages by spawning a coroutine per
+//      message and running the scheduler. Coroutines that `await` a Task
+//      suspend; the scheduler polls their Tasks each tick and resumes them
+//      when ready. This is how a slow handler (e.g. SSE) does NOT block
+//      other in-flight connections.
+//   5. If idle (no connection), `process.sleep_ms(1)` avoids busy-looping.
+//      This runs in the main thread (not a coroutine), so it uses the sync
+//      `sleep_ms` — it only fires when there's nothing to do.
+fn serve(addr, handler) {
+    let listener = socket.listen(addr);
+    socket.set_nonblocking(listener, true);
+    println("1y http server listening on " + addr);
+
+    loop {
+        let stream = socket.accept(listener);
+
+        if is_nil(stream) {
+            // No pending connection — drain queued handlers, then sleep briefly.
+            try { yield } rescue { nil };
+            process.sleep_ms(1)
+        } else {
+            // New connection: spawn an actor and fire-and-forget the stream.
+            // The stream inherits the listener's non-blocking mode — KEEP it
+            // non-blocking so `await socket.read_async` in the handler can
+            // suspend on WouldBlock instead of blocking the event loop.
+            let conn = spawn Connection();
+            conn ! Handle(stream, handler)
+        };
+
+        // Drain queued handler messages each iteration (even when connections
+        // are arriving, so handlers don't starve). Each drain advances all
+        // parked coroutines — this is the concurrency heartbeat.
+        try { yield } rescue { nil }
     }
 }

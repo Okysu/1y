@@ -111,7 +111,7 @@
         },
         {
           "name": "keyword.concurrency.1y",
-          "match": "\\b(spawn|actor|state|on|reply|receive|shared|transact)\\b"
+          "match": "\\b(spawn|actor|state|on|reply|yield|await|shared|transact)\\b"
         },
         {
           "name": "keyword.operator.logical.1y",
