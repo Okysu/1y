@@ -94,16 +94,14 @@ actor Connection {
     }
 }
 
-// The accept loop: spawn Connection actors, yield to advance them.
+// The accept loop: event-driven accept + spawn Connection actors.
 fn serve(addr, handler) {
     let listener = socket.listen(addr);
     socket.set_nonblocking(listener, true);
     loop {
-        let stream = socket.accept(listener);
-        if is_nil(stream) {
-            try { yield } rescue { nil };
-            process.sleep_ms(1)
-        } else {
+        // Event-driven: suspends until a connection is pending.
+        let stream = await socket.accept_async(listener);
+        if not(is_nil(stream)) {
             let conn = spawn Connection();
             conn ! Handle(stream, handler)
         };
@@ -117,7 +115,7 @@ fn serve(addr, handler) {
 To be honest, this design has costs.
 
 - **Cooperative, not preemptive.** A coroutine that never `await`s will run to completion. There is no preemption. Long CPU-bound loops should yield periodically or be offloaded to `process.exec`.
-- **Single-threaded (for now).** True multi-core parallelism requires multiple processes (via `process`) or future work on a multi-threaded scheduler. Colorless async gives concurrency, not parallelism.
+- **Multi-threaded via `parallel` module.** Colorless async provides concurrency (non-blocking I/O), while the `parallel` module provides true multi-core parallelism. See [Multi-threading](../syntax/multithreading).
 - **Event-driven I/O.** The scheduler uses `mio` (`epoll`/`kqueue`/IOCP) to wait only on readiness of registered streams, so parked Tasks are polled only when the OS reports them ready rather than every `yield`.
 - **Task combinators are minimal.** `await` is the core primitive; `task_all([t1, ...])`, `task_any([t1, ...])`, and `task_ready(value)` compose Tasks. For long-lived concurrent state, prefer Actors. This is deliberate minimalism — matching Zig's philosophy of one primitive well.
 

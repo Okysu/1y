@@ -94,16 +94,14 @@ actor Connection {
     }
 }
 
-// accept 循环：派生 Connection actor，yield 推进它们。
+// accept 循环：事件驱动 accept + 派生 Connection actor。
 fn serve(addr, handler) {
     let listener = socket.listen(addr);
     socket.set_nonblocking(listener, true);
     loop {
-        let stream = socket.accept(listener);
-        if is_nil(stream) {
-            try { yield } rescue { nil };
-            process.sleep_ms(1)
-        } else {
+        // 事件驱动：挂起直到有连接待处理。
+        let stream = await socket.accept_async(listener);
+        if not(is_nil(stream)) {
             let conn = spawn Connection();
             conn ! Handle(stream, handler)
         };
@@ -117,7 +115,7 @@ fn serve(addr, handler) {
 诚实地说，这个设计有代价。
 
 - **协作式，非抢占式。** 永不 `await` 的协程会一直跑到完成。没有抢占。长 CPU 密集循环应定期 yield 或卸载到 `process.exec`。
-- **单线程（目前）。** 真正的多核并行需要多进程（通过 `process`）或未来的多线程调度器工作。无色异步给的是并发，不是并行。
+- **通过 `parallel` 模块实现多线程。** 无色异步提供并发（非阻塞 I/O），而 `parallel` 模块提供真正的多核并行。参见[多线程](../syntax/multithreading)。
 - **事件驱动 I/O。** 调度器用 `mio`（`epoll`/`kqueue`/IOCP）只在已注册流就绪时才等待，parked Task 只在 OS 报告就绪时才被轮询，而非每次 `yield` 都轮询全部。
 - **Task 组合子保持精简。** `await` 是核心原语；`task_all([t1, ...])`、`task_any([t1, ...])`、`task_ready(value)` 用于组合 Task。长生命周期的并发状态请用 Actor。这是刻意的极简——与 Zig"一个原语做好"的哲学一致。
 
