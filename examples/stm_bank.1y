@@ -1,0 +1,160 @@
+// examples/stm_bank.1y — STM bank transfers with concurrent actors.
+//
+// Demonstrates:
+//   - Multiple `shared` accounts coordinated atomically via `transact`
+//   - `retry` for waiting until sufficient balance
+//   - Concurrent transfers via Actor messages — no locks, no deadlocks
+//   - Invariant preservation: total money is conserved across all transfers
+//
+// Run with:  1y run examples/stm_bank.1y
+
+println("=== STM Bank — concurrent transfers ===");
+
+// ---------------------------------------------------------------------------
+// 1. Accounts — each is a `shared` cell holding an Int balance.
+// ---------------------------------------------------------------------------
+
+shared acct_alice = 1000;
+shared acct_bob = 500;
+shared acct_carol = 300;
+shared total_transfers = 0;   // metrics: number of successful transfers
+
+fn total_money() -> Int {
+    transact {
+        acct_alice + acct_bob + acct_carol
+    }
+}
+
+println("initial total: " + str(total_money()));   // 1800
+
+// ---------------------------------------------------------------------------
+// 2. Helper: read/write a named account. These access the shared cells
+//    directly; inside a `transact`, reads see a snapshot and writes are
+//    buffered until commit.
+// ---------------------------------------------------------------------------
+
+fn read_account(name) -> Int {
+    match name {
+        "alice" => acct_alice,
+        "bob" => acct_bob,
+        "carol" => acct_carol,
+        _ => 0
+    }
+}
+
+fn write_account(name, balance) {
+    match name {
+        "alice" => acct_alice = balance,
+        "bob" => acct_bob = balance,
+        "carol" => acct_carol = balance,
+        _ => nil
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 3. Atomic transfer with `retry` — waits for sufficient balance.
+//    If the source account has insufficient funds, `retry` restarts the
+//    transaction. Since `let` variables persist across retries, we use one
+//    to bound the number of attempts and avoid infinite loops.
+// ---------------------------------------------------------------------------
+
+fn transfer(src_name, dst_name, amount) -> Bool {
+    let attempts = 0;
+    transact {
+        attempts = attempts + 1;
+        if attempts > 3 { false } else {
+            let src_balance = read_account(src_name);
+            let dst_balance = read_account(dst_name);
+
+            if src_balance < amount {
+                retry   // wait for funds — restart the transaction
+            };
+
+            // Write both — committed atomically.
+            write_account(src_name, src_balance - amount);
+            write_account(dst_name, dst_balance + amount);
+            total_transfers = total_transfers + 1;
+            true
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 4. A Teller actor that processes transfer requests concurrently.
+//    Multiple Tellers can run in parallel — STM ensures atomicity.
+// ---------------------------------------------------------------------------
+
+actor Teller {
+    on transfer(src, dst, amount) {
+        let ok = transfer(src, dst, amount);
+        reply(ok)
+    }
+    on balance(name) {
+        reply(read_account(name))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 5. Run a batch of transfers.
+// ---------------------------------------------------------------------------
+
+let teller = spawn Teller();
+
+// Alice sends 100 to Bob.
+let r1 = teller ? transfer("alice", "bob", 100);
+println("alice -> bob 100: " + str(r1));              // true
+
+// Bob sends 50 to Carol.
+let r2 = teller ? transfer("bob", "carol", 50);
+println("bob -> carol 50: " + str(r2));               // true
+
+// Carol tries to send 99999 (insufficient funds — gives up after retries).
+let r3 = teller ? transfer("carol", "alice", 99999);
+println("carol -> alice 99999: " + str(r3));          // false
+
+// ---------------------------------------------------------------------------
+// 6. Rollback demo — an exception mid-transaction leaves accounts intact.
+//    The audit_log push is also rolled back, demonstrating COW collections.
+// ---------------------------------------------------------------------------
+
+shared audit_log = [];
+
+fn audited_transfer(src, dst, amount) -> Bool {
+    try {
+        transact {
+            let s = read_account(src);
+            let d = read_account(dst);
+            write_account(src, s - amount);
+            write_account(dst, d + amount);
+            audit_log = push(audit_log, src + "->" + dst + " " + str(amount));
+            if amount > 400 { raise "blocked: amount too large" };
+            total_transfers = total_transfers + 1;
+            true
+        }
+    } rescue as _e {
+        false
+    }
+}
+
+let r4 = audited_transfer("alice", "carol", 500);
+println("audited alice -> carol 500: " + str(r4));    // false (blocked)
+println("audit_log entries: " + str(count(audit_log)));  // 0 — rolled back
+
+// ---------------------------------------------------------------------------
+// 7. Verify invariants.
+// ---------------------------------------------------------------------------
+
+println("");
+println("=== Final state ===");
+println("alice:  " + str(acct_alice));     // 1000 - 100 = 900
+println("bob:    " + str(acct_bob));       // 500 + 100 - 50 = 550
+println("carol:  " + str(acct_carol));     // 300 + 50 = 350
+println("total:  " + str(total_money()));  // 1800 (conserved)
+println("successful transfers: " + str(total_transfers));  // 2
+
+// Key insight: no locks, no lock ordering, no deadlocks. If two transactions
+// conflict, the STM runtime automatically retries one of them. The code reads
+// like single-threaded sequential logic, yet is safe under concurrency.
+
+println("");
+println("=== Done ===");

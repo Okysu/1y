@@ -1,0 +1,136 @@
+// examples/concurrent_crawler.1y — concurrent web crawler.
+//
+// Demonstrates:
+//   - `parallel.map` for I/O-bound parallelism (multiple TLS connections
+//     running on different worker threads, each blocking independently)
+//   - `parallel.spawn` + `parallel.join` for finer-grained control
+//   - Pure 1y, no external HTTP client library — just `tls` + string ops
+//
+// Contrast with Actor + task_all:
+//   - Actors run on a single-threaded event loop; blocking calls (tls.connect)
+//     would stall all actors. Use Actor + socket.read_async for non-blocking I/O.
+//   - parallel.spawn uses OS threads; each worker can block independently.
+//     Ideal for calls to libraries that don't have async variants yet.
+//
+// Run with:  1y run examples/concurrent_crawler.1y
+
+import tls;
+
+// ---------------------------------------------------------------------------
+// 1. fetch_page — TLS GET request, returns full response as a string.
+//    Runs on a worker thread; blocking is fine because other workers run
+//    independently.
+// ---------------------------------------------------------------------------
+
+fn fetch_page(host, path) -> Str {
+    try {
+        let stream = tls.connect(host, 443);
+        let request =
+            "GET " + path + " HTTP/1.1\r\n" +
+            "Host: " + host + "\r\n" +
+            "User-Agent: 1y-crawler/0.1\r\n" +
+            "Connection: close\r\n" +
+            "\r\n";
+        tls.write(stream, request);
+        let response = "";
+        loop {
+            let chunk = tls.read(stream, 4096);
+            match chunk {
+                s if is_str(s) => response = response + s,
+                nil => break response
+            }
+        }
+    } rescue as e {
+        "[error] " + str(e)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 2. Analysis functions — pure computation, no I/O.
+// ---------------------------------------------------------------------------
+
+// Skip the HTTP status line + headers (everything before the blank line).
+fn extract_body(response) -> Str {
+    let parts = split(response, "\r\n\r\n");
+    if count(parts) > 1 { parts[1] } else { response }
+}
+
+// Count word-like tokens separated by whitespace.
+fn count_words(text) -> Int {
+    let spaces = split(text, " ");
+    let newlines = split(text, "\n");
+    count(spaces) + count(newlines)
+}
+
+// Combined: fetch + analyze, returns a Map with results.
+fn fetch_and_count(host, path) -> Map {
+    let response = fetch_page(host, path);
+    let body = extract_body(response);
+    let words = count_words(body);
+    {
+        "host": host,
+        "path": path,
+        "status": "ok",
+        "words": words,
+        "bytes": len(body)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 3. Crawl — parallel.map dispatches each URL to a different worker.
+// ---------------------------------------------------------------------------
+
+println("=== Concurrent Web Crawler ===");
+println("CPU cores: " + str(parallel.cores()));
+println("");
+
+let urls = [
+    ["example.com", "/"],
+    ["example.org", "/"],
+    ["example.net", "/"]
+];
+
+// --- Approach A: parallel.map (batch) ---
+println("fetching " + str(count(urls)) + " pages via parallel.map...");
+let results = parallel.map("fetch_and_count", urls);
+
+let i = 0;
+while i < count(results) {
+    let r = results[i];
+    println("  " + r["host"] + r["path"] + " — " + str(r["words"]) + " words, " + str(r["bytes"]) + " bytes");
+    i += 1
+};
+
+println("");
+
+// --- Approach B: parallel.spawn + parallel.join (individual) ---
+// Useful when you want to kick off tasks at different points in the code
+// and collect results later.
+println("fetching 2 more pages via parallel.spawn + join...");
+
+let h1 = parallel.spawn("fetch_and_count", ["jsonplaceholder.typicode.com", "/posts/1"]);
+let h2 = parallel.spawn("fetch_and_count", ["jsonplaceholder.typicode.com", "/posts/2"]);
+
+// ... do other work here while workers fetch in background ...
+
+let r1 = parallel.join(h1);
+let r2 = parallel.join(h2);
+
+println("  " + r1["host"] + r1["path"] + " — " + str(r1["bytes"]) + " bytes");
+println("  " + r2["host"] + r2["path"] + " — " + str(r2["bytes"]) + " bytes");
+
+// ---------------------------------------------------------------------------
+// 4. Summary.
+// ---------------------------------------------------------------------------
+
+println("");
+println("=== Summary ===");
+println("pages crawled: " + str(count(results) + 2));
+println("technique: parallel.map (batch) + parallel.spawn/join (individual)");
+println("");
+println("Key insight: each TLS connection blocks its own worker thread,");
+println("so slow sites don't delay fast ones. No callbacks, no promises —");
+println("just plain function calls that happen to run on other threads.");
+
+println("");
+println("=== Done ===");
