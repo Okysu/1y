@@ -1,13 +1,14 @@
 # `1y` Test Coverage Report
 
-Generated with `cargo-tarpaulin` on Phase 4.6.
+Generated with `cargo-tarpaulin` on Phase 4.6 (coverage lines); test counts
+updated through Phase C + yin.
 
 ## Summary
 
 - **Total lines**: 5111
 - **Covered lines**: 3257
 - **Coverage**: 63.73%
-- **Total tests**: 416
+- **Total tests**: 502 (Phase C + yin + parallel: +86 tests since Phase 4.6)
 
 ## Per-File Coverage
 

@@ -17,4 +17,5 @@ pub use error::{ErrorReport, SourceError};
 pub use interpreter::Interpreter;
 pub use lexer::tokenize;
 pub use parser::parse;
+pub use runtime::worker::WorkerPool;
 pub use value::{ActorPid, CrossEnvelope, SendValue, Value};

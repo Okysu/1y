@@ -1,6 +1,7 @@
 # `1y` Standard Library Reference
 
-This document lists every function in the `1y` standard library as of Phase 4.6.
+This document lists every function in the `1y` standard library as of
+Phase C (colorless async + BEAM actor model).
 
 ## Built-in Functions (global)
 
@@ -46,6 +47,10 @@ These are available without any `import`.
 | `sin` / `cos` | `(Value) -> Decimal` | Trig (radians) |
 | `log` | `(Value) -> Decimal` | Natural log |
 | `exp` | `(Value) -> Decimal` | e^x |
+| `pid_of` | `(Actor) -> Int` | Actor's global Pid (Phase C3) |
+| `task_ready` | `(Value) -> Task` | Immediately-ready Task |
+| `task_all` | `(Vec<Task>) -> Task` | Resolves when all inputs resolve |
+| `task_any` | `(Vec<Task>) -> Task` | Resolves when any input resolves |
 
 ## `env`
 
@@ -88,7 +93,8 @@ These are available without any `import`.
 | `pid` | `() -> Int` | Current process ID |
 | `cwd` | `() -> Str` | Current working directory |
 | `set_cwd` | `(Str)` | Change working directory |
-| `sleep_ms` | `(Int)` | Sleep milliseconds |
+| `sleep_ms` | `(Int)` | Sleep milliseconds (blocking, main thread only) |
+| `sleep_async` | `(Int) -> Task` | Sleep milliseconds as a Task (colorless async; `await` it) |
 
 ## `random`
 
@@ -124,14 +130,17 @@ Based on the `serialport` crate.
 
 ## `socket`
 
-Blocking TCP networking.
+TCP networking. Supports both blocking and non-blocking modes. Non-blocking
+mode + `read_async` enables colorless async I/O (suspend on `WouldBlock`,
+resume when data arrives — other coroutines run in the meantime).
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `listen` | `(Str) -> Opaque` | Bind TCP listener ("addr:port") |
-| `accept` | `(Opaque) -> Opaque` | Accept connection → stream |
+| `accept` | `(Opaque) -> Opaque or Nil` | Accept connection → stream; Nil if none pending (non-blocking) |
 | `connect` | `(Str) -> Opaque` | Connect to "addr:port" |
-| `read` | `(Opaque, Int) -> Str or Nil` | Read up to N bytes |
+| `read` | `(Opaque, Int) -> Str or Nil` | Read up to N bytes (blocking) |
+| `read_async` | `(Opaque, Int) -> Task` | Read up to N bytes as a Task (colorless async; `await` it) |
 | `read_line` | `(Opaque) -> Str or Nil` | Read until newline |
 | `write` | `(Opaque, Str)` | Write string |
 | `close` | `(Opaque)` | Close socket |
@@ -196,3 +205,79 @@ Signature format: `"ret(arg1, arg2, ...)"` where types are:
 - `str` — `*const c_char` (NUL-terminated)
 
 Up to 6 arguments supported. **FFI is unsafe**: only load trusted libraries.
+
+## `lib.http` (self-hosted library)
+
+Pure-1y HTTP/1.1 server library (`lib/http.1y`). Built on the `socket` and
+`process` modules with Actor-based concurrency + colorless async. Each
+connection runs in a spawned `Connection` actor; the handler may `await` any
+`Task` without blocking other connections.
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `serve` | `(Str, Func) -> !` | Start server on "addr:port"; handler receives a request Map |
+| `parse_request` | `(Str) -> Map or Nil` | Parse raw HTTP request string |
+| `response` | `(Int, Str, Vec) -> Str` | Build raw HTTP response (status, body, headers) |
+| `json_response` | `(Int, Str) -> Str` | Shortcut: JSON response |
+| `html_response` | `(Int, Str) -> Str` | Shortcut: HTML response |
+| `text_response` | `(Int, Str) -> Str` | Shortcut: plain-text response |
+| `status_text` | `(Int) -> Str` | Human-readable status text |
+| `not_found` | `() -> Str` | Build a 404 response |
+
+The handler Map shape:
+- Request: `{ "method", "path", "version", "headers": Map, "body": Str }`
+- Response: `{ "status": Int, "body": Str, "headers": Vec<Str> }`
+
+Headers are a `Vec` of `"Key: Value"` strings (1y has no native Map iteration).
+
+## `lib.yin` (self-hosted web framework)
+
+Gin-inspired web framework (`lib/yin.1y`), built on `lib.http`. Demonstrates
+that 1y's language features are sufficient for a real web framework with no
+native extensions.
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `new` | `() -> App` | Create a new app (shared cell holding routes/middlewares) |
+| `get` / `post` / `put` / `delete` | `(App, Str, Func) -> Nil` | Register a route handler |
+| `use` | `(App, Func) -> Nil` | Register middleware `fn(ctx, next)` |
+| `group` | `(App, Str) -> App` | Create a route group with a prefix (shares parent's route table) |
+| `handle` | `(App, Map) -> Map` | Dispatch a request Map, return response Map |
+| `run` | `(App, Str) -> !` | Start the HTTP server on "addr:port" |
+| `param` | `(Ctx, Str) -> Str` | Extract a path parameter (`:id`) |
+| `header` | `(Ctx, Str) -> Str` | Get a request header |
+| `body` | `(Ctx) -> Str` | Get the request body |
+| `json` | `(Ctx, Int, Value) -> Nil` | Write JSON response (sets Content-Type) |
+| `html` | `(Ctx, Int, Str) -> Nil` | Write HTML response |
+| `text` | `(Ctx, Int, Str) -> Nil` | Write plain-text response |
+| `set_header` | `(Ctx, Str, Str) -> Nil` | Append a response header |
+| `status_code` | `(Ctx, Int) -> Nil` | Override the status code |
+
+See `examples/yin_server.1y` for a complete example.
+
+## `parallel` (built-in module)
+
+User-facing multi-threading. Built on the `WorkerPool` (N worker threads, one
+per CPU core). Functions are called by name on worker threads that pre-load
+the entry file's definitions.
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `cores` | `() -> Int` | Number of CPU cores available |
+| `call` | `(Str, Vec) -> Value` | Synchronously call named function with args, return result |
+| `spawn` | `(Str, Vec) -> Handle` | Asynchronously call named function, return a handle |
+| `join` | `(Handle) -> Value` | Wait for a spawned task, return its result |
+| `map` | `(Str, Vec<Vec>) -> Vec` | Call named function in parallel for each arg set |
+
+Arguments and return values must be `SendValue`-compatible (Int, Str, Bool,
+Nil, Vec, Map, Set, Variant, Struct). Functions, shared cells, actors, tasks,
+and opaque resources cannot cross thread boundaries.
+
+```1y
+fn double(n) { n * 2 }
+
+let r = parallel.call("double", [21]);          // 42
+let h = parallel.spawn("double", [21]);         // Handle
+let r2 = parallel.join(h);                       // 42
+let rs = parallel.map("double", [[1],[2],[3]]); // [2, 4, 6]
+```

@@ -844,7 +844,26 @@ impl Parser {
                 TokenKind::Dot => {
                     let start = lhs.span();
                     self.bump();
-                    let name = self.expect_ident("field or method name")?;
+                    // Accept keywords as method/field names after `.` so that
+                    // module methods like `parallel.spawn(...)` parse correctly
+                    // even though `spawn` is a reserved keyword.
+                    let name = match self.peek().clone() {
+                        TokenKind::Ident(s) => {
+                            self.bump();
+                            s
+                        }
+                        TokenKind::Keyword(kw) => {
+                            self.bump();
+                            kw.as_str().to_string()
+                        }
+                        other => {
+                            let span = self.span_here();
+                            return Err(SourceError::new(
+                                span,
+                                format!("expected field or method name, found {}", other.describe()),
+                            ));
+                        }
+                    };
                     if matches!(self.peek(), TokenKind::LParen) {
                         self.bump();
                         let args = self.parse_args()?;

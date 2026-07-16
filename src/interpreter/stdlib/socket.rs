@@ -8,6 +8,7 @@
 //! Exports:
 //!   - `listen(addr) -> Opaque`         — create a TcpListener (binds to addr)
 //!   - `accept(listener) -> Opaque`     — accept a connection, returns TcpStream
+//!   - `accept_async(listener) -> Task` — async accept, returns Task<TcpStream|Nil>
 //!   - `connect(addr) -> Opaque`        — connect to a remote, returns TcpStream
 //!   - `read(stream, n) -> Str | Nil`   — read up to n bytes (Nil on EOF)
 //!   - `read_async(stream, n) -> Task`  — async read, returns Task<Str|Nil>
@@ -31,6 +32,7 @@ pub fn build() -> ModuleRef {
         &[
             ("listen", NativeFn { name: "listen", func: bi_listen }),
             ("accept", NativeFn { name: "accept", func: bi_accept }),
+            ("accept_async", NativeFn { name: "accept_async", func: bi_accept_async }),
             ("connect", NativeFn { name: "connect", func: bi_connect }),
             ("read", NativeFn { name: "read", func: bi_read }),
             ("read_async", NativeFn { name: "read_async", func: bi_read_async }),
@@ -94,6 +96,44 @@ fn bi_accept(args: &[Value]) -> Result<Value, InterpreterError> {
         }
         _ => Err(InterpreterError::TypeError {
             expected: "TcpListener", got: "opaque", op: "socket.accept".into(), span: None,
+        }),
+    }
+}
+
+/// `socket.accept_async(listener) -> Task<TcpStream|Nil>` — async non-blocking accept.
+/// Returns a Task that polls the listener (which must be in non-blocking mode).
+/// When a connection is pending, completes with the accepted `TcpStream`.
+///
+/// The listener is registered with the scheduler's mio::Poll for event-driven
+/// I/O multiplexing — the Task is only polled when mio reports the listener
+/// as readable, avoiding polling of the parked Task.
+fn bi_accept_async(args: &[Value]) -> Result<Value, InterpreterError> {
+    let r = opaque_at(args, 0, "socket.accept_async")?;
+    match &*r {
+        NativeResource::TcpListener(l) => {
+            let l_for_closure = l.clone();
+            let task_state = crate::value::TaskState::Pending(Box::new(move || {
+                match l_for_closure.borrow().accept() {
+                    Ok((stream, _addr)) => {
+                        crate::value::TaskPoll::Ready(Value::Opaque(Rc::new(
+                            NativeResource::TcpStream(Rc::new(RefCell::new(stream)))
+                        )))
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        crate::value::TaskPoll::Pending
+                    }
+                    Err(_) => crate::value::TaskPoll::Ready(Value::Nil),
+                }
+            }));
+            let task_ref = Rc::new(RefCell::new(task_state));
+            // Register the listener with the scheduler's mio::Poll for
+            // event-driven readiness notification. This makes the scheduler
+            // only poll this Task when the listener is actually readable.
+            crate::runtime::scheduler::register_listener_readable(&l.borrow(), &task_ref);
+            Ok(Value::Task(task_ref))
+        }
+        _ => Err(InterpreterError::TypeError {
+            expected: "TcpListener", got: "opaque", op: "socket.accept_async".into(), span: None,
         }),
     }
 }
@@ -252,6 +292,7 @@ fn bi_close(args: &[Value]) -> Result<Value, InterpreterError> {
         NativeResource::Serial(_) => Ok(Value::Nil),
         NativeResource::TlsStream(_) => Ok(Value::Nil),
         NativeResource::SharedLib(_) => Ok(Value::Nil),
+        NativeResource::ParallelHandle(_) => Ok(Value::Nil),
     }
 }
 
@@ -280,6 +321,7 @@ fn bi_set_nonblocking(args: &[Value]) -> Result<Value, InterpreterError> {
         NativeResource::Serial(_) => {}
         NativeResource::TlsStream(_) => {}
         NativeResource::SharedLib(_) => {}
+        NativeResource::ParallelHandle(_) => {}
     }
     Ok(Value::Nil)
 }

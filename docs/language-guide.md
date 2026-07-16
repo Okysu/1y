@@ -6,7 +6,8 @@ matching, actor-based concurrency, software transactional memory, a module
 system, and a standard library covering I/O, networking, crypto, TLS, JSON, and
 FFI.
 
-This guide covers the language as of Phase 4.6.
+This guide covers the language as of Phase C (colorless async + BEAM actor
+model).
 
 ## Table of Contents
 
@@ -22,8 +23,10 @@ This guide covers the language as of Phase 4.6.
 10. [Modules and Imports](#modules-and-imports)
 11. [Actors](#actors)
 12. [Shared State and Transactions](#shared-state-and-transactions)
-13. [Standard Library](#standard-library)
-14. [FFI](#ffi)
+13. [Colorless Async](#colorless-async)
+14. [Multi-threading](#multi-threading)
+15. [Standard Library](#standard-library)
+16. [FFI](#ffi)
 
 ---
 
@@ -212,6 +215,125 @@ transact {
 - `transact { ... }` provides snapshot isolation, atomic commit, rollback.
 - `retry` re-runs the transaction (max 64 attempts).
 - Nesting is supported (inner transactions commit to the outer).
+
+## Colorless Async
+
+`1y` implements **Zig-style colorless async**: any `fn` can `await` a `Task`
+without an `async` keyword. There is no function coloring — synchronous and
+asynchronous calls use the same calling convention.
+
+### Creating Tasks
+
+A `Task` is produced by I/O operations that may block:
+
+```1y
+import socket;
+import process;
+
+// socket.read_async — suspends on WouldBlock, resumes on data
+let data = await socket.read_async(stream, 65536);
+
+// process.sleep_async — suspends for a duration
+await process.sleep_async(500);
+```
+
+Combinators:
+
+```1y
+// task_ready(value) — immediately-ready Task
+let t1 = task_ready(42);
+
+// task_all([t1, t2, ...]) — resolves when all inputs resolve
+let results = await task_all([t1, t2]);
+
+// task_any([t1, t2, ...]) — resolves when any input resolves
+let first = await task_any([t1, t2]);
+```
+
+### Why no `async` keyword?
+
+In languages with function coloring (Python `async def`, Rust `async fn`,
+JS `async`), you must annotate functions that may await, and callers must
+handle `Future`/`Promise` differently. This creates two worlds: sync and
+async, which don't compose freely.
+
+`1y` uses **stackful coroutines** (`corosensei`): `await` suspends the entire
+call stack, so any function — even one written without knowing about async —
+can be called from within an `await`ing context, and any function can start
+`await`ing without changing its signature. This eliminates the mental burden
+of "is this function async?".
+
+### HTTP handler example
+
+```1y
+import lib.http as http;
+
+// This handler is just a regular fn — no `async` marker.
+// It can `await` inside, and slow handlers do NOT block other connections.
+fn handler(req) {
+    await process.sleep_async(100);  // simulate slow work
+    { "status": 200, "body": "done", "headers": [] }
+}
+
+http.serve("127.0.0.1:8080", handler)
+```
+
+See [architecture.md](architecture.md#colorless-async-zig-style) for the
+scheduler internals.
+
+## Multi-threading
+
+`1y` provides user-facing multi-threading via the built-in `parallel` module.
+A pool of N worker threads (one per CPU core) pre-loads the entry file's
+definitions, then accepts function calls by name.
+
+### parallel.call — synchronous
+
+```1y
+fn heavy_compute(n) {
+    let s = 0;
+    let i = 0;
+    while i < n { s = s + i; i = i + 1 };
+    s
+}
+
+// Blocks until the worker finishes, returns the result.
+let r = parallel.call("heavy_compute", [1000000]);
+```
+
+### parallel.spawn + parallel.join — asynchronous
+
+```1y
+// Returns immediately with a handle.
+let h1 = parallel.spawn("heavy_compute", [1000000]);
+let h2 = parallel.spawn("heavy_compute", [2000000]);
+
+// Block until each result is ready.
+let r1 = parallel.join(h1);
+let r2 = parallel.join(h2);
+```
+
+### parallel.map — parallel mapping
+
+```1y
+// All four calls run concurrently on different workers.
+let results = parallel.map("heavy_compute", [[1000], [2000], [3000], [4000]]);
+```
+
+### parallel.cores — CPU count
+
+```1y
+println("CPU cores: " + str(parallel.cores()));
+```
+
+### Constraints
+
+- Functions are called **by name** (string), not by closure reference.
+- Arguments and return values must be `SendValue`-compatible: Int, Str, Bool,
+  Nil, Vec, Map, Set, Variant, Struct. Functions, shared cells, actors, tasks,
+  and opaque resources cannot cross thread boundaries.
+- Worker threads load only definitions (FuncDef, ActorDef, TypeDef, EnumDef,
+  Import). Side-effect statements are not re-run on workers.
 
 ## Standard Library
 

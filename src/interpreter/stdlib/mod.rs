@@ -13,6 +13,7 @@ pub mod env;
 pub mod ffi;
 pub mod io;
 pub mod json;
+pub mod parallel;
 pub mod process;
 pub mod random;
 pub mod serial;
@@ -30,6 +31,7 @@ pub fn build_std_modules() -> HashMap<String, ModuleRef> {
     map.insert("ffi".to_string(), ffi::build());
     map.insert("io".to_string(), io::build());
     map.insert("json".to_string(), json::build());
+    map.insert("parallel".to_string(), parallel::build());
     map.insert("process".to_string(), process::build());
     map.insert("random".to_string(), random::build());
     map.insert("serial".to_string(), serial::build());

@@ -25,15 +25,28 @@ fn main() {
                     PathBuf::from(p).parent().map(|p| p.to_path_buf())
                 }
             });
-            // Use a single-worker pool (Phase C2: WorkerPool). The pool
-            // abstracts over thread spawning; future work will allow N>1
-            // workers for parallel actor execution across cores.
-            let pool = onely::runtime::worker::WorkerPool::new(1);
-            let rx = pool.submit(src.clone(), entry_dir);
-            let result = rx.recv().expect("worker pool channel closed");
-            pool.join();
+
+            // Create a multi-worker pool with pre-loaded definitions.
+            // Workers load only definitions (FuncDef/ActorDef/TypeDef/EnumDef/Import),
+            // not side-effect statements, so they don't re-run main logic.
+            let n = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1);
+            let pool = onely::runtime::worker::WorkerPool::new(
+                n,
+                Some(src.clone()),
+                entry_dir.clone(),
+            );
+            onely::runtime::worker::set_global_pool(pool);
+
+            // Run the full program (with side effects) on the main thread.
+            let mut interp = onely::Interpreter::new();
+            if let Some(dir) = &entry_dir {
+                interp.set_entry_dir(dir.clone());
+            }
+            let result = interp.run(&src);
             if let Err(e) = result {
-                eprintln!("{}", e);
+                eprintln!("{}", e.render(&src));
                 std::process::exit(1);
             }
         }

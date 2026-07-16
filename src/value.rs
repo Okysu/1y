@@ -19,6 +19,7 @@ use std::collections::{HashMap as StdMap, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::interpreter::env::EnvRef;
 
@@ -167,6 +168,9 @@ pub enum NativeResource {
     /// `Clone` derive on the outer `Rc` clone (we never actually clone the
     /// Library itself).
     SharedLib(Rc<RefCell<Option<libloading::Library>>>),
+    /// A handle to a parallel task, created by `parallel.spawn`.
+    /// Contains the receiver for the result from a worker thread.
+    ParallelHandle(Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<Result<SendValue, String>>>>>),
 }
 
 impl Clone for NativeResource {
@@ -177,6 +181,7 @@ impl Clone for NativeResource {
             NativeResource::Serial(r) => NativeResource::Serial(r.clone()),
             NativeResource::TlsStream(r) => NativeResource::TlsStream(r.clone()),
             NativeResource::SharedLib(r) => NativeResource::SharedLib(r.clone()),
+            NativeResource::ParallelHandle(r) => NativeResource::ParallelHandle(r.clone()),
         }
     }
 }
@@ -593,6 +598,7 @@ impl std::fmt::Display for Value {
                 NativeResource::Serial(_) => write!(f, "<serial-port>"),
                 NativeResource::TlsStream(_) => write!(f, "<tls-stream>"),
                 NativeResource::SharedLib(_) => write!(f, "<shared-lib>"),
+                NativeResource::ParallelHandle(_) => write!(f, "<parallel-handle>"),
             },
             Value::LazyImport { path } => write!(f, "<lazy-import {}>", path),
             Value::Task(_) => write!(f, "<task>"),

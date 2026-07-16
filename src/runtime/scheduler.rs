@@ -114,6 +114,25 @@ pub fn register_readable(stream: &std::net::TcpStream, task: &TaskRef) -> Option
     })
 }
 
+/// Register a TCP listener for readable events with the current scheduler's
+/// mio::Poll. Called by `socket.accept_async` when creating a Task.
+///
+/// Returns the allocated Token, or None if no scheduler is active (top-level
+/// await without a running event loop).
+pub fn register_listener_readable(listener: &std::net::TcpListener, task: &TaskRef) -> Option<Token> {
+    CURRENT_SCHEDULER.with(|s| {
+        let ptr = *s.borrow();
+        if ptr.is_null() {
+            return None;
+        }
+        // SAFETY: ptr was set by drain_mailboxes_async, which holds a unique
+        // borrow on the scheduler. Registration happens inside a coroutine
+        // that runs within drain_mailboxes_async's scheduler.run_until_complete.
+        let scheduler: &mut Scheduler = unsafe { &mut *ptr };
+        scheduler.register_listener_readable(listener, task.clone())
+    })
+}
+
 /// Deregister a TCP stream from the scheduler's mio::Poll.
 /// Called when the Task completes or is consumed.
 pub fn deregister_stream(token: Token) {
@@ -142,9 +161,15 @@ struct Parked {
     io_token: Option<Token>,
 }
 
+/// Which kind of I/O source is registered with mio.
+enum IoSource {
+    Stream(mio::net::TcpStream),
+    Listener(mio::net::TcpListener),
+}
+
 /// A registered I/O source, kept alive to maintain the mio registration.
 struct IoEntry {
-    source: mio::net::TcpStream,
+    source: IoSource,
     task: TaskRef,
 }
 
@@ -192,15 +217,41 @@ impl Scheduler {
             return None;
         }
         let task_ptr = Rc::as_ptr(&task) as usize;
-        self.io_entries.insert(token, IoEntry { source: mio_stream, task });
+        self.io_entries.insert(token, IoEntry { source: IoSource::Stream(mio_stream), task });
         self.task_ptr_to_token.insert(task_ptr, token);
         Some(token)
     }
 
-    /// Deregister a stream and remove all associated mappings.
+    /// Register a TCP listener for readable events (incoming connections).
+    /// Clones the listener (via try_clone) so the original remains usable.
+    fn register_listener_readable(&mut self, listener: &std::net::TcpListener, task: TaskRef) -> Option<Token> {
+        let cloned = match listener.try_clone() {
+            Ok(l) => l,
+            Err(_) => return None,
+        };
+        let mut mio_listener = mio::net::TcpListener::from_std(cloned);
+        let token = Token(self.next_token);
+        self.next_token += 1;
+        if self.poll.registry().register(&mut mio_listener, token, Interest::READABLE).is_err() {
+            return None;
+        }
+        let task_ptr = Rc::as_ptr(&task) as usize;
+        self.io_entries.insert(token, IoEntry { source: IoSource::Listener(mio_listener), task });
+        self.task_ptr_to_token.insert(task_ptr, token);
+        Some(token)
+    }
+
+    /// Deregister an I/O source (stream or listener) and remove all associated mappings.
     fn deregister_stream(&mut self, token: Token) {
         if let Some(entry) = self.io_entries.remove(&token) {
-            let _ = self.poll.registry().deregister(&mut { entry.source });
+            match entry.source {
+                IoSource::Stream(mut s) => {
+                    let _ = self.poll.registry().deregister(&mut s);
+                }
+                IoSource::Listener(mut l) => {
+                    let _ = self.poll.registry().deregister(&mut l);
+                }
+            }
             let task_ptr = Rc::as_ptr(&entry.task) as usize;
             self.task_ptr_to_token.remove(&task_ptr);
         }

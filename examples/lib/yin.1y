@@ -1,0 +1,321 @@
+// lib/yin.1y — A Gin-inspired web framework for 1y, built on lib.http.
+//
+//     import lib.yin as yin;
+//
+//     let app = yin.new();
+//
+//     yin.use(app, fn(ctx, next) {
+//         println(ctx.req.method + " " + ctx.req.path);
+//         next()
+//     });
+//
+//     yin.get(app, "/ping", fn(ctx) {
+//         yin.json(ctx, 200, { "message": "pong" })
+//     });
+//
+//     yin.get(app, "/users/:id", fn(ctx) {
+//         let id = yin.param(ctx, "id");
+//         yin.json(ctx, 200, { "user_id": id })
+//     });
+//
+//     let api = yin.group(app, "/api");
+//     yin.get(api, "/users", fn(ctx) {
+//         yin.json(ctx, 200, [{ "id": 1 }, { "id": 2 }])
+//     });
+//
+//     yin.run(app, "127.0.0.1:8080")
+//
+// Design:
+//   - App is a `shared` cell holding a Map. The Map contains three nested
+//     shared cells (routes, param_routes, middlewares) so that groups can
+//     share the same route tables as the parent app.
+//   - Context is also a `shared` cell holding a Map. yin.json(ctx, ...) etc.
+//     modify the shared cell in place, so handlers don't need to return it.
+//   - Shared cell parameters are passed by reference (1y's calling convention
+//     preserves SharedRef for bare identifiers), so register/use can write
+//     through to the nested shared cells.
+
+import lib.http as http;
+import json as J;
+
+// ---------------------------------------------------------------------------
+// App creation
+// ---------------------------------------------------------------------------
+
+fn new() {
+    shared {
+        "routes": shared {},          // "METHOD:/path" → handler
+        "param_routes": shared [],    // [[method, [path_parts], handler], ...]
+        "middlewares": shared [],     // [middleware_fn, ...]
+        "prefix": ""                  // for groups; empty for the root app
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Route registration
+// ---------------------------------------------------------------------------
+
+fn register(app, method, path, handler) {
+    let m = app;                          // deref app → Map
+    let prefix = m["prefix"];
+    let p = if is_str(prefix) { prefix } else { "" };
+    let full_path = p + path;
+
+    if contains(full_path, ":") {
+        let parts = split_path(full_path);
+        let entry = [method, parts, handler];
+        let pr_ref = m["param_routes"];   // SharedRef to Vec
+        let pr = pr_ref;                   // deref → Vec
+        pr_ref = push(pr, entry)           // write through
+    } else {
+        let key = method + ":" + full_path;
+        let r_ref = m["routes"];           // SharedRef to Map
+        let r = r_ref;                      // deref → Map
+        r_ref = assoc(r, key, handler)     // write through
+    }
+}
+
+fn get(app, path, handler) {
+    register(app, "GET", path, handler)
+}
+
+fn post(app, path, handler) {
+    register(app, "POST", path, handler)
+}
+
+fn put(app, path, handler) {
+    register(app, "PUT", path, handler)
+}
+
+fn delete(app, path, handler) {
+    register(app, "DELETE", path, handler)
+}
+
+fn use(app, middleware) {
+    let m = app;
+    let mws_ref = m["middlewares"];
+    let mws = mws_ref;
+    mws_ref = push(mws, middleware)
+}
+
+/// Create a route group. Shares the parent's route tables via the same
+/// nested shared cells; only the prefix differs.
+fn group(app, prefix) {
+    let m = app;
+    shared {
+        "routes": m["routes"],
+        "param_routes": m["param_routes"],
+        "middlewares": m["middlewares"],
+        "prefix": prefix
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Path utilities
+// ---------------------------------------------------------------------------
+
+fn split_path(path) -> Vec {
+    let raw = split(path, "/");
+    let result = [];
+    let i = 0;
+    while i < count(raw) {
+        if len(raw[i]) > 0 {
+            result = push(result, raw[i])
+        };
+        i += 1
+    };
+    result
+}
+
+fn is_param(seg) -> Bool {
+    len(seg) > 0 and substring(seg, 0, 1) == ":"
+}
+
+fn param_name(seg) -> Str {
+    substring(seg, 1, len(seg))
+}
+
+// ---------------------------------------------------------------------------
+// Route matching
+// ---------------------------------------------------------------------------
+
+fn match_route(app, method, path) {
+    let m = app;
+    let r_ref = m["routes"];
+    let routes = r_ref;                   // deref → Map
+    let exact_key = method + ":" + path;
+    let exact = routes[exact_key];
+    match exact {
+        h if not(is_nil(h)) => { "handler": h, "params": {} },
+        _ => match_param_route(app, method, path)
+    }
+}
+
+fn match_param_route(app, method, path) {
+    let m = app;
+    let pr_ref = m["param_routes"];
+    let param_routes = pr_ref;            // deref → Vec
+    let path_parts = split_path(path);
+
+    let i = 0;
+    while i < count(param_routes) {
+        let entry = param_routes[i];
+        let mtd = entry[0];
+        let pattern = entry[1];
+        let handler = entry[2];
+
+        if mtd == method and count(pattern) == count(path_parts) {
+            let params = try_match_parts(pattern, path_parts);
+            if not(is_nil(params)) {
+                return { "handler": handler, "params": params }
+            }
+        };
+        i += 1
+    };
+
+    nil
+}
+
+fn try_match_parts(pattern, path_parts) {
+    let params = {};
+    let i = 0;
+    while i < count(pattern) {
+        let pp = pattern[i];
+        let ap = path_parts[i];
+        if is_param(pp) {
+            params = assoc(params, param_name(pp), ap)
+        } else {
+            if pp != ap {
+                return nil
+            }
+        };
+        i += 1
+    };
+    params
+}
+
+// ---------------------------------------------------------------------------
+// Context
+// ---------------------------------------------------------------------------
+
+fn new_ctx(req, params, app) {
+    shared {
+        "req": req,
+        "params": params,
+        "status": 200,
+        "body": "",
+        "headers": [],
+        "app": app
+    }
+}
+
+fn param(ctx, name) -> Str {
+    let c = ctx;
+    let p = c["params"];
+    p[name]
+}
+
+fn header(ctx, name) -> Str {
+    let c = ctx;
+    let headers = c["req"]["headers"];
+    headers[name]
+}
+
+fn body(ctx) -> Str {
+    let c = ctx;
+    c["req"]["body"]
+}
+
+// ---------------------------------------------------------------------------
+// Response helpers — modify the ctx shared cell in place
+// ---------------------------------------------------------------------------
+
+fn json(ctx, status, data) {
+    let c = ctx;
+    let c2 = assoc(c, "status", status);
+    let c3 = assoc(c2, "body", J.stringify(data));
+    let h = c3["headers"];
+    let new_h = push(h, "Content-Type: application/json; charset=utf-8");
+    ctx = assoc(c3, "headers", new_h)
+}
+
+fn html(ctx, status, text) {
+    let c = ctx;
+    let c2 = assoc(c, "status", status);
+    let c3 = assoc(c2, "body", text);
+    let h = c3["headers"];
+    let new_h = push(h, "Content-Type: text/html; charset=utf-8");
+    ctx = assoc(c3, "headers", new_h)
+}
+
+fn text(ctx, status, msg) {
+    let c = ctx;
+    let c2 = assoc(c, "status", status);
+    let c3 = assoc(c2, "body", msg);
+    let h = c3["headers"];
+    let new_h = push(h, "Content-Type: text/plain; charset=utf-8");
+    ctx = assoc(c3, "headers", new_h)
+}
+
+fn set_header(ctx, key, value) {
+    let c = ctx;
+    let h = c["headers"];
+    let new_h = push(h, key + ": " + value);
+    ctx = assoc(c, "headers", new_h)
+}
+
+fn status_code(ctx, code) {
+    let c = ctx;
+    ctx = assoc(c, "status", code)
+}
+
+// ---------------------------------------------------------------------------
+// Middleware chain
+// ---------------------------------------------------------------------------
+
+fn run_chain(middlewares, ctx, final_handler, idx) {
+    if idx >= count(middlewares) {
+        final_handler(ctx)
+    } else {
+        let mw = middlewares[idx];
+        mw(ctx, fn() {
+            run_chain(middlewares, ctx, final_handler, idx + 1)
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Request dispatch
+// ---------------------------------------------------------------------------
+
+fn handle(app, req) {
+    let route = match_route(app, req["method"], req["path"]);
+
+    match route {
+        r if is_nil(r) => {
+            { "status": 404, "body": "404 Not Found", "headers": ["Content-Type: text/plain; charset=utf-8"] }
+        },
+        r => {
+            let ctx = new_ctx(req, r["params"], app);
+            let handler = r["handler"];
+
+            let m = app;
+            let mws_ref = m["middlewares"];
+            let mws = mws_ref;
+            run_chain(mws, ctx, handler, 0);
+
+            let c = ctx;
+            { "status": c["status"], "body": c["body"], "headers": c["headers"] }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
+
+fn run(app, addr) {
+    http.serve(addr, fn(req) {
+        handle(app, req)
+    })
+}

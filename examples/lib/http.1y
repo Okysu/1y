@@ -267,15 +267,17 @@ actor Connection {
 // Server
 // ---------------------------------------------------------------------------
 
-// Start an Actor-based HTTP server with non-blocking accept + colorless async.
+// Start an Actor-based HTTP server with event-driven accept + colorless async.
 //
 // `addr`     — "host:port" string (e.g. "127.0.0.1:8080")
 // `handler`  — function(req_map) -> { "status": Int, "body": Str, "headers": Vec }
 //
 // Architecture:
 //   1. Listener is set to non-blocking mode.
-//   2. Main loop calls `socket.accept` (non-blocking) — returns Nil if no
-//      pending connection.
+//   2. Main loop calls `await socket.accept_async(listener)` — the coroutine
+//      suspends until mio reports the listener readable (a connection is
+//      pending). No sleep_ms polling; the scheduler wakes us only when there
+//      is work, which scales far better under high concurrency.
 //   3. On a new connection: `spawn Connection()` + `conn ! Handle(stream, handler)`
 //      — the message is queued, accept loop continues immediately. The stream
 //      stays in non-blocking mode so the handler's `await socket.read_async`
@@ -285,28 +287,33 @@ actor Connection {
 //      suspend; the scheduler polls their Tasks each tick and resumes them
 //      when ready. This is how a slow handler (e.g. SSE) does NOT block
 //      other in-flight connections.
-//   5. If idle (no connection), `process.sleep_ms(1)` avoids busy-looping.
-//      This runs in the main thread (not a coroutine), so it uses the sync
-//      `sleep_ms` — it only fires when there's nothing to do.
 fn serve(addr, handler) {
     let listener = socket.listen(addr);
     socket.set_nonblocking(listener, true);
     println("1y http server listening on " + addr);
 
     loop {
-        let stream = socket.accept(listener);
+        // Event-driven accept: suspends until a connection is pending.
+        // No sleep_ms polling — mio wakes us only when there's work.
+        let stream = await socket.accept_async(listener);
 
-        if is_nil(stream) {
-            // No pending connection — drain queued handlers, then sleep briefly.
-            try { yield } rescue { nil };
-            process.sleep_ms(1)
-        } else {
-            // New connection: spawn an actor and fire-and-forget the stream.
-            // The stream inherits the listener's non-blocking mode — KEEP it
-            // non-blocking so `await socket.read_async` in the handler can
-            // suspend on WouldBlock instead of blocking the event loop.
+        if not(is_nil(stream)) {
             let conn = spawn Connection();
             conn ! Handle(stream, handler)
+        };
+
+        // Batch accept: drain any additional pending connections without
+        // suspending (non-blocking accept returns Nil if none pending).
+        // Reduces per-connection coroutine overhead under high concurrency.
+        let more = true;
+        while more {
+            let s2 = socket.accept(listener);
+            if is_nil(s2) {
+                more = false
+            } else {
+                let conn = spawn Connection();
+                conn ! Handle(s2, handler)
+            }
         };
 
         // Drain queued handler messages each iteration (even when connections

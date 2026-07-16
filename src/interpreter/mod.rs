@@ -148,6 +148,14 @@ impl Interpreter {
         let global = Environment::global();
         builtins::register(&global);
         let (cross_tx, cross_rx) = std::sync::mpsc::channel();
+        let std_modules = stdlib::build_std_modules();
+        // The `parallel` module is a core concurrency API — bind it as a
+        // global so `parallel.call(...)` works without an explicit import.
+        if let Some(parallel_mod) = std_modules.get("parallel") {
+            global
+                .borrow_mut()
+                .define("parallel", Value::Module(parallel_mod.clone()));
+        }
         Interpreter {
             global,
             variants: HashMap::new(),
@@ -158,7 +166,7 @@ impl Interpreter {
             cross_inbox: cross_rx,
             _cross_sender: cross_tx,
             txn_stack: Vec::new(),
-            std_modules: stdlib::build_std_modules(),
+            std_modules,
             module_cache: HashMap::new(),
             module_load_stack: Vec::new(),
             entry_dir: None,
@@ -221,6 +229,50 @@ impl Interpreter {
             }
         }
         Ok(last)
+    }
+
+    /// Load only definition statements (FuncDef, ActorDef, TypeDef, EnumDef,
+    /// Import) from a source string. Skips side-effect statements (Let,
+    /// SharedDecl, Expr, Semi). Used by WorkerPool to pre-load definitions on
+    /// worker threads without running main-program side effects.
+    pub fn load_definitions(&mut self, source: &str) -> Result<(), InterpreterError> {
+        let output = crate::parser::parse(source);
+        if !output.errors.is_empty() {
+            let e = &output.errors[0];
+            return Err(InterpreterError::RuntimeError {
+                msg: format!("parse error: {}", e.full_message()),
+                span: Some(e.span),
+            });
+        }
+        for stmt in &output.program.stmts {
+            match stmt {
+                Stmt::FuncDef(_) | Stmt::ActorDef(_) | Stmt::TypeDef(_)
+                | Stmt::EnumDef(_) | Stmt::Import(_) => {
+                    self.eval_stmt(&self.global.clone(), stmt)?;
+                }
+                _ => {} // skip Let, SharedDecl, Expr, Semi, StateDecl, OnClause
+            }
+        }
+        Ok(())
+    }
+
+    /// Call a function by name with SendValue arguments. Used by WorkerPool
+    /// workers to invoke functions submitted via parallel.call/spawn.
+    pub fn call_function_by_name(
+        &mut self,
+        name: &str,
+        args: Vec<crate::value::SendValue>,
+    ) -> Result<crate::value::SendValue, String> {
+        let func = self
+            .global
+            .borrow()
+            .get(name)
+            .ok_or_else(|| format!("function '{}' not defined", name))?;
+        let args: Vec<Value> = args.into_iter().map(|sv| sv.into_value()).collect();
+        let result = self
+            .call_function(&func, args, Span::dummy())
+            .map_err(|e| e.render(name))?;
+        crate::value::SendValue::from_value(&result)
     }
 
     // -----------------------------------------------------------------------
