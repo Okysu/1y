@@ -15,9 +15,9 @@ This page covers the four core functions of `ffi` — `load`, `call`, `unload`, 
 ```1y
 import ffi;
 
-let lib = ffi.load("libc.so.6");          # Linux
-# let lib = ffi.load("msvcrt.dll");       # Windows
-# let lib = ffi.load("libSystem.dylib");  # macOS
+let lib = ffi.load("libc.so.6");          // Linux
+// let lib = ffi.load("msvcrt.dll");       // Windows
+// let lib = ffi.load("libSystem.dylib");  // macOS
 ```
 
 `load` searches the standard library paths (influenced by `LD_LIBRARY_PATH` / `PATH` / `DYLD_LIBRARY_PATH` and similar) and also accepts absolute or relative paths. If loading fails, `load` errors with the reason. Loading the same library twice yields independent handles; typically you load once at startup and hold the handle for the program's lifetime.
@@ -28,7 +28,7 @@ let lib = ffi.load("libc.so.6");          # Linux
 
 ```1y
 let r = ffi.call(lib, "abs", "int(int)", [-42]);
-print(r);    # 42
+print(r);    // 42
 ```
 
 How `call` works:
@@ -42,11 +42,11 @@ How `call` works:
 A signature is a string of the form `"ret(arg1, arg2, ...)"`: the part before the parentheses is the return type, and inside the parentheses is a comma-separated list of parameter types. A no-argument function is written `"ret()"`.
 
 ```1y
-"int(int)"          # takes one int, returns int
-"void(int)"         # takes one int, returns nothing
-"str(str)"          # takes a C string, returns a C string
-"float(float)"      # takes an f64, returns an f64
-"int(str, int)"     # takes (string, int), returns int
+"int(int)"          // takes one int, returns int
+"void(int)"         // takes one int, returns nothing
+"str(str)"          // takes a C string, returns a C string
+"float(float)"      // takes an f64, returns an f64
+"int(str, int)"     // takes (string, int), returns int
 ```
 
 A return type of `void` means the function returns nothing, in which case `call` returns the unit value. Whitespace in the signature is ignored, so `"int( int , str )"` is equivalent to `"int(int,str)"`.
@@ -99,9 +99,8 @@ For these reasons, FFI should be a **last resort**: first check whether the stan
 
 ```1y
 import ffi;
-import io;
 
-# Load the C standard library cross-platform and call abs / strlen
+// Load the C standard library cross-platform and call abs / strlen
 let lib = ffi.load("libc.so.6");
 
 let absval = ffi.call(lib, "abs", "int(int)", [-42]);

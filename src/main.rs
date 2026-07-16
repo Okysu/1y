@@ -25,25 +25,13 @@ fn main() {
                     PathBuf::from(p).parent().map(|p| p.to_path_buf())
                 }
             });
-            // Tree-walking recursion maps to native recursion; run on a thread
-            // with a large stack so deep `1y` recursion doesn't overflow.
-            // `Value`/`InterpreterError` hold `Rc` (`!Send`), so the error is
-            // stringified inside the worker thread before being returned.
-            let result = std::thread::Builder::new()
-                .stack_size(256 * 1024 * 1024)
-                .spawn(move || {
-                    let mut interp = onely::Interpreter::new();
-                    if let Some(dir) = entry_dir {
-                        interp.set_entry_dir(dir);
-                    }
-                    match interp.run(&src) {
-                        Ok(()) => Ok(()),
-                        Err(e) => Err(e.render(&src)),
-                    }
-                })
-                .expect("spawn interpreter thread")
-                .join()
-                .expect("interpreter thread panicked");
+            // Use a single-worker pool (Phase C2: WorkerPool). The pool
+            // abstracts over thread spawning; future work will allow N>1
+            // workers for parallel actor execution across cores.
+            let pool = onely::runtime::worker::WorkerPool::new(1);
+            let rx = pool.submit(src.clone(), entry_dir);
+            let result = rx.recv().expect("worker pool channel closed");
+            pool.join();
             if let Err(e) = result {
                 eprintln!("{}", e);
                 std::process::exit(1);

@@ -119,32 +119,34 @@ fn divide(a, b) {
 }
 ```
 
-`try { ... } rescue Pattern as name { ... }` 捕获异常。`try` 块中的代码若抛出异常,1y 会依次用 `rescue` 后的**模式**去匹配被抛出的值;匹配成功时,把值绑定到 `as` 后的名字(若提供),并执行对应的处理块:
+`try { ... } rescue [TypeName] as name { ... }` 捕获异常。`try` 块中的代码若抛出异常,1y 会将抛出值的类型与 `rescue` 后的类型名进行匹配(若不给出类型名则捕获所有异常);匹配成功时,把值绑定到 `as` 后的名字(若提供),并执行对应的处理块:
 
 ```1y
 try {
     let r = divide(10, 0);
     println("result: {r}")
-} rescue msg {
+} rescue as msg {
     println("caught: {msg}")   // caught: division by zero
 }
 ```
 
-`rescue` 后面用的是**模式**,因此你可以像在 `match` 里那样精确地分类处理不同异常:
+`rescue` 后面跟的是可选的**类型名**——它按名称匹配 `Variant` 或 `Struct`,因此你可以精确地分类处理不同异常:
 
 ```1y
+enum AppError { Timeout, WithCode(Int) }
+
 try {
-    risky_operation()
-} rescue "timeout" => {
+    raise Timeout
+} rescue Timeout {
     println("operation timed out, retrying")
-} rescue Some(code) => {
+} rescue WithCode as code {
     println("error code: {code}")
-} rescue other => {
+} rescue as other {
     println("unknown error: {other}")
 }
 ```
 
-这让你能够用统一的模式匹配语法来处理错误,而不是为异常单独发明一套机制。`try` 是一个表达式,它的值是 `try` 块成功时的值,或在 `rescue` 中处理块返回的值。
+这让你能够按类型来处理错误,而不是为异常单独发明一套机制。`try` 是一个表达式,它的值是 `try` 块成功时的值,或在 `rescue` 中处理块返回的值。
 
 ## ensure:清理块
 
@@ -152,9 +154,9 @@ try {
 
 ```1y
 try {
-    let f = io.open("data.txt");
-    process(f)
-} rescue e => {
+    let data = io.read_to_string("data.txt");
+    process(data)
+} rescue as e {
     println("error: {e}")
 } ensure {
     // 无论是否出错,这里都会执行
@@ -162,7 +164,7 @@ try {
 }
 ```
 
-把 `try / rescue / ensure` 组合起来,你就得到了一套结构化的错误处理流程:尝试执行、按模式分类捕获、无论如何都做清理。
+把 `try / rescue / ensure` 组合起来,你就得到了一套结构化的错误处理流程:尝试执行、按类型分类捕获、无论如何都做清理。
 
 ## 控制流即表达式
 
@@ -180,11 +182,11 @@ let count = loop {
 
 let value = try {
     risky_parse(input)
-} rescue _ => { 0 };
+} rescue as _ { 0 };
 ```
 
 当你习惯了"让表达式自己携带值"的思路,1y 的代码会变得更紧凑、更少出错,也更接近数学式的描述。
 
 ## 小结
 
-`if` 选择并返回值;`while` / `for` 是副作用循环,返回 `Nil`;`loop` 配合 `break value` 是带返回值的通用循环;`raise` 抛出任意值作为异常,`try / rescue` 用模式匹配捕获,`ensure` 保证清理。把这些结构当作"会产出值的表达式"来使用,你的 1y 程序会自然而然地流露出函数式的简洁与清晰。
+`if` 选择并返回值;`while` / `for` 是副作用循环,返回 `Nil`;`loop` 配合 `break value` 是带返回值的通用循环;`raise` 抛出任意值作为异常,`try / rescue` 按类型名捕获,`ensure` 保证清理。把这些结构当作"会产出值的表达式"来使用,你的 1y 程序会自然而然地流露出函数式的简洁与清晰。

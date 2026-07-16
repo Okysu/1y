@@ -43,6 +43,11 @@ fn str_at(args: &[Value], idx: usize, name: &str) -> Result<String, InterpreterE
 }
 
 fn bi_read_line(_args: &[Value]) -> Result<Value, InterpreterError> {
+    // Flush stdout so any pending `print` (without newline) is visible before
+    // we block on stdin. This makes interactive prompts like
+    // `print("Name? "); let name = io.read_line();` work as expected.
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
     let mut line = String::new();
     match std::io::stdin().read_line(&mut line) {
         Ok(0) => Ok(Value::Nil),

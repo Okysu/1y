@@ -92,7 +92,7 @@ The benefit of immutability is that **aliasing problems are eliminated at the ro
 let xs = [1, 2, 3];
 let ys = push(xs, 4);         // [1, 2, 3, 4]
 let first = xs[0];            // index access, 1
-let combined = xs + ys;       // concatenation
+let combined = fold(ys, xs, fn(acc, x) { push(acc, x) });  // concatenation via fold
 ```
 
 `Vec` is backed by `im::Vector`, an RRB-tree implementation offering near-O(log₃₂ n) random access and O(1) amortized append.
@@ -115,12 +115,18 @@ Note that `{}` is parsed as an empty block (`Nil`), not an empty `Map`. To const
 
 ```1y
 let s = #{1, 2, 3};
-let s2 = insert(s, 4);               // add an element
-let s3 = remove(s, 2);                // remove an element
-let has = contains(s, 1);             // true
+println(count(s));                    // 3
+
+// membership check via fold
+let has = fold(s, false, fn(acc, x) { if x == 1 { true } else { acc } });
+println(has);                         // true
+
+for x in s {
+    println(x)
+}
 ```
 
-`Set` is backed by `im::HashSet`, offering O(1) average membership checks.
+`Set` is backed by `im::HashSet`, offering O(1) average membership checks. Element-level mutation is done by building a new set literal or by folding over the set.
 
 ## Functions: Func and Native
 

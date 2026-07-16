@@ -26,24 +26,24 @@ This reads almost like the definition itself: when `n` is less than 2, return `n
 
 The cost of naive recursion, however, is exponential. `fib(10)` needs about 177 calls, `fib(30)` needs over a million, and `fib(50)` will keep your program "stuck" for a long time. The problem is redundant computation: the result of `fib(n - 2)` has already been computed inside `fib(n - 1)`, yet nothing remembers it.
 
-## Version Two: Memoization with a Map
+## Version Two: Memoization with a Shared Map
 
-We obviously do not want the same subproblem solved over and over. A natural improvement is a "memo table" — store what you have computed and look it up next time. 1y's `Map` is persistent: `assoc` returns a new Map that **shares most of its structure** rather than mutating in place, which fits the functional style of "threading state through recursion" perfectly:
+We obviously do not want the same subproblem solved over and over. A natural improvement is a "memo table" — store what you have computed and look it up next time. 1y's `shared` cell gives us a mutable reference that can be read and written from inside a closure, which is the perfect vehicle for a memo table:
 
 ```1y
 fn fib_memo(n) -> Int {
-    fn go(n, memo) {
+    let memo = shared {0: 0, 1: 1};
+    fn go(n) {
         match get(memo, n) {
             v if is_int(v) => v,
             _ => {
-                let v = go(n - 1, memo) + go(n - 2, memo);
-                // assoc returns a new Map recording n -> v
+                let v = go(n - 1) + go(n - 2);
+                memo = assoc(memo, n, v);
                 v
             }
         }
     };
-    // seed the memo with the two base cases
-    go(n, assoc(assoc({}, "0", 0), "1", 1))
+    go(n)
 }
 
 println(fib_memo(100))
@@ -51,31 +51,12 @@ println(fib_memo(100))
 
 Let us look closely at how this is built.
 
-- We tuck the real recursion into an inner function `go` that carries an extra parameter, `memo` — the memo table. This is a common pattern in functional languages: "carry state as a parameter" instead of mutating a global variable.
-- `match get(memo, n)` looks the key up with `get`. Note that `get` returns `nil` when the key is absent, which is what triggers the `_ =>` branch.
-- `assoc(memo, n, v)` records the freshly computed `v` in the table. There is an **important subtlety**: for simplicity, the `go` above actually returns the number `v`, not the updated memo. A stricter version that lets the memo truly be reused would thread the `assoc` result down to the sub-calls. We write that more "textbook" version next.
+- `let memo = shared {0: 0, 1: 1}` creates a shared transactional cell wrapping a Map. The two base cases (`F(0) = 0`, `F(1) = 1`) are seeded up front with **integer keys** — note that keys and lookup values must use the same type, so we use `0` and `1`, not `"0"` and `"1"`.
+- The inner function `go` closes over `memo`. Each call first does `get(memo, n)` — reading the shared cell returns the Map, and `get` looks up the key. When the key is absent, `get` returns `nil`, which falls through to the `_ =>` branch.
+- `memo = assoc(memo, n, v)` writes the freshly computed `v` back into the shared cell. Because `memo` is a `shared` cell (not a plain `let` binding), this assignment persists across recursive calls — every subsequent `go` sees the updated table. This is what makes the memoization actually work.
+- `assoc` returns a **new** Map (1y's Maps are persistent — structural sharing, no in-place mutation), and the shared cell is updated to point to this new version.
 
-Here is a rigorous version that threads the memo all the way down:
-
-```1y
-fn fib_memo(n) -> Int {
-    fn go(n, memo) -> Int {
-        match get(memo, n) {
-            v if is_int(v) => v,
-            _ => {
-                let m1 = go(n - 1, memo);
-                let m2 = go(n - 2, memo);
-                // simplified: recompute to demonstrate assoc usage
-                let v = fib(n - 1) + fib(n - 2);
-                v
-            }
-        }
-    };
-    go(n, assoc(assoc({}, "0", 0), "1", 1))
-}
-```
-
-`get(memo, key)` looks up a key, `assoc(memo, key, val)` inserts or updates a key, and `dissoc(memo, key)` removes one — these three form the basic toolkit for working with a Map. Because Maps are persistent, you can freely switch between "versions" without interference, which is especially friendly to algorithms that need backtracking or parallelism.
+`get(memo, key)` looks up a key, `assoc(memo, key, val)` inserts or updates a key, and `dissoc(memo, key)` removes one — these three form the basic toolkit for working with a Map. Combined with `shared`, you get the convenience of mutable state without giving up the safety of persistent data structures.
 
 ## Version Three: Iteration
 

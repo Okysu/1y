@@ -158,6 +158,45 @@ impl Parser {
         self.errors.push(SourceError::new(span, msg));
     }
 
+    /// Detect a JS-style arrow function `(...) => ...`. Called right after
+    /// the opening `(` has been consumed. Only matches the common forms:
+    ///   `() =>`           — zero-arg arrow
+    ///   `(x) =>`          — single-arg arrow
+    ///   `(a, b, ...) =>`  — multi-arg arrow (idents separated by commas)
+    ///
+    /// This deliberately does NOT match arbitrary `(...)` followed by `=>`,
+    /// because 1y's `match` arms also use `expr => body`, and expressions
+    /// like `not(is_nil(h)) => ...` would be false positives.
+    fn looks_like_arrow_fn(&self) -> bool {
+        // Pattern: `)` then `=>`  (zero-arg: `() =>`)
+        if matches!(self.peek(), TokenKind::RParen) {
+            return matches!(
+                self.tokens.get(self.idx + 1).map(|t| &t.kind),
+                Some(TokenKind::FatArrow)
+            );
+        }
+        // Pattern: `ident (, ident)*` then `)` then `=>`
+        let mut i = self.idx;
+        loop {
+            match &self.tokens.get(i).map(|t| &t.kind) {
+                Some(TokenKind::Ident(_)) => {
+                    i += 1;
+                    match self.tokens.get(i).map(|t| &t.kind) {
+                        Some(TokenKind::Comma) => i += 1, // continue collecting params
+                        Some(TokenKind::RParen) => break, // done with params
+                        _ => return false, // not a param list
+                    }
+                }
+                _ => return false,
+            }
+        }
+        // i now points at `)`. Check if `=>` follows.
+        matches!(
+            self.tokens.get(i + 1).map(|t| &t.kind),
+            Some(TokenKind::FatArrow)
+        )
+    }
+
     // --- statement list / blocks ---
 
     /// Parse a sequence of statements until a terminator (`}` at block level,
@@ -879,6 +918,19 @@ impl Parser {
             // parenthesised expression
             TokenKind::LParen => {
                 self.bump();
+                // Detect JS-style arrow functions `() => ...` / `(params) => ...`.
+                // 1y uses `fn(params) { body }` for lambdas; give a targeted
+                // hint instead of a generic "unexpected `)`".
+                if self.looks_like_arrow_fn() {
+                    return Err(SourceError::new(
+                        start,
+                        "arrow functions (`=>`) are not supported",
+                    )
+                    .with_hint(
+                        "1y uses `fn(params) { body }` for lambdas — \
+                         try `fn() { ... }` or `fn(x) { ... }`",
+                    ));
+                }
                 let inner = self.parse_expr(0)?;
                 self.expect(&TokenKind::RParen, "`)`");
                 Ok(Expr::Paren(Box::new(inner), start.union(self.prev_span())))
@@ -1050,17 +1102,19 @@ impl Parser {
     }
 
     /// Parse `{ ... }` which is either a block or a map literal, decided by
-    /// lookahead: after `{`, an empty `}` is an empty block; otherwise we parse
-    /// one expression and if a `:` follows it is a map, else a block.
+    /// lookahead: after `{`, an empty `}` is an empty map literal `{}` (not an
+    /// empty block, which would evaluate to `Nil` and surprise users who
+    /// expect `{}` to behave like an empty Map as in most languages);
+    /// otherwise we parse one expression and if a `:` follows it is a map,
+    /// else a block.
     fn parse_brace_expr(&mut self, start: Span) -> Result<Expr, SourceError> {
         self.bump(); // `{`
 
-        // empty block
+        // empty map literal: `{}`
         if matches!(self.peek(), TokenKind::RBrace) {
             self.bump();
-            return Ok(Expr::Block {
-                stmts: vec![],
-                tail: None,
+            return Ok(Expr::MapLit {
+                entries: vec![],
                 span: start.union(self.prev_span()),
             });
         }

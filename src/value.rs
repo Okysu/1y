@@ -61,6 +61,34 @@ pub struct Envelope {
     pub reply_slot: Option<Rc<RefCell<Option<Value>>>>,
 }
 
+/// A `Send` version of [`Envelope`] for cross-thread actor messaging.
+///
+/// When an actor on thread A sends a message to an actor on thread B, the
+/// `Value` message payload is converted to [`SendValue`] (erroring on
+/// non-Send types like functions or resources), and the `reply_slot` uses
+/// `Arc<Mutex<…>>` instead of `Rc<RefCell<…>>` so the reply can cross
+/// thread boundaries.
+///
+/// The receiving thread converts the `SendValue` back to a `Value` and
+/// dispatches it to the local actor, filling the reply slot when done.
+pub struct CrossEnvelope {
+    /// The message payload, as a `Send` data-only subset of `Value`.
+    pub msg: SendValue,
+    /// For `?` (request/reply): a cross-thread reply slot. `None` for `!`.
+    pub reply_slot: Option<std::sync::Arc<std::sync::Mutex<Option<SendValue>>>>,
+}
+
+// Compile-time assertion that CrossEnvelope is Send + Sync.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    const fn assert_sync<T: Sync>() {}
+    assert_send::<CrossEnvelope>();
+    assert_sync::<CrossEnvelope>();
+    assert_send::<SendValue>();
+    assert_sync::<SendValue>();
+    assert_send::<ActorPid>();
+};
+
 /// An actor instance: isolated state + message handlers + mailbox.
 ///
 /// Actors run on a single-threaded event loop. `!` enqueues a message and
@@ -68,6 +96,10 @@ pub struct Envelope {
 /// waits for `reply`. The event loop drains pending `!` messages when the
 /// main program finishes (or when explicitly flushed).
 pub struct ActorInstance {
+    /// Globally-unique actor ID (Phase C3). Allocated at spawn time and
+    /// registered in the global `ActorRegistry` so actors on other threads
+    /// can route messages to this actor via `CrossEnvelope`.
+    pub pid: ActorPid,
     /// Environment holding the actor's `state` bindings (parent = global).
     pub env: EnvRef,
     /// `on name(params)` handlers, keyed by handler name.
@@ -79,6 +111,7 @@ pub struct ActorInstance {
 impl ActorInstance {
     pub fn new(env: EnvRef) -> Self {
         ActorInstance {
+            pid: crate::runtime::registry::allocate_pid(),
             env,
             handlers: HashMap::new(),
             mailbox: VecDeque::new(),
@@ -563,6 +596,338 @@ impl std::fmt::Display for Value {
             },
             Value::LazyImport { path } => write!(f, "<lazy-import {}>", path),
             Value::Task(_) => write!(f, "<task>"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ActorPid — lightweight Send identifier for cross-thread actor messaging
+// ---------------------------------------------------------------------------
+
+/// A lightweight, `Send` + `Copy` identifier for an actor.
+///
+/// In the BEAM-style concurrency model, actors live on a specific thread
+/// (tied to that thread's `Scheduler` and coroutine pool). When an actor
+/// reference needs to cross thread boundaries, it is represented as a `Pid`
+/// — a globally unique `u64` — rather than the `!Send` `ActorRef` (`Rc`).
+///
+/// The receiving thread resolves the `Pid` back to a local `ActorRef` via
+/// the global `ActorRegistry` (see `runtime/registry.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ActorPid(pub u64);
+
+impl std::fmt::Display for ActorPid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<pid {}>", self.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SendValue — a Send subset of Value for cross-thread actor messages
+// ---------------------------------------------------------------------------
+
+/// A `Send` subset of [`Value`] that can safely cross thread boundaries.
+///
+/// In the BEAM-style concurrency model, only **data** values can be sent in
+/// cross-thread Actor messages — not functions, closures, shared cells,
+/// tasks, or I/O resources (all of which are `!Send` due to `Rc`).
+///
+/// `SendValue` is the wire format for cross-thread `Envelope`s. The sending
+/// thread calls [`SendValue::from_value`] to convert a `Value` into a
+/// `SendValue` (erroring on non-Send types), and the receiving thread calls
+/// [`SendValue::into_value`] to reconstruct a `Value`.
+///
+/// `ActorPid` is included so actor references can be forwarded across threads.
+#[derive(Clone, Debug)]
+pub enum SendValue {
+    // --- numbers ---
+    Int(BigInt),
+    Decimal(BigDecimal),
+
+    // --- primitives ---
+    Str(String),
+    Bool(bool),
+    Nil,
+
+    // --- persistent collections (im is Send + Sync when elements are) ---
+    Vec(ImVector<SendValue>),
+    Map(ImMap<SendValue, SendValue>),
+    Set(ImSet<SendValue>),
+
+    // --- user-defined types ---
+    Variant {
+        name: String,
+        args: Vec<SendValue>,
+    },
+    Struct {
+        name: String,
+        fields: StdMap<String, SendValue>,
+    },
+
+    // --- cross-thread actor reference ---
+    /// An actor on another thread, identified by Pid.
+    ActorPid(ActorPid),
+}
+
+impl SendValue {
+    /// Convert a `Value` to a `SendValue`, returning an error message for
+    /// types that cannot cross thread boundaries (functions, shared cells,
+    /// tasks, resources, etc.).
+    pub fn from_value(v: &Value) -> Result<Self, String> {
+        match v {
+            Value::Int(n) => Ok(SendValue::Int(n.clone())),
+            Value::Decimal(d) => Ok(SendValue::Decimal(d.clone())),
+            Value::Str(s) => Ok(SendValue::Str((**s).clone())),
+            Value::Bool(b) => Ok(SendValue::Bool(*b)),
+            Value::Nil => Ok(SendValue::Nil),
+            Value::Vec(v) => {
+                let items: Result<ImVector<_>, _> =
+                    v.iter().map(SendValue::from_value).collect();
+                Ok(SendValue::Vec(items?))
+            }
+            Value::Map(m) => {
+                let mut map = ImMap::new();
+                for (k, v) in m.iter() {
+                    map.insert(SendValue::from_value(k)?, SendValue::from_value(v)?);
+                }
+                Ok(SendValue::Map(map))
+            }
+            Value::Set(s) => {
+                let mut set = ImSet::new();
+                for item in s.iter() {
+                    set.insert(SendValue::from_value(item)?);
+                }
+                Ok(SendValue::Set(set))
+            }
+            Value::Variant { name, args } => {
+                let args: Result<Vec<_>, _> =
+                    args.iter().map(SendValue::from_value).collect();
+                Ok(SendValue::Variant {
+                    name: (**name).clone(),
+                    args: args?,
+                })
+            }
+            Value::Struct { name, fields } => {
+                let mut out_fields = StdMap::new();
+                for (k, v) in fields.iter() {
+                    out_fields.insert(k.clone(), SendValue::from_value(v)?);
+                }
+                Ok(SendValue::Struct {
+                    name: (**name).clone(),
+                    fields: out_fields,
+                })
+            }
+            Value::Actor(_) => {
+                Err("cannot send Actor reference across threads (use a Pid)".into())
+            }
+            Value::Func(_) => Err("cannot send function across threads".into()),
+            Value::Native(_) => Err("cannot send native function across threads".into()),
+            Value::Shared(_) => Err("cannot send shared cell across threads".into()),
+            Value::Module(_) => Err("cannot send module across threads".into()),
+            Value::Opaque(_) => Err("cannot send resource across threads".into()),
+            Value::LazyImport { .. } => {
+                Err("cannot send lazy import across threads".into())
+            }
+            Value::Task(_) => Err("cannot send task across threads".into()),
+        }
+    }
+
+    /// Convert a `SendValue` back to a `Value` on the receiving thread.
+    ///
+    /// `ActorPid` values are **not** resolved here — the caller must look up
+    /// the Pid in the `ActorRegistry` and replace the `Nil` placeholder with
+    /// a local `Value::Actor` if the actor lives on this thread, or keep it
+    /// as a Pid-valued placeholder if it lives on another thread.
+    pub fn into_value(self) -> Value {
+        match self {
+            SendValue::Int(n) => Value::Int(n),
+            SendValue::Decimal(d) => Value::Decimal(d),
+            SendValue::Str(s) => Value::Str(Rc::new(s)),
+            SendValue::Bool(b) => Value::Bool(b),
+            SendValue::Nil => Value::Nil,
+            SendValue::Vec(v) => {
+                Value::Vec(v.into_iter().map(SendValue::into_value).collect())
+            }
+            SendValue::Map(m) => Value::Map(
+                m.into_iter()
+                    .map(|(k, v)| (k.into_value(), v.into_value()))
+                    .collect(),
+            ),
+            SendValue::Set(s) => {
+                Value::Set(s.into_iter().map(SendValue::into_value).collect())
+            }
+            SendValue::Variant { name, args } => Value::Variant {
+                name: Rc::new(name),
+                args: Rc::new(args.into_iter().map(SendValue::into_value).collect()),
+            },
+            SendValue::Struct { name, fields } => Value::Struct {
+                name: Rc::new(name),
+                fields: Rc::new(
+                    fields
+                        .into_iter()
+                        .map(|(k, v)| (k, v.into_value()))
+                        .collect(),
+                ),
+            },
+            // ActorPid is left as Nil here — the caller (message dispatch)
+            // is responsible for resolving it via the ActorRegistry.
+            SendValue::ActorPid(pid) => {
+                let _ = pid;
+                Value::Nil
+            }
+        }
+    }
+}
+
+// --- SendValue equality: structural for all data types ---
+
+impl PartialEq for SendValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (SendValue::Int(a), SendValue::Int(b)) => a == b,
+            (SendValue::Decimal(a), SendValue::Decimal(b)) => a == b,
+            (SendValue::Str(a), SendValue::Str(b)) => a == b,
+            (SendValue::Bool(a), SendValue::Bool(b)) => a == b,
+            (SendValue::Nil, SendValue::Nil) => true,
+            (SendValue::Vec(a), SendValue::Vec(b)) => a == b,
+            (SendValue::Map(a), SendValue::Map(b)) => a == b,
+            (SendValue::Set(a), SendValue::Set(b)) => a == b,
+            (
+                SendValue::Variant { name: an, args: aa },
+                SendValue::Variant { name: bn, args: ba },
+            ) => an == bn && aa == ba,
+            (
+                SendValue::Struct { name: an, fields: af },
+                SendValue::Struct { name: bn, fields: bf },
+            ) => an == bn && af == bf,
+            (SendValue::ActorPid(a), SendValue::ActorPid(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for SendValue {}
+
+impl Hash for SendValue {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            SendValue::Int(n) => {
+                0u8.hash(state);
+                n.hash(state);
+            }
+            SendValue::Decimal(d) => {
+                1u8.hash(state);
+                d.hash(state);
+            }
+            SendValue::Str(s) => {
+                2u8.hash(state);
+                s.hash(state);
+            }
+            SendValue::Bool(b) => {
+                3u8.hash(state);
+                b.hash(state);
+            }
+            SendValue::Nil => {
+                4u8.hash(state);
+            }
+            SendValue::Vec(v) => {
+                5u8.hash(state);
+                v.hash(state);
+            }
+            SendValue::Map(m) => {
+                6u8.hash(state);
+                m.hash(state);
+            }
+            SendValue::Set(s) => {
+                7u8.hash(state);
+                s.hash(state);
+            }
+            SendValue::Variant { name, args } => {
+                9u8.hash(state);
+                name.hash(state);
+                args.hash(state);
+            }
+            SendValue::Struct { name, fields } => {
+                10u8.hash(state);
+                name.hash(state);
+                let mut keys: Vec<_> = fields.keys().collect();
+                keys.sort();
+                for k in keys {
+                    k.hash(state);
+                    fields[k].hash(state);
+                }
+            }
+            SendValue::ActorPid(pid) => {
+                13u8.hash(state);
+                pid.hash(state);
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for SendValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SendValue::Int(n) => write!(f, "{}", n),
+            SendValue::Decimal(d) => write!(f, "{}", d),
+            SendValue::Str(s) => write!(f, "\"{}\"", s),
+            SendValue::Bool(b) => write!(f, "{}", b),
+            SendValue::Nil => write!(f, "nil"),
+            SendValue::Vec(v) => {
+                write!(f, "[")?;
+                for (i, item) in v.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", item)?;
+                }
+                write!(f, "]")
+            }
+            SendValue::Map(m) => {
+                write!(f, "{{")?;
+                for (i, (k, v)) in m.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}: {}", k, v)?;
+                }
+                write!(f, "}}")
+            }
+            SendValue::Set(s) => {
+                write!(f, "#{{")?;
+                for (i, item) in s.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", item)?;
+                }
+                write!(f, "}}")
+            }
+            SendValue::Variant { name, args } => {
+                if args.is_empty() {
+                    write!(f, "{}", name)
+                } else {
+                    write!(f, "{}(", name)?;
+                    for (i, a) in args.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{}", a)?;
+                    }
+                    write!(f, ")")
+                }
+            }
+            SendValue::Struct { name, fields } => {
+                write!(f, "{} {{", name)?;
+                for (i, (k, v)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}: {}", k, v)?;
+                }
+                write!(f, "}}")
+            }
+            SendValue::ActorPid(pid) => write!(f, "{}", pid),
         }
     }
 }

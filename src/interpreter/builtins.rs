@@ -76,6 +76,8 @@ pub fn register(env: &EnvRef) {
         ("task_all", NativeFn { name: "task_all", func: bi_task_all }),
         ("task_any", NativeFn { name: "task_any", func: bi_task_any }),
         ("task_ready", NativeFn { name: "task_ready", func: bi_task_ready }),
+        // --- concurrency (Phase C3: actor introspection) ---
+        ("pid_of", NativeFn { name: "pid_of", func: bi_pid_of }),
     ];
     for (name, nf) in entries {
         env.borrow_mut().define(*name, Value::Native(std::rc::Rc::new(nf.clone())));
@@ -775,4 +777,30 @@ fn bi_task_ready(args: &[Value]) -> Result<Value, InterpreterError> {
     let v = one_arg(args, "task_ready")?;
     let task = crate::value::TaskState::Ready(v);
     Ok(Value::Task(std::rc::Rc::new(std::cell::RefCell::new(task))))
+}
+
+/// `pid_of(actor) -> Int`
+///
+/// Returns the globally-unique actor ID (Pid) of an actor instance as an
+/// integer. Pids are allocated at spawn time and registered in the global
+/// `ActorRegistry`, allowing actors on other threads to route messages
+/// to this actor via its Pid.
+///
+/// Example:
+///   let c = spawn Counter();
+///   let id = pid_of(c);     # e.g. 42
+fn bi_pid_of(args: &[Value]) -> Result<Value, InterpreterError> {
+    let v = one_arg(args, "pid_of")?;
+    match &v {
+        Value::Actor(ar) => {
+            let pid = ar.borrow().pid;
+            Ok(Value::Int(num_bigint::BigInt::from(pid.0)))
+        }
+        other => Err(InterpreterError::TypeError {
+            expected: "Actor",
+            got: other.type_name(),
+            op: "pid_of".into(),
+            span: None,
+        }),
+    }
 }

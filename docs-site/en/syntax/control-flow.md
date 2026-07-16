@@ -119,32 +119,34 @@ fn divide(a, b) {
 }
 ```
 
-`try { ... } rescue Pattern as name { ... }` catches exceptions. If code inside the `try` block raises, 1y tries to match the raised value against the **pattern** after `rescue`; on a match, it binds the value to the name after `as` (if provided) and runs the corresponding handler block:
+`try { ... } rescue [TypeName] as name { ... }` catches exceptions. If code inside the `try` block raises, 1y tries to match the raised value's type against the type name after `rescue` (or catches everything when no type name is given); on a match, it binds the value to the name after `as` (if provided) and runs the corresponding handler block:
 
 ```1y
 try {
     let r = divide(10, 0);
     println("result: {r}")
-} rescue msg {
+} rescue as msg {
     println("caught: {msg}")   // caught: division by zero
 }
 ```
 
-What follows `rescue` is a **pattern**, so you can classify and handle different exceptions precisely, just as you would in a `match`:
+What follows `rescue` is an optional **type name** — it matches a `Variant` or `Struct` by name, so you can classify and handle different exceptions precisely:
 
 ```1y
+enum AppError { Timeout, WithCode(Int) }
+
 try {
-    risky_operation()
-} rescue "timeout" => {
+    raise Timeout
+} rescue Timeout {
     println("operation timed out, retrying")
-} rescue Some(code) => {
+} rescue WithCode as code {
     println("error code: {code}")
-} rescue other => {
+} rescue as other {
     println("unknown error: {other}")
 }
 ```
 
-This lets you handle errors with the same uniform pattern-matching syntax, rather than inventing a separate mechanism for exceptions. `try` is an expression: its value is the value of the `try` block on success, or the value returned by the `rescue` handler.
+This lets you handle errors by type without inventing a separate mechanism for exceptions. `try` is an expression: its value is the value of the `try` block on success, or the value returned by the `rescue` handler.
 
 ## ensure: Cleanup Blocks
 
@@ -152,9 +154,9 @@ This lets you handle errors with the same uniform pattern-matching syntax, rathe
 
 ```1y
 try {
-    let f = io.open("data.txt");
-    process(f)
-} rescue e => {
+    let data = io.read_to_string("data.txt");
+    process(data)
+} rescue as e {
     println("error: {e}")
 } ensure {
     // runs whether or not an error occurred
@@ -162,7 +164,7 @@ try {
 }
 ```
 
-Combining `try / rescue / ensure` gives you a structured error-handling flow: attempt execution, classify and catch by pattern, and clean up no matter what.
+Combining `try / rescue / ensure` gives you a structured error-handling flow: attempt execution, classify and catch by type, and clean up no matter what.
 
 ## Control Flow as Expressions
 
@@ -180,11 +182,11 @@ let count = loop {
 
 let value = try {
     risky_parse(input)
-} rescue _ => { 0 };
+} rescue as _ { 0 };
 ```
 
 Once you get used to the mindset of "let the expression carry its own value," your 1y code becomes more compact, less error-prone, and closer to a mathematical description.
 
 ## Summary
 
-`if` selects and returns a value; `while` and `for` are side-effecting loops that return `Nil`; `loop` paired with `break value` is a general-purpose loop with a return value; `raise` throws any value as an exception, `try / rescue` catches with pattern matching, and `ensure` guarantees cleanup. Treat these constructs as "expressions that produce values," and your 1y programs will naturally exude functional clarity and conciseness.
+`if` selects and returns a value; `while` and `for` are side-effecting loops that return `Nil`; `loop` paired with `break value` is a general-purpose loop with a return value; `raise` throws any value as an exception, `try / rescue` catches by type name, and `ensure` guarantees cleanup. Treat these constructs as "expressions that produce values," and your 1y programs will naturally exude functional clarity and conciseness.

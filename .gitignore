@@ -38,6 +38,7 @@ docs-site/.vitepress/dist/
 coverage/
 *.lcov
 .tarpaulin/
+/out/
 
 # ===========================================================================
 # IDE / Editor

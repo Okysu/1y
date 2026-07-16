@@ -8,6 +8,7 @@ use onely::Interpreter;
 use onely::Value;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Locate the project root (the directory containing Cargo.toml).
 fn project_root() -> PathBuf {
@@ -15,15 +16,24 @@ fn project_root() -> PathBuf {
     manifest_dir
 }
 
+static SETUP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 /// Set up a temp entry directory containing a `lib/http.1y` so that
 /// `import lib.http` resolves correctly.
+///
+/// Each call uses a unique subdirectory (keyed by an atomic counter) so that
+/// tests running in parallel don't race on the same file.
 fn setup_http_module() -> PathBuf {
     let root = project_root();
     let src = root.join("lib").join("http.1y");
     let content = fs::read_to_string(&src)
         .unwrap_or_else(|e| panic!("failed to read {}: {}", src.display(), e));
 
-    let dir = std::env::temp_dir().join("onely_tests").join("http_lib");
+    let id = SETUP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir()
+        .join("onely_tests")
+        .join("http_lib")
+        .join(format!("t{}", id));
     let lib_dir = dir.join("lib");
     fs::create_dir_all(&lib_dir).unwrap();
     fs::write(lib_dir.join("http.1y"), &content).unwrap();

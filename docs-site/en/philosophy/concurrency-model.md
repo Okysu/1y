@@ -28,19 +28,20 @@ The Actor is the first cornerstone of 1y concurrency. An Actor is a **lightweigh
 actor Counter {
   state count: Int = 0
 
-  on Incr { count = count + 1 }
-  on Decr { count = count - 1 }
-  on Get(reply) { reply ! count }
+  on Incr() { count = count + 1 }
+  on Decr() { count = count - 1 }
+  on Get() { reply(count) }
 }
 ```
 
 Creating and using an Actor:
 
 ```1y
-let counter = spawn Counter
-counter ! Incr                       # fire-and-forget
-counter ! Incr
-let n = counter ? Get                # request/reply, returns 2
+let counter = spawn Counter()
+counter ! Incr()                    // fire-and-forget
+counter ! Incr()
+yield;                              // drain pending `!` messages
+let n = counter ? Get()             // request/reply, returns 2
 ```
 
 Note the semantics of the two operators:
@@ -55,9 +56,9 @@ Because each Actor processes only one message at a time, its internal state is n
 Actors can message each other, forming arbitrary topologies. An Actor can spawn child Actors, dispatch tasks, and collect results. Because state is isolated, this composition does not produce the deadlock problems that arise when combining locked modules:
 
 ```1y
-# A pool manager that dispatches tasks to workers
+// A pool manager that dispatches tasks to workers
 actor Pool {
-  state workers = List.map(0.until(8), _ => spawn Worker)
+  state workers = []
 
   on Submit(task) {
     let w = pick_idle(workers)
@@ -70,30 +71,30 @@ actor Pool {
 
 In some scenarios, pure message passing is awkward — for example, when multiple components need to read and write the same shared configuration, or when you need atomic updates across multiple data structures. For these cases, 1y provides **Software Transactional Memory (STM)**.
 
-STM lets you mark a block of code as a "transaction"; reads and writes to shared references (`ref`) inside that block get **snapshot isolation**: the transaction sees a consistent snapshot taken at the start, and on commit, if it detects that a reference it read has been changed by another transaction, it retries automatically.
+STM lets you mark a block of code as a "transaction"; reads and writes to shared cells (created with `shared`) inside that block get **snapshot isolation**: the transaction sees a consistent snapshot taken at the start, and on commit, if it detects that a cell it read has been changed by another transaction, it retries automatically.
 
 ```1y
-# Two accounts; transfer atomically
-let alice = ref(100)
-let bob   = ref(50)
+// Two accounts; transfer atomically
+shared alice = 100
+shared bob   = 50
 
-atomically {
-  alice := !alice - 30
-  bob   := !bob   + 30
+transact {
+  alice = alice - 30;
+  bob   = bob   + 30
 }
-# Either both updates succeed, or both roll back — money never vanishes.
+// Either both updates succeed, or both roll back — money never vanishes.
 ```
 
 The core value of STM is that **atomicity composes**: you can combine two independent STM operations into a larger transaction without worrying about lock ordering between them. Compared with locks, this is a qualitative leap — locks do not compose; STM does.
 
 ```1y
-# Compose multiple STM operations into one transaction
-atomically {
-  let balance = !alice
+// Compose multiple STM operations into one transaction
+transact {
+  let balance = alice;
   if balance >= amount {
-    alice := balance - amount
-    ledger := List.push(!ledger, Transfer(alice, bob, amount))
-    bob := !bob + amount
+    alice = balance - amount;
+    ledger = push(ledger, Transfer(alice, bob, amount));
+    bob = bob + amount
   }
 }
 ```
@@ -116,10 +117,10 @@ Rule of thumb: **default to Actor; reach for STM only when you need to atomicall
 
 STM's safety rests on two properties:
 
-1. **Immutable data**: 1y values are immutable; a `ref` is merely "a replaceable label," and when replaced the old value still exists intact. A transaction reads a snapshot taken at a point in time, never a half-mutated value.
-2. **Optimistic concurrency + retry**: a transaction takes no locks while running; on commit it checks whether the references it read still point to their original values. If any changed, the whole transaction retries. As long as conflicts are infrequent, this is more efficient than locking.
+1. **Immutable data**: 1y values are immutable; a `shared` cell is merely "a replaceable label," and when replaced the old value still exists intact. A transaction reads a snapshot taken at a point in time, never a half-mutated value.
+2. **Optimistic concurrency + retry**: a transaction takes no locks while running; on commit it checks whether the cells it read still hold their original values. If any changed, the whole transaction retries. As long as conflicts are infrequent, this is more efficient than locking.
 
-Because of immutability, retry is **idempotent** — re-running a transaction has no side effects (`!` messages inside a transaction are only actually sent after the commit succeeds). This is the subtlety of combining immutability with STM in 1y: immutability makes STM both correct and simple to implement.
+Because of immutability, retry is **idempotent** — re-running a transaction has no side effects (messages sent with `!` inside a transaction are only actually delivered after the commit succeeds). This is the subtlety of combining immutability with STM in 1y: immutability makes STM both correct and simple to implement.
 
 ## Comparison with Other Models
 

@@ -15,9 +15,9 @@ title: FFI 外部函数接口
 ```1y
 import ffi;
 
-let lib = ffi.load("libc.so.6");          # Linux
-# let lib = ffi.load("msvcrt.dll");       # Windows
-# let lib = ffi.load("libSystem.dylib");  # macOS
+let lib = ffi.load("libc.so.6");          // Linux
+// let lib = ffi.load("msvcrt.dll");       // Windows
+// let lib = ffi.load("libSystem.dylib");  // macOS
 ```
 
 `load` 会在标准搜索路径中查找库（受 `LD_LIBRARY_PATH`/`PATH`/`DYLD_LIBRARY_PATH` 等环境变量影响），也接受绝对或相对路径。若加载失败，`load` 报错并给出原因。同一库重复 `load` 会得到独立的句柄，通常你只需在程序启动时加载一次，长期持有。
@@ -28,7 +28,7 @@ let lib = ffi.load("libc.so.6");          # Linux
 
 ```1y
 let r = ffi.call(lib, "abs", "int(int)", [-42]);
-print(r);    # 42
+print(r);    // 42
 ```
 
 `call` 的工作流程：
@@ -42,11 +42,11 @@ print(r);    # 42
 签名是一个形如 `"ret(arg1, arg2, ...)"` 的字符串：括号前是返回类型，括号内是逗号分隔的参数类型列表。无参数时写作 `"ret()"`。
 
 ```1y
-"int(int)"          # 接收一个 int，返回 int
-"void(int)"         # 接收一个 int，无返回值
-"str(str)"          # 接收 C 字符串，返回 C 字符串
-"float(float)"      # 接收 f64，返回 f64
-"int(str, int)"     # 接收 (字符串, 整数)，返回整数
+"int(int)"          // 接收一个 int，返回 int
+"void(int)"         // 接收一个 int，无返回值
+"str(str)"          // 接收 C 字符串，返回 C 字符串
+"float(float)"      // 接收 f64，返回 f64
+"int(str, int)"     // 接收 (字符串, 整数)，返回整数
 ```
 
 返回类型 `void` 表示函数无返回值，`call` 此时返回单元值。签名中的空白会被忽略，因此 `"int( int , str )"` 与 `"int(int,str)"` 等价。
@@ -99,9 +99,8 @@ FFI 是**本质上不安全（unsafe）**的能力。一旦跨越 FFI 边界，1
 
 ```1y
 import ffi;
-import io;
 
-# 跨平台加载 C 标准库并调用 abs / strlen
+// 跨平台加载 C 标准库并调用 abs / strlen
 let lib = ffi.load("libc.so.6");
 
 let absval = ffi.call(lib, "abs", "int(int)", [-42]);

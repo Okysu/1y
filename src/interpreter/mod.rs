@@ -106,6 +106,19 @@ pub struct Interpreter {
     actors: HashMap<String, ActorDef>,
     /// All live actor instances, used by the event loop to drain `!` messages.
     live_actors: Vec<ActorRef>,
+    /// Local `ActorPid → ActorRef` map (Phase C3). Used to resolve Pids
+    /// arriving in `CrossEnvelope`s from other threads back to local actor
+    /// instances.
+    pid_to_actor: HashMap<u64, ActorRef>,
+    /// Cross-thread inbox receiver (Phase C3). Actors on other threads send
+    /// `CrossEnvelope`s here via the global `ActorRegistry`; the event loop
+    /// drains this inbox and dispatches to local actors.
+    #[allow(dead_code)]
+    cross_inbox: std::sync::mpsc::Receiver<crate::value::CrossEnvelope>,
+    /// Cross-thread inbox sender (Phase C3). Cloned and registered in the
+    /// `ActorRegistry` so other threads can route messages to this interpreter.
+    /// Kept here so we can register new actors' Pids as they spawn.
+    _cross_sender: std::sync::mpsc::Sender<crate::value::CrossEnvelope>,
     /// Stack of active transaction contexts (innermost = last).
     /// Non-empty only during evaluation of a `transact { ... }` body.
     txn_stack: Vec<TransactionContext>,
@@ -134,12 +147,16 @@ impl Interpreter {
     pub fn new() -> Self {
         let global = Environment::global();
         builtins::register(&global);
+        let (cross_tx, cross_rx) = std::sync::mpsc::channel();
         Interpreter {
             global,
             variants: HashMap::new(),
             structs: HashMap::new(),
             actors: HashMap::new(),
             live_actors: Vec::new(),
+            pid_to_actor: HashMap::new(),
+            cross_inbox: cross_rx,
+            _cross_sender: cross_tx,
             txn_stack: Vec::new(),
             std_modules: stdlib::build_std_modules(),
             module_cache: HashMap::new(),
@@ -160,7 +177,7 @@ impl Interpreter {
         if !output.errors.is_empty() {
             let e = &output.errors[0];
             return Err(InterpreterError::RuntimeError {
-                msg: format!("parse error: {}", e.message),
+                msg: format!("parse error: {}", e.full_message()),
                 span: Some(e.span),
             });
         }
@@ -188,7 +205,7 @@ impl Interpreter {
         if !output.errors.is_empty() {
             let e = &output.errors[0];
             return Err(InterpreterError::RuntimeError {
-                msg: format!("parse error: {}", e.message),
+                msg: format!("parse error: {}", e.full_message()),
                 span: Some(e.span),
             });
         }
@@ -382,7 +399,7 @@ impl Interpreter {
             let e = &output.errors[0];
             return Err(InterpreterError::ImportError {
                 path: path.to_string(),
-                msg: format!("parse error: {}", e.message),
+                msg: format!("parse error: {}", e.full_message()),
                 span: Some(span),
             });
         }
@@ -737,6 +754,20 @@ impl Interpreter {
                 let func = self.eval_expr(env, callee)?;
                 let mut arg_vals = Vec::with_capacity(args.len());
                 for a in args {
+                    // Pass SharedRef by reference (not dereferenced) when the
+                    // argument is a bare identifier bound to a shared cell.
+                    // This allows `fn f(s) { s = 42 }` to write through when
+                    // called as `f(my_shared_cell)`. Inside the callee, reads
+                    // still auto-deref (via Expr::Ident), so this is invisible
+                    // to code that only reads the argument.
+                    if let Expr::Ident(name, _) = a {
+                        if let Some(val) = env.borrow().get(name) {
+                            if matches!(val, Value::Shared(_)) {
+                                arg_vals.push(val);
+                                continue;
+                            }
+                        }
+                    }
                     arg_vals.push(self.eval_expr(env, a)?);
                 }
                 self.call_function(&func, arg_vals, *span)
@@ -761,6 +792,14 @@ impl Interpreter {
                     })?;
                     let mut arg_vals = Vec::with_capacity(args.len());
                     for a in args {
+                        if let Expr::Ident(name, _) = a {
+                            if let Some(val) = env.borrow().get(name) {
+                                if matches!(val, Value::Shared(_)) {
+                                    arg_vals.push(val);
+                                    continue;
+                                }
+                            }
+                        }
                         arg_vals.push(self.eval_expr(env, a)?);
                     }
                     return self.call_function(&func, arg_vals, *span);
@@ -775,6 +814,14 @@ impl Interpreter {
                 })?;
                 let mut arg_vals = vec![recv_val];
                 for a in args {
+                    if let Expr::Ident(name, _) = a {
+                        if let Some(val) = env.borrow().get(name) {
+                            if matches!(val, Value::Shared(_)) {
+                                arg_vals.push(val);
+                                continue;
+                            }
+                        }
+                    }
                     arg_vals.push(self.eval_expr(env, a)?);
                 }
                 self.call_function(&func, arg_vals, *span)
@@ -1098,6 +1145,14 @@ impl Interpreter {
                     }
                 }
                 let actor_ref: ActorRef = Rc::new(RefCell::new(ActorInstance::new(actor_env)));
+                // Phase C3: register the actor's Pid in the global registry
+                // (routes cross-thread messages to this interpreter's inbox)
+                // and in the local pid→ActorRef map (for dispatch).
+                {
+                    let pid = actor_ref.borrow().pid;
+                    crate::runtime::registry::register(pid, self._cross_sender.clone());
+                    self.pid_to_actor.insert(pid.0, actor_ref.clone());
+                }
                 // Now register handlers with access to the ActorRef (self).
                 for stmt in &ad.body {
                     if let Stmt::OnClause(oc) = stmt {
@@ -1670,6 +1725,17 @@ impl Interpreter {
                 }
             }
             Value::Native(nf) => {
+                // NativeFns expect dereferenced values. If a SharedRef was
+                // passed (because the call site passed a bare identifier
+                // bound to a shared cell), dereference it here so builtins
+                // like `push`, `count`, `get` etc. see the inner value.
+                let args: Vec<Value> = args
+                    .into_iter()
+                    .map(|a| match &a {
+                        Value::Shared(sref) => sref.borrow().value.clone(),
+                        _ => a,
+                    })
+                    .collect();
                 // Higher-order builtins need to call user closures, which
                 // requires interpreter access. Route by name instead of
                 // invoking `func` directly.

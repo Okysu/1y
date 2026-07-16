@@ -92,7 +92,7 @@ println(count(v2));        // 4
 let xs = [1, 2, 3];
 let ys = push(xs, 4);         // [1, 2, 3, 4]
 let first = xs[0];            // 索引访问,1
-let combined = xs + ys;       // 拼接
+let combined = fold(ys, xs, fn(acc, x) { push(acc, x) });  // 通过 fold 拼接
 ```
 
 `Vec` 内部基于 `im::Vector`,一个 RRB 树实现,提供接近 O(log₃₂ n) 的随机访问与 O(1) 的尾部追加。
@@ -115,12 +115,18 @@ let also_v = m.x;                     // 字段访问是 get(m, "x") 的简写
 
 ```1y
 let s = #{1, 2, 3};
-let s2 = insert(s, 4);               // 添加元素
-let s3 = remove(s, 2);                // 删除元素
-let has = contains(s, 1);             // true
+println(count(s));                    // 3
+
+// 通过 fold 检查成员
+let has = fold(s, false, fn(acc, x) { if x == 1 { true } else { acc } });
+println(has);                         // true
+
+for x in s {
+    println(x)
+}
 ```
 
-`Set` 内部基于 `im::HashSet`,提供 O(1) 平均的成员判断。
+`Set` 内部基于 `im::HashSet`,提供 O(1) 平均的成员判断。元素级的增删可通过构造新的集合字面量或对集合做 fold 来实现。
 
 ## 函数:Func 与 Native
 

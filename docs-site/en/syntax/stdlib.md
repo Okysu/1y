@@ -13,13 +13,15 @@ title: Standard Library
 | `env` | Environment variables | `get`, `set`, `unset`, `args`, `vars` |
 | `io` | File I/O | `read_line`, `read_to_string`, `write`, `append`, `exists` |
 | `json` | JSON codec | `parse`, `stringify`, `pretty` |
-| `process` | Process control | `exit`, `exec`, `exec_status`, `pid`, `cwd`, `set_cwd`, `sleep_ms` |
+| `process` | Process control | `exit`, `exec`, `exec_status`, `pid`, `cwd`, `set_cwd`, `sleep_ms`, `sleep_async` |
 | `random` | PRNG (xorshift64) | `int`, `range`, `float`, `bool`, `pick`, `shuffle`, `seed` |
 | `serial` | Serial port | `open`, `list`, `read`, `write`, `close` |
-| `socket` | TCP networking | `listen`, `accept`, `connect`, `read`, `read_line`, `write`, `close`, `set_nonblocking`, `peer_addr` |
+| `socket` | TCP networking | `listen`, `accept`, `connect`, `read`, `read_line`, `write`, `close`, `set_nonblocking`, `peer_addr`, `read_async` |
 | `crypto` | Hashing / CSPRNG | `sha256`, `sha512`, `sha1`, `md5`, `hmac_sha256`, `hmac_sha512`, `base64_encode/decode`, `hex_encode/decode`, `random_bytes`, `secure_int`, `secure_float` |
 | `tls` | TLS client (rustls) | `connect`, `read`, `read_line`, `write`, `close`, `peer_addr` |
 | `ffi` | Dynamic library loading | `load`, `call`, `unload`, `is_loaded` |
+
+> **Task combinators** (`task_all`, `task_any`, `task_ready`) are global built-in functions, not part of a module — see [Tasks](#tasks).
 
 ## env — Environment Variables
 
@@ -32,8 +34,8 @@ let home = env.get("HOME");
 env.set("MODE", "debug");
 env.unset("TEMP");
 
-let argv = env.args();        # argument vector from startup
-let all = env.vars();         # all current environment variables
+let argv = env.args();        // argument vector from startup
+let all = env.vars();         // all current environment variables
 ```
 
 `args` returns the startup argument vector and `vars` returns all environment variables, handy for configuration discovery and diagnostics. `set`/`unset` affect only the current process and its children — they never write back to the parent shell.
@@ -50,7 +52,7 @@ io.write("log.txt", "started");
 io.append("log.txt", "step two done");
 
 if io.exists("data.bin") {
-    let line = io.read_line();   # read a line from standard input
+    let line = io.read_line();   // read a line from standard input
     print("-" + line);
 }
 ```
@@ -66,7 +68,7 @@ import json;
 
 let obj = { name: "1y", version: 1 };
 let compact = json.stringify(obj);
-let pretty = json.pretty(obj);   # indented, for human reading
+let pretty = json.pretty(obj);   // indented, for human reading
 
 let parsed = json.parse(compact);
 ```
@@ -87,11 +89,11 @@ process.set_cwd("/tmp");
 let dir = process.cwd();
 let me = process.pid();
 
-process.sleep_ms(500);     # sleep for 500 milliseconds
+process.sleep_ms(500);     // sleep for 500 milliseconds
 process.exit(0);
 ```
 
-`exec` runs a subcommand and blocks until it finishes; `exec_status` returns the exit code; `exit` terminates the current process immediately. `sleep_ms` pauses the current execution flow for the given milliseconds — under the event-loop model it yields the scheduler, giving other Actors a chance to run.
+`exec` runs a subcommand and blocks until it finishes; `exec_status` returns the exit code; `exit` terminates the current process immediately. `sleep_ms` pauses the current execution flow for the given milliseconds — under the event-loop model it yields the scheduler, giving other Actors a chance to run. `sleep_async(ms)` returns a `Task<Nil>` that completes after `ms` milliseconds; `await process.sleep_async(ms)` suspends the current coroutine without blocking other Actors (this is the colorless-async primitive used to keep slow routes from stalling the event loop).
 
 ## random — Pseudo-Random Numbers
 
@@ -101,9 +103,9 @@ process.exit(0);
 import random;
 
 random.seed(42);
-let n = random.int();              # arbitrary integer
-let r = random.range(1, 100);      # [1, 100)
-let f = random.float();            # [0.0, 1.0)
+let n = random.int(100);            // [0, 100)
+let r = random.range(1, 100);      // [1, 100)
+let f = random.float();            // [0.0, 1.0)
 let b = random.bool();
 let choice = random.pick([1, 2, 3]);
 let shuffled = random.shuffle([1, 2, 3, 4]);
@@ -118,8 +120,8 @@ For cryptographically secure randomness, use the `crypto` module's `random_bytes
 ```1y
 import serial;
 
-let ports = serial.list();                 # enumerate available ports
-let dev = serial.open("COM3", 115200);     # or /dev/ttyUSB0
+let ports = serial.list();                 // enumerate available ports
+let dev = serial.open("COM3", 115200);     // or /dev/ttyUSB0
 serial.write(dev, "PING");
 let data = serial.read(dev, 64);
 serial.close(dev);
@@ -142,13 +144,45 @@ socket.write(conn, "HTTP/1.1 200 OK");
 print(socket.peer_addr(conn));
 socket.close(conn);
 
-# client
+// client
 let c = socket.connect("example.com", 80);
 socket.write(c, "GET / HTTP/1.0");
 socket.close(c);
 ```
 
-`listen` creates a listening socket and `accept` blocks waiting for and returns a new connection. `set_nonblocking` makes subsequent `read`/`read_line` return immediately when no data is available rather than hanging, which pairs well with an event loop for concurrent serving. `peer_addr` returns the remote address for logging and authorization.
+`listen` creates a listening socket and `accept` blocks waiting for and returns a new connection. `set_nonblocking` makes subsequent `read`/`read_line` return immediately when no data is available rather than hanging, which pairs well with an event loop for concurrent serving. `peer_addr` returns the remote address for logging and authorization. `read_async(stream, n)` returns a `Task<Str|Nil>` that completes when up to `n` bytes are available on the stream; `await socket.read_async(stream, 65536)` suspends the coroutine until the OS reports the stream readable (via `mio`), so one slow connection never blocks the others.
+
+## Tasks — Async Composition
+
+`await` is the core suspension primitive (see [Colorless async](../philosophy/no-async.md)). A `Task` is a value produced by async I/O functions (`socket.read_async`, `process.sleep_async`) or by the global combinators below. Tasks are **single-use**: `await` consumes one. You can `await` from any function body — no `async` marker is needed.
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `task_ready` | `task_ready(value) -> Task` | A Task that is already complete with `value`. |
+| `task_all` | `task_all([t1, t2, ...]) -> Task<Vec<value>>` | Completes when **all** inputs complete; results are in order. Consumes all inputs on success. |
+| `task_any` | `task_any([t1, T2, ...]) -> Task<value>` | Completes when **any** input completes; yields the first ready value. Consumes only the winner. |
+
+```1y
+import process;
+
+// Wrap a plain value into a Task
+let now = await task_ready(42);
+
+// Run two sleeps concurrently and wait for both
+let both = await task_all([
+    process.sleep_async(100),
+    process.sleep_async(150)
+]);
+println(str(count(both)));    // 2
+
+// Race two Tasks; the faster one wins
+let winner = await task_any([
+    process.sleep_async(100),
+    process.sleep_async(500)
+]);
+```
+
+For long-lived concurrent state (a counter, a cache, a session) prefer **Actors** (`spawn Name(args)`); `Task` is for composing async I/O, not for shared mutable state.
 
 ## crypto — Hashing and CSPRNG
 

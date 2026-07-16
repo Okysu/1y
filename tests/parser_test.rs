@@ -281,6 +281,20 @@ fn parse_empty_vector() {
     assert!(matches!(e, Expr::VecLit { ref items, .. } if items.is_empty()));
 }
 
+#[test]
+fn parse_empty_map_braces() {
+    // `{}` is an empty Map literal (not an empty block/Nil).
+    let e = parse_expr_first("{}");
+    assert!(matches!(e, Expr::MapLit { ref entries, .. } if entries.is_empty()));
+}
+
+#[test]
+fn parse_empty_map_in_expr() {
+    // `assoc({}, "k", 1)` — `{}` as an argument must parse as an empty Map.
+    let out = parse("let m = assoc({}, \"k\", 1)");
+    assert!(out.errors.is_empty());
+}
+
 // ==========================================================================
 // control flow expressions
 // ==========================================================================
@@ -458,9 +472,44 @@ fn parse_error_has_line_col() {
     let out = parse(src);
     assert_eq!(out.errors.len(), 1);
     let e = &out.errors[0];
-    // The error should point at the `)` on line 1.
+    // The error should point at the `(` on line 1.
     assert_eq!(e.span.start.line, 1);
     assert!(e.span.start.col >= 5 && e.span.start.col <= 15);
+}
+
+#[test]
+fn parse_arrow_fn_gives_targeted_hint() {
+    // `() => ...` and `(x) => ...` are JS arrow functions; 1y uses `fn() {}`.
+    // The parser should produce a targeted error mentioning arrow functions,
+    // with a hint pointing to `fn(params) { body }`.
+    for src in ["let f = () => { 1 }", "let g = (x) => { x + 1 }", "let h = (a, b) => { a - b }"] {
+        let out = parse(src);
+        assert_eq!(out.errors.len(), 1, "expected exactly 1 error in `{}`", src);
+        let e = &out.errors[0];
+        assert!(
+            e.message.contains("arrow"),
+            "error message should mention arrow functions, got: {}",
+            e.message
+        );
+        assert!(
+            e.hint.as_deref().unwrap_or("").contains("fn("),
+            "hint should suggest `fn(...)`, got: {:?}",
+            e.hint
+        );
+    }
+}
+
+#[test]
+fn parse_paren_expr_not_confused_with_arrow() {
+    // Legitimate parenthesised expressions must still parse fine — the
+    // arrow-detection lookahead must not fire when `=>` does not follow.
+    let out = parse("let x = (1 + 2) * 3");
+    assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+    let out = parse("let y = (a)");
+    assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+    // `=>` inside a match arm is fine — it is not an arrow function.
+    let out = parse("fn f(n) { match n { _ => 1 } }");
+    assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
 }
 
 #[test]

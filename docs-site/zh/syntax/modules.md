@@ -13,8 +13,8 @@ title: 模块系统
 ```1y
 import io;
 
-io.println("hello");          // 通过 io 调用其导出的函数
-let content = io.read_file("data.txt");
+println("hello");             // println 是全局内置函数
+let content = io.read_to_string("data.txt");
 ```
 
 如果你希望用一个不同的名字来引用模块(例如避免命名冲突,或让名字更贴合语境),可以使用 `import ... as alias`:
@@ -22,8 +22,8 @@ let content = io.read_file("data.txt");
 ```1y
 import io as fs;
 
-fs.println("hello via fs");
-fs.write_file("out.txt", "data");
+println("hello via fs");
+fs.write("out.txt", "data");
 ```
 
 `as` 之后的名字会成为当前作用域中该模块的别名,原名则不可用。这在同时引入功能相近的模块时尤其有用。
@@ -69,8 +69,8 @@ fn maybe_parse(s) {
 import json;
 import random;
 
-let data = json.parse("{\"name\": \"Alice\"}");
-let n = random.int(1, 100);
+let data = json.parse("\{\"name\": \"Alice\"\}");
+let n = random.range(1, 100);
 ```
 
 ## 文件模块

@@ -13,13 +13,15 @@ title: 标准库概览
 | `env` | 环境变量 | `get`, `set`, `unset`, `args`, `vars` |
 | `io` | 文件 I/O | `read_line`, `read_to_string`, `write`, `append`, `exists` |
 | `json` | JSON 编解码 | `parse`, `stringify`, `pretty` |
-| `process` | 进程控制 | `exit`, `exec`, `exec_status`, `pid`, `cwd`, `set_cwd`, `sleep_ms` |
+| `process` | 进程控制 | `exit`, `exec`, `exec_status`, `pid`, `cwd`, `set_cwd`, `sleep_ms`, `sleep_async` |
 | `random` | 伪随机数（xorshift64） | `int`, `range`, `float`, `bool`, `pick`, `shuffle`, `seed` |
 | `serial` | 串口通信 | `open`, `list`, `read`, `write`, `close` |
-| `socket` | TCP 网络 | `listen`, `accept`, `connect`, `read`, `read_line`, `write`, `close`, `set_nonblocking`, `peer_addr` |
+| `socket` | TCP 网络 | `listen`, `accept`, `connect`, `read`, `read_line`, `write`, `close`, `set_nonblocking`, `peer_addr`, `read_async` |
 | `crypto` | 哈希与 CSPRNG | `sha256`, `sha512`, `sha1`, `md5`, `hmac_sha256`, `hmac_sha512`, `base64_encode/decode`, `hex_encode/decode`, `random_bytes`, `secure_int`, `secure_float` |
 | `tls` | TLS 客户端（rustls） | `connect`, `read`, `read_line`, `write`, `close`, `peer_addr` |
 | `ffi` | 动态库加载 | `load`, `call`, `unload`, `is_loaded` |
+
+> **Task 组合子**（`task_all`、`task_any`、`task_ready`）是全局内置函数，不属于任何模块——见 [Tasks](#tasks)。
 
 ## env — 环境变量
 
@@ -32,8 +34,8 @@ let home = env.get("HOME");
 env.set("MODE", "debug");
 env.unset("TEMP");
 
-let argv = env.args();        # 命令行参数列表
-let all = env.vars();         # 当前所有环境变量
+let argv = env.args();        // 命令行参数列表
+let all = env.vars();         // 当前所有环境变量
 ```
 
 `args` 返回启动时的参数向量，`vars` 返回所有环境变量，便于配置发现与诊断。`set`/`unset` 只影响当前进程及其子进程，不会回写到父 shell。
@@ -50,7 +52,7 @@ io.write("log.txt", "启动完成");
 io.append("log.txt", "第二步完成");
 
 if io.exists("data.bin") {
-    let line = io.read_line();   # 从标准输入读一行
+    let line = io.read_line();   // 从标准输入读一行
     print("-" + line);
 }
 ```
@@ -66,7 +68,7 @@ import json;
 
 let obj = { name: "1y", version: 1 };
 let compact = json.stringify(obj);
-let pretty = json.pretty(obj);   # 带缩进，便于阅读
+let pretty = json.pretty(obj);   // 带缩进，便于阅读
 
 let parsed = json.parse(compact);
 ```
@@ -87,11 +89,11 @@ process.set_cwd("/tmp");
 let dir = process.cwd();
 let me = process.pid();
 
-process.sleep_ms(500);     # 休眠 500 毫秒
+process.sleep_ms(500);     // 休眠 500 毫秒
 process.exit(0);
 ```
 
-`exec` 阻塞执行子命令并等待完成，`exec_status` 返回退出码，`exit` 立即终止当前进程。`sleep_ms` 让当前执行流休眠指定毫秒数——在事件循环模型下，它会交出调度权，让其他 Actor 有机会运行。
+`exec` 阻塞执行子命令并等待完成，`exec_status` 返回退出码，`exit` 立即终止当前进程。`sleep_ms` 让当前执行流休眠指定毫秒数——在事件循环模型下，它会交出调度权，让其他 Actor 有机会运行。`sleep_async(ms)` 返回一个 `Task<Nil>`，在 `ms` 毫秒后完成；`await process.sleep_async(ms)` 挂起当前协程而不阻塞其他 Actor（这是无色异步用来保证慢路由不拖累事件循环的核心原语）。
 
 ## random — 伪随机数
 
@@ -101,9 +103,9 @@ process.exit(0);
 import random;
 
 random.seed(42);
-let n = random.int();              # 任意整数
-let r = random.range(1, 100);      # [1, 100)
-let f = random.float();            # [0.0, 1.0)
+let n = random.int(100);            // [0, 100)
+let r = random.range(1, 100);      // [1, 100)
+let f = random.float();            // [0.0, 1.0)
 let b = random.bool();
 let choice = random.pick([1, 2, 3]);
 let shuffled = random.shuffle([1, 2, 3, 4]);
@@ -118,8 +120,8 @@ let shuffled = random.shuffle([1, 2, 3, 4]);
 ```1y
 import serial;
 
-let ports = serial.list();                 # 枚举可用串口
-let dev = serial.open("COM3", 115200);     # 或 /dev/ttyUSB0
+let ports = serial.list();                 // 枚举可用串口
+let dev = serial.open("COM3", 115200);     // 或 /dev/ttyUSB0
 serial.write(dev, "PING");
 let data = serial.read(dev, 64);
 serial.close(dev);
@@ -142,13 +144,45 @@ socket.write(conn, "HTTP/1.1 200 OK");
 print(socket.peer_addr(conn));
 socket.close(conn);
 
-# 客户端
+// 客户端
 let c = socket.connect("example.com", 80);
 socket.write(c, "GET / HTTP/1.0");
 socket.close(c);
 ```
 
-`listen` 创建监听套接字，`accept` 阻塞等待并返回新连接。`set_nonblocking` 让后续 `read`/`read_line` 在无数据时立即返回而非挂起，便于与事件循环配合实现并发服务。`peer_addr` 返回对端地址，便于日志与鉴权。
+`listen` 创建监听套接字，`accept` 阻塞等待并返回新连接。`set_nonblocking` 让后续 `read`/`read_line` 在无数据时立即返回而非挂起，便于与事件循环配合实现并发服务。`peer_addr` 返回对端地址，便于日志与鉴权。`read_async(stream, n)` 返回一个 `Task<Str|Nil>`，在流上最多有 `n` 字节可读时完成；`await socket.read_async(stream, 65536)` 挂起协程，直到 OS 报告该流可读（经 `mio`），从而一个慢连接永远不会阻塞其他连接。
+
+## Tasks — 异步组合
+
+`await` 是核心挂起原语（见[无色异步](../philosophy/no-async.md)）。`Task` 是由异步 I/O 函数（`socket.read_async`、`process.sleep_async`）或下列全局组合子产生的值。Task 是**一次性**的：`await` 会消费它。你可以在任何函数体里 `await`——不需要 `async` 标记。
+
+| 函数 | 签名 | 说明 |
+|------|------|------|
+| `task_ready` | `task_ready(value) -> Task` | 一个已经以 `value` 完成的 Task。 |
+| `task_all` | `task_all([t1, t2, ...]) -> Task<Vec<value>>` | **全部**输入完成时完成，结果按顺序排列。成功时消费所有输入。 |
+| `task_any` | `task_any([t1, t2, ...]) -> Task<value>` | **任一**输入完成时完成，返回最先就绪的值。仅消费获胜的输入。 |
+
+```1y
+import process;
+
+// 把一个普通值包装成 Task
+let now = await task_ready(42);
+
+// 并发跑两个休眠，等两者都完成
+let both = await task_all([
+    process.sleep_async(100),
+    process.sleep_async(150)
+]);
+println(str(count(both)));    // 2
+
+// 让两个 Task 竞速，快的赢
+let winner = await task_any([
+    process.sleep_async(100),
+    process.sleep_async(500)
+]);
+```
+
+长生命周期的并发状态（计数器、缓存、会话）请用 **Actor**（`spawn Name(args)`）；`Task` 用于组合异步 I/O，不用于共享可变状态。
 
 ## crypto — 哈希与 CSPRNG
 

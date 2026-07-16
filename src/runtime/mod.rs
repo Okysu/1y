@@ -17,3 +17,5 @@
 //!   pending, the coroutine suspends.
 
 pub mod scheduler;
+pub mod registry;
+pub mod worker;

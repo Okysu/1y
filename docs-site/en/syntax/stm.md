@@ -28,8 +28,8 @@ Reads and writes to a cell use the **same syntax as ordinary variables** — no 
 - `counter = expr` sets the cell's value to the result of `expr`.
 
 ```1y
-let v = counter;       # read
-counter = v + 1;       # write
+let v = counter;       // read
+counter = v + 1;       // write
 ```
 
 The meaning depends on context: inside a transaction, reads and writes go through snapshot isolation; outside a transaction, they take effect directly (see [Access Outside a Transaction](#access-outside-a-transaction)). This uniform syntax lets you reuse the same read/write logic in and out of transactions, deciding only whether to wrap it in `transact`.
@@ -43,7 +43,7 @@ let counter = shared 0;
 let result = transact {
     let v = counter + 1;
     counter = v;
-    v           # the transaction's return value
+    v           // the transaction's return value
 };
 ```
 
@@ -58,7 +58,7 @@ Key properties of a transaction:
 Snapshot isolation means a transaction **sees a consistent state as of the moment it started**, even if other transactions commit changes in the meantime. This lets the logic inside a transaction read as naturally as sequential code:
 
 ```1y
-# Atomic transfer: either both balances update, or neither does
+// Atomic transfer: either both balances update, or neither does
 let alice = shared 100;
 let bob = shared 50;
 
@@ -90,12 +90,12 @@ This "do first, check later" strategy is efficient when conflicts are infrequent
 `retry` explicitly abandons the current transaction and reruns it from the top. It is typically used for the "condition not yet met, try again later" pattern: the transaction finds a precondition not currently satisfied and proactively `retry`s, waiting until the relevant cells change before trying once more.
 
 ```1y
-# Wait until the balance is sufficient, then debit
+// Wait until the balance is sufficient, then debit
 transact {
     if alice >= amount {
         alice = alice - amount;
     } else {
-        retry        # not enough balance; retry the transaction
+        retry        // not enough balance; retry the transaction
     }
 };
 ```
@@ -114,11 +114,11 @@ Key points:
 transact {
     counter = counter + 1;
     transact {
-        # the inner commit goes to the outer snapshot;
-        # if the outer rolls back, this rolls back too
+        // the inner commit goes to the outer snapshot;
+        // if the outer rolls back, this rolls back too
         counter = counter + 10;
     };
-    # what's read here is the outer snapshot, already including the inner writes
+    // what's read here is the outer snapshot, already including the inner writes
     counter
 };
 ```
@@ -140,7 +140,7 @@ Outside a `transact` block, reading and writing a cell are still available, with
 
 ```1y
 let counter = shared 0;
-counter = counter + 1;   # outside a transaction: a direct, non-atomic read-modify-write
+counter = counter + 1;   // outside a transaction: a direct, non-atomic read-modify-write
 ```
 
 Access outside a transaction is an "escape hatch," suited to single-threaded initialization, one-time assignment, and other scenarios known to be free of contention. **Whenever there is concurrent access, put it inside `transact`**, otherwise you bypass STM's isolation guarantees and reintroduce data races.
@@ -148,11 +148,9 @@ Access outside a transaction is an "escape hatch," suited to single-threaded ini
 ## A Complete Example: A Concurrency-Safe Counter
 
 ```1y
-import io;
-
 let counter = shared 0;
 
-# Multiple transactions increment concurrently; STM guarantees the final count is correct
+// Multiple transactions increment concurrently; STM guarantees the final count is correct
 fn bump() {
     transact {
         let v = counter + 1;

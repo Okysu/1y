@@ -114,19 +114,22 @@ match xs {
 
 `[first, ..rest]` is an extremely useful pattern: it matches a vector with **at least one element**, binds the first element to `first`, and binds the remaining elements to `rest`. Note that a Vec pattern only matches when the vector truly has at least as many elements as the pattern requires; otherwise 1y falls through to the next arm.
 
-## Map Patterns
+## Field Patterns (Bare Struct Form)
 
-A `Map` pattern inspects and destructures by key. Inside the braces you write `"key": subpattern`; a key matches only when it exists **and** its subpattern also matches:
+A brace pattern without a type name — `{field: subpattern, ...}` — matches a `Struct` value by its field names. Inside the braces you write `field: subpattern`; a field matches only when it exists **and** its subpattern also matches:
 
 ```1y
+type Config = { host: Str, port: Int };
+let config = Config({ host: "localhost", port: 8080 });
+
 match config {
-    {"host": h, "port": p} => "{h}:{p}",
-    {"host": h} => "host only: {h}",
+    {host: h, port: p} => "{h}:{p}",
+    {host: h} => "host only: {h}",
     _ => "no host"
 }
 ```
 
-A Map pattern does not require you to list every key — as long as the keys you do list all match, the rest are ignored. This makes it ideal for "pluck a few fields on demand" scenarios.
+A bare field pattern does not require you to list every field — as long as the fields you do list all match, the rest are ignored. This makes it ideal for "pluck a few fields on demand" scenarios. It is the unnamed counterpart of the `TypeName { ... }` form covered next.
 
 ## Struct Patterns
 
@@ -143,7 +146,7 @@ match p {
 }
 ```
 
-Here `Point { x: 0, y: 0 }` uses literals to match the origin exactly, while `Point { x: px, y: py }` binds the fields to variables. As with Map patterns, a Struct pattern only checks the fields you list; unlisted fields do not participate in matching.
+Here `Point { x: 0, y: 0 }` uses literals to match the origin exactly, while `Point { x: px, y: py }` binds the fields to variables. As with bare field patterns, a Struct pattern only checks the fields you list; unlisted fields do not participate in matching.
 
 ## Variant Patterns (Enum Destructuring)
 
@@ -214,4 +217,4 @@ Nested patterns let `match` describe the shape of complex data precisely, withou
 
 ## Summary
 
-Pattern matching unifies branching and destructuring. With this set of pattern primitives — literals, variables, wildcards, or, Vec, Map, Struct, and Variant — together with guards, you can describe in a declarative way "what data I expect, and what to do when I see it." When you find yourself writing a long chain of `if`s to inspect a value's type and structure, it is usually a sign that they should be rewritten as a single `match`.
+Pattern matching unifies branching and destructuring. With this set of pattern primitives — literals, variables, wildcards, or, Vec, field, Struct, and Variant — together with guards, you can describe in a declarative way "what data I expect, and what to do when I see it." When you find yourself writing a long chain of `if`s to inspect a value's type and structure, it is usually a sign that they should be rewritten as a single `match`.

@@ -59,7 +59,7 @@ println("vec last = " + str(v[9999]));          // 9999
 // 5. Map assoc/dissoc churn — persistent map operations
 // ---------------------------------------------------------------------------
 
-// `{}` is an empty block in 1y, so seed the map with one entry.
+// `{}` is an empty Map in 1y. We seed with one real entry to exercise assoc.
 let m = { "0": 0 };
 let j = 1;
 while j < 1_000 {

@@ -13,8 +13,8 @@ An `import` statement brings a module into the current scope and binds it to a n
 ```1y
 import io;
 
-io.println("hello");          // call an exported function via io
-let content = io.read_file("data.txt");
+println("hello");             // println is a global builtin
+let content = io.read_to_string("data.txt");
 ```
 
 If you want to refer to a module by a different name (for example, to avoid a name clash or to fit your context better), use `import ... as alias`:
@@ -22,8 +22,8 @@ If you want to refer to a module by a different name (for example, to avoid a na
 ```1y
 import io as fs;
 
-fs.println("hello via fs");
-fs.write_file("out.txt", "data");
+println("hello via fs");
+fs.write("out.txt", "data");
 ```
 
 The name after `as` becomes the module's alias in the current scope; the original name is no longer available. This is especially useful when importing several modules with similar functionality.
@@ -69,8 +69,8 @@ The only semantic difference between `import` and `lazy import` is the loading t
 import json;
 import random;
 
-let data = json.parse("{\"name\": \"Alice\"}");
-let n = random.int(1, 100);
+let data = json.parse("\{\"name\": \"Alice\"\}");
+let n = random.range(1, 100);
 ```
 
 ## File Modules

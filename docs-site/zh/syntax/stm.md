@@ -28,8 +28,8 @@ let config = shared { host: "localhost", port: 8080 };
 - `counter = expr` 把单元的值设为 `expr` 的结果。
 
 ```1y
-let v = counter;       # 读
-counter = v + 1;       # 写
+let v = counter;       // 读
+counter = v + 1;       // 写
 ```
 
 语义取决于上下文：在事务内，读写走快照隔离；在事务外，读写直接生效（见[事务外访问](#事务外访问)）。这种统一的语法让你可以在事务内外复用同一段读写逻辑，只需决定是否把它包进 `transact`。
@@ -43,7 +43,7 @@ let counter = shared 0;
 let result = transact {
     let v = counter + 1;
     counter = v;
-    v           # 事务的返回值
+    v           // 事务的返回值
 };
 ```
 
@@ -58,7 +58,7 @@ let result = transact {
 快照隔离意味着事务**看到的是它开始时刻的一致状态**，即便其他事务在此期间提交了改动。这使得事务内的逻辑可以写得像顺序代码一样直观：
 
 ```1y
-# 原子转账：要么两个余额都更新，要么都不更新
+// 原子转账：要么两个余额都更新，要么都不更新
 let alice = shared 100;
 let bob = shared 50;
 
@@ -90,12 +90,12 @@ transact {
 `retry` 显式地放弃当前事务并从头重跑。它通常用于"条件不满足，等会儿再试"的模式：事务发现某个前置条件暂时不成立，主动 `retry`，等到相关 cell 发生变化后再试一次。
 
 ```1y
-# 等待账户余额充足后再扣款
+// 等待账户余额充足后再扣款
 transact {
     if alice >= amount {
         alice = alice - amount;
     } else {
-        retry        # 余额不够，重试事务
+        retry        // 余额不够，重试事务
     }
 };
 ```
@@ -114,10 +114,10 @@ transact {
 transact {
     counter = counter + 1;
     transact {
-        # 内层提交到外层快照；若外层回滚，这里也一并回滚
+        // 内层提交到外层快照；若外层回滚，这里也一并回滚
         counter = counter + 10;
     };
-    # 此处读到的是外层快照，已包含内层的写入
+    // 此处读到的是外层快照，已包含内层的写入
     counter
 };
 ```
@@ -139,7 +139,7 @@ transact {
 
 ```1y
 let counter = shared 0;
-counter = counter + 1;   # 事务外：直接读改写，非原子
+counter = counter + 1;   // 事务外：直接读改写，非原子
 ```
 
 事务外的访问是"逃生舱"，适合单线程初始化、一次性赋值等确定无竞争的场景。**只要存在并发访问，就应放进 `transact`**，否则会绕过 STM 的隔离保证，引入数据竞争。
@@ -147,11 +147,9 @@ counter = counter + 1;   # 事务外：直接读改写，非原子
 ## 完整示例：并发安全的计数器
 
 ```1y
-import io;
-
 let counter = shared 0;
 
-# 多个事务并发自增，STM 保证最终结果正确
+// 多个事务并发自增，STM 保证最终结果正确
 fn bump() {
     transact {
         let v = counter + 1;

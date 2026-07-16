@@ -24,8 +24,8 @@ In 1y, all values are immutable by default. Once a value is created, it never ch
 
 ```1y
 let xs = [1, 2, 3]
-let ys = List.push(xs, 4)
-# xs is still [1, 2, 3]; ys is [1, 2, 3, 4]
+let ys = push(xs, 4)
+// xs is still [1, 2, 3]; ys is [1, 2, 3, 4]
 ```
 
 This sounds inefficient, but persistent data structures achieve near-O(1) copy cost through **structural sharing**. More importantly, immutability eliminates aliasing problems at the root: you never worry that "another function might silently mutate my data." In concurrent settings, this means data can flow freely between Actors with no copying and no synchronization.
@@ -36,9 +36,8 @@ This sounds inefficient, but persistent data structures achieve near-O(1) copy c
 
 ```1y
 let status =
-  if score >= 90 then "A"
-  else if score >= 60 then "B"
-  else "C"
+  if score >= 90 { "A" }
+  else { if score >= 60 { "B" } else { "C" } }
 ```
 
 Expression-orientation brings programs closer to mathematics: a program is "a computation," not "a sequence of instructions." It also makes refactoring safer — any piece of code can be extracted into a function because it already has a value.
@@ -48,9 +47,9 @@ Expression-orientation brings programs closer to mathematics: a program is "a co
 1y has only two numeric types: `Int` (arbitrary-precision integer) and `Decimal` (arbitrary-precision decimal). Arithmetic auto-promotes: `Int + Decimal` yields `Decimal`; division that does not divide evenly auto-promotes to `Decimal`. The programmer never chooses between `int`, `long`, `float`, `double`, `BigInteger`, and `BigDecimal` — the language chooses correctly on your behalf.
 
 ```1y
-let a = factorial(500)        # a 1135-digit integer, no problem
-let b = 10 :pow 100           # 1 followed by 100 zeros
-let c = 1 / 3                 # 0.3333... (Decimal), not 0
+let a = factorial(500)        // a 1135-digit integer, no problem
+let b = pow(10, 100)          // 1 followed by 100 zeros
+let c = 1 / 3                 // 0.3333... (Decimal), not 0
 ```
 
 See [Numerical Unification](./numerical-unification) for the full story.
@@ -60,9 +59,9 @@ See [Numerical Unification](./numerical-unification) for the full story.
 Concurrency is not an add-on library; it is the core of the language. Both Actor and STM are built in with dedicated syntax:
 
 ```1y
-let counter = spawn Counter.init(0)
-counter ! Incr                       # fire-and-forget
-let current = counter ? Get          # request/reply
+let counter = spawn Counter()
+counter ! Incr()                    // fire-and-forget
+let current = counter ? Get()       // request/reply
 ```
 
 Concurrency primitives are not "advanced features" — they are everyday tools for every 1y programmer. See [Concurrency Model](./concurrency-model).
@@ -87,7 +86,7 @@ The combined result: **1y programs read like a specification**. Code describes "
 
 ## Small but Complete
 
-1y's syntax surface is tiny: `let`, `fn`, `match`, `if`, `actor`, `atomically`, the module system, and FFI — it fits on one sheet of paper. But "small" does not mean "weak":
+1y's syntax surface is tiny: `let`, `fn`, `match`, `if`, `actor`, `transact`, the module system, and FFI — it fits on one sheet of paper. But "small" does not mean "weak":
 
 - Arbitrary-precision numbers, sufficient for finance and scientific computing;
 - Persistent data structures, sufficient for complex data transformations;

@@ -1,0 +1,84 @@
+// examples/yin_server.1y — A complete yin web server example.
+//
+// Run with:  1y run examples/yin_server.1y
+//
+// Demonstrates: exact routes, param routes, route groups, middleware,
+// JSON/HTML/text responses, and error handling.
+//
+// Then try it with curl:
+//   curl http://127.0.0.1:8080/ping
+//   curl http://127.0.0.1:8080/users/42
+//   curl http://127.0.0.1:8080/api/users
+//   curl http://127.0.0.1:8080/api/posts/99
+//   curl -X POST http://127.0.0.1:8080/api/users -d '{"name":"alice"}'
+
+import lib.yin as yin;
+
+let app = yin.new();
+
+// --- Logging middleware ---
+yin.use(app, fn(ctx, next) {
+    let c = ctx;
+    let req = c["req"];
+    println(req["method"] + " " + req["path"]);
+    next()
+});
+
+// --- CORS middleware ---
+yin.use(app, fn(ctx, next) {
+    let c = ctx;
+    let h = c["headers"];
+    ctx = assoc(c, "headers", push(h, "Access-Control-Allow-Origin: *"));
+    next()
+});
+
+// --- Basic routes ---
+yin.get(app, "/", fn(ctx) {
+    yin.html(ctx, 200, "<h1>Welcome to yin</h1><p>A Gin-inspired web framework for 1y.</p>")
+});
+
+yin.get(app, "/ping", fn(ctx) {
+    yin.json(ctx, 200, { "message": "pong" })
+});
+
+yin.get(app, "/users/:id", fn(ctx) {
+    let id = yin.param(ctx, "id");
+    yin.json(ctx, 200, { "user_id": id, "name": "user_" + id })
+});
+
+// --- API group (prefix /api) ---
+let api = yin.group(app, "/api");
+
+yin.get(api, "/users", fn(ctx) {
+    yin.json(ctx, 200, [
+        { "id": 1, "name": "alice" },
+        { "id": 2, "name": "bob" },
+        { "id": 3, "name": "charlie" }
+    ])
+});
+
+yin.post(api, "/users", fn(ctx) {
+    let body = yin.body(ctx);
+    yin.json(ctx, 201, { "created": true, "received": body })
+});
+
+yin.get(api, "/posts/:pid", fn(ctx) {
+    let pid = yin.param(ctx, "pid");
+    yin.json(ctx, 200, { "post_id": pid, "title": "post_" + pid })
+});
+
+yin.delete(api, "/posts/:pid", fn(ctx) {
+    let pid = yin.param(ctx, "pid");
+    yin.json(ctx, 200, { "deleted": true, "post_id": pid })
+});
+
+// --- Nested group (prefix /api/v1) ---
+let v1 = yin.group(app, "/api/v1");
+
+yin.get(v1, "/status", fn(ctx) {
+    yin.json(ctx, 200, { "version": "v1", "status": "ok" })
+});
+
+// --- Start the server ---
+println("yin server starting on 127.0.0.1:8080");
+yin.run(app, "127.0.0.1:8080")

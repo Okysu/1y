@@ -29,6 +29,15 @@ impl SourceError {
         self
     }
 
+    /// The message plus optional hint, as a single string. Used when wrapping
+    /// a `SourceError` into a runtime error so the hint is not lost.
+    pub fn full_message(&self) -> String {
+        match &self.hint {
+            Some(h) => format!("{}\n  hint: {}", self.message, h),
+            None => self.message.clone(),
+        }
+    }
+
     /// Render this error against a slice of source text. Produces a multi-line
     /// string with a `^^^` underline under the offending span.
     pub fn render(&self, source: &str) -> String {

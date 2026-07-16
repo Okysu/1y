@@ -24,8 +24,8 @@ title: 设计原则
 
 ```1y
 let xs = [1, 2, 3]
-let ys = List.push(xs, 4)
-# xs 仍然是 [1, 2, 3],ys 是 [1, 2, 3, 4]
+let ys = push(xs, 4)
+// xs 仍然是 [1, 2, 3],ys 是 [1, 2, 3, 4]
 ```
 
 这听起来低效,但持久化数据结构通过**结构共享**实现了近乎 O(1) 的复制成本。更重要的是,不可变性从根本上消灭了别名问题:你不需要担心"另一个函数会不会偷偷改掉我的数据"。在并发场景下,这意味着数据可以自由地在 Actor 之间传递,无需拷贝、无需同步。
@@ -36,9 +36,8 @@ let ys = List.push(xs, 4)
 
 ```1y
 let status =
-  if score >= 90 then "A"
-  else if score >= 60 then "B"
-  else "C"
+  if score >= 90 { "A" }
+  else { if score >= 60 { "B" } else { "C" } }
 ```
 
 表达式导向让程序更接近数学:程序就是"计算",而非"指令序列"。这也使得重构更加安全——任何一段代码都可以被提取为函数,因为它本就有值。
@@ -48,9 +47,9 @@ let status =
 1y 只有两种数值类型:`Int`(任意精度整数)与 `Decimal`(任意精度十进制小数)。算术运算会自动提升:`Int + Decimal` 得到 `Decimal`;除法不能整除时自动提升为 `Decimal`。程序员永远不必在 `int`、`long`、`float`、`double`、`BigInteger`、`BigDecimal` 之间做选择——选择由语言正确地代劳。
 
 ```1y
-let a = factorial(500)        # 一个 1135 位的整数,毫无问题
-let b = 10 :pow 100           # 1 后面 100 个 0
-let c = 1 / 3                 # 0.3333...(Decimal),而非 0
+let a = factorial(500)        // 一个 1135 位的整数,毫无问题
+let b = pow(10, 100)          // 1 后面 100 个 0
+let c = 1 / 3                 // 0.3333...(Decimal),而非 0
 ```
 
 关于数值统一,详见[数值统一](./numerical-unification)一章。
@@ -60,9 +59,9 @@ let c = 1 / 3                 # 0.3333...(Decimal),而非 0
 并发不是附加的库,而是语言的核心。Actor 与 STM 都内建于语言,拥有专属语法:
 
 ```1y
-let counter = spawn Counter.init(0)
-counter ! Incr                       # 发后即忘
-let current = counter ? Get          # 请求/回复
+let counter = spawn Counter()
+counter ! Incr()                    // 发后即忘
+let current = counter ? Get()       // 请求/回复
 ```
 
 并发原语不是"高级特性",而是每个 1y 程序员日常使用的工具。详见[并发模型](./concurrency-model)。
@@ -87,7 +86,7 @@ let current = counter ? Get          # 请求/回复
 
 ## 麻雀虽小,五脏俱全
 
-1y 的语法表很小:`let`、`fn`、`match`、`if`、`actor`、`atomically`、模块系统、FFI——几乎可以一张纸写完。但"小"不等于"弱":
+1y 的语法表很小:`let`、`fn`、`match`、`if`、`actor`、`transact`、模块系统、FFI——几乎可以一张纸写完。但"小"不等于"弱":
 
 - 任意精度数值,足以支撑金融与科学计算;
 - 持久化数据结构,足以支撑复杂的数据变换;

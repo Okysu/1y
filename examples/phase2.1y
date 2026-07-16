@@ -228,9 +228,8 @@ println("20 / 4 = " + str(q));    // 5
 println("=== Key-value store ===");
 
 actor KVStore {
-    // Note: `{}` parses as an empty block (Nil), not an empty map.
-    // Initialize with a placeholder entry to get a real Map.
-    state data = dissoc({ __init: 0 }, "__init")
+    // `{}` is an empty Map in 1y.
+    state data = {}
     on put(key, val) { data = assoc(data, key, val); reply(nil) }
     on get(key) { reply(get(data, key)) }
     on has(key) { reply(get(data, key) != nil) }

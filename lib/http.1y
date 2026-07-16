@@ -16,11 +16,11 @@
 //   http.not_found()                        — build a 404 response
 //
 // `handler` is a function that receives a request Map:
-//   \{ "method": "GET", "path": "/", "version": "HTTP/1.1",
-//     "headers": <Map>, "body": <Str> \}
+//   { "method": "GET", "path": "/", "version": "HTTP/1.1",
+//     "headers": <Map>, "body": <Str> }
 // and returns a Map:
-//   \{ "status": 200, "body": "<html>...</html>",
-//      "headers": ["Content-Type: text/html"] \}
+//   { "status": 200, "body": "<html>...</html>",
+//      "headers": ["Content-Type: text/html"] }
 //
 // `handler` may itself call `await` on any Task (e.g. for SSE streaming,
 // slow backends, or timed delays) — this is the core of colorless async:
@@ -174,10 +174,8 @@ fn parse_request(raw) {
     // Validate: method must be uppercase letters, path starts with /.
     if len(method) == 0 or substring(path, 0, 1) != "/" { return nil };
 
-    // Parse headers into a Map.
-    // Note: \{} is an empty block in 1y, not an empty Map. We seed with a
-    // placeholder entry and build via assoc, then dissoc the placeholder.
-    let headers = \{ "_init": nil \};
+    // Parse headers into a Map. `{}` is an empty Map in 1y.
+    let headers = {};
     let idx = 1;
     while idx < count(lines) {
         let line = lines[idx];
@@ -192,10 +190,7 @@ fn parse_request(raw) {
         idx += 1
     };
 
-    // Remove the placeholder key.
-    headers = dissoc(headers, "_init");
-
-    \{ "method": method, "path": path, "version": version, "headers": headers, "body": body \}
+    { "method": method, "path": path, "version": version, "headers": headers, "body": body }
 }
 
 // ---------------------------------------------------------------------------
@@ -249,7 +244,7 @@ actor Connection {
         let resp = try {
             handler(req)
         } rescue {
-            \{ "status": 500, "body": "Internal Server Error", "headers": [] \}
+            { "status": 500, "body": "Internal Server Error", "headers": [] }
         };
 
         // Normalize the handler's return value.
@@ -275,7 +270,7 @@ actor Connection {
 // Start an Actor-based HTTP server with non-blocking accept + colorless async.
 //
 // `addr`     — "host:port" string (e.g. "127.0.0.1:8080")
-// `handler`  — function(req_map) -> \{ "status": Int, "body": Str, "headers": Vec \}
+// `handler`  — function(req_map) -> { "status": Int, "body": Str, "headers": Vec }
 //
 // Architecture:
 //   1. Listener is set to non-blocking mode.

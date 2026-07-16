@@ -612,8 +612,288 @@ fn test_arity_error() {
     assert!(err.contains("expects") || err.contains("argument"));
 }
 
+// ---------------------------------------------------------------------------
+// Empty Map literal `{}`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_empty_map_literal() {
+    // `{}` must evaluate to an empty Map, not Nil (empty block).
+    match eval("{}") {
+        Value::Map(m) => assert!(m.is_empty()),
+        other => panic!("expected empty Map, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_empty_map_count() {
+    assert_eq!(eval("count({})"), eval("0"));
+}
+
+#[test]
+fn test_empty_map_with_assoc() {
+    // assoc on an empty Map produces a one-entry Map.
+    match eval(r#"assoc({}, "k", "v")"#) {
+        Value::Map(m) => assert_eq!(m.len(), 1),
+        other => panic!("expected Map, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_empty_map_get_returns_nil() {
+    assert_eq!(eval(r#"get({}, "missing")"#), Value::Nil);
+}
+
+#[test]
+fn test_memo_pattern_with_empty_map() {
+    // The fib_memo pattern: seed with {} and build via assoc.
+    let src = r#"
+        fn fib(n) {
+            fn go(n, memo) {
+                match get(memo, n) {
+                    v if is_int(v) => v,
+                    _ => {
+                        let v = if n < 2 { n } else { go(n - 1, memo) + go(n - 2, memo) };
+                        v
+                    }
+                }
+            };
+            go(n, {})
+        }
+        fib(10)
+    "#;
+    assert_eq!(eval_big(src), "55");
+}
+
 #[test]
 fn test_pattern_match_fail() {
     let err = eval_err("match 42 { 1 => 1 }");
     assert!(err.contains("no pattern matched") || err.contains("match"));
+}
+
+// ---------------------------------------------------------------------------
+// shared cells + transact (STM) — the canonical counter pattern from stm.md
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_shared_cell_read_write_outside_transact() {
+    // `shared expr` creates a cell; reading the binding auto-derefs (no `*`);
+    // assigning to the binding writes the cell. No `*` deref operator exists.
+    let src = r#"
+        let counter = shared 0;
+        let v = counter;            // read
+        counter = v + 1;            // write
+        counter                     // read again
+    "#;
+    assert_eq!(eval(src), eval("1"));
+}
+
+#[test]
+fn test_transact_returns_value() {
+    let src = r#"
+        let counter = shared 0;
+        let result = transact {
+            let v = counter + 1;
+            counter = v;
+            v
+        };
+        result
+    "#;
+    assert_eq!(eval(src), eval("1"));
+}
+
+#[test]
+fn test_stm_counter_pattern() {
+    // The exact pattern documented in docs-site/{en,zh}/examples/transactional-counter.md
+    // and docs-site/{en,zh}/syntax/stm.md: a function that atomically bumps
+    // a shared counter inside `transact`.
+    let src = r#"
+        let counter = shared 0;
+        fn bump() {
+            transact {
+                let v = counter + 1;
+                counter = v;
+                v
+            }
+        };
+        bump();
+        bump();
+        bump()
+    "#;
+    assert_eq!(eval(src), eval("3"));
+}
+
+#[test]
+fn test_transact_read_your_writes() {
+    // Inside a transaction, a second read sees the buffered write (snapshot
+    // isolation: read-your-writes).
+    let src = r#"
+        let x = shared 0;
+        let snap = transact {
+            x = x + 1;
+            x = x + 1;
+            x
+        };
+        snap
+    "#;
+    assert_eq!(eval(src), eval("2"));
+}
+
+#[test]
+fn test_lambda_zero_arg_fn_form() {
+    // 1y lambda syntax is `fn(params) { body }` — NOT JS arrow `() => {}`.
+    let src = r#"
+        let f = fn() { 42 };
+        f()
+    "#;
+    assert_eq!(eval(src), eval("42"));
+}
+
+#[test]
+fn test_lambda_one_arg_fn_form() {
+    let src = r#"
+        let inc = fn(x) { x + 1 };
+        inc(9)
+    "#;
+    assert_eq!(eval(src), eval("10"));
+}
+
+// ---------------------------------------------------------------------------
+// SendValue — cross-thread data subset
+// ---------------------------------------------------------------------------
+
+use onely::SendValue;
+
+fn to_send_and_back(src: &str) -> Value {
+    let v = eval(src);
+    let sv = SendValue::from_value(&v).expect("should be convertible to SendValue");
+    sv.into_value()
+}
+
+#[test]
+fn test_send_value_int_roundtrip() {
+    assert_eq!(to_send_and_back("42"), eval("42"));
+    assert_eq!(to_send_and_back("0"), eval("0"));
+    assert_eq!(to_send_and_back("-7"), eval("-7"));
+}
+
+#[test]
+fn test_send_value_str_roundtrip() {
+    assert_eq!(to_send_and_back("\"hello\""), eval("\"hello\""));
+    assert_eq!(to_send_and_back("\"\""), eval("\"\""));
+}
+
+#[test]
+fn test_send_value_vec_roundtrip() {
+    assert_eq!(to_send_and_back("[1, 2, 3]"), eval("[1, 2, 3]"));
+    assert_eq!(to_send_and_back("[]"), eval("[]"));
+}
+
+#[test]
+fn test_send_value_map_roundtrip() {
+    assert_eq!(to_send_and_back("{ \"a\": 1, \"b\": 2 }"), eval("{ \"a\": 1, \"b\": 2 }"));
+    assert_eq!(to_send_and_back("{}"), eval("{}"));
+}
+
+#[test]
+fn test_send_value_set_roundtrip() {
+    assert_eq!(to_send_and_back("#{1, 2, 3}"), eval("#{1, 2, 3}"));
+}
+
+#[test]
+fn test_send_value_variant_roundtrip() {
+    assert_eq!(
+        to_send_and_back("enum Option { Some(Int), None }; Some(42)"),
+        eval("enum Option { Some(Int), None }; Some(42)")
+    );
+    assert_eq!(
+        to_send_and_back("enum Option { Some(Int), None }; None"),
+        eval("enum Option { Some(Int), None }; None")
+    );
+}
+
+#[test]
+fn test_send_value_nested_roundtrip() {
+    let src = r#"[{ "x": 1 }, [2, 3], "four"]"#;
+    assert_eq!(to_send_and_back(src), eval(src));
+}
+
+#[test]
+fn test_send_value_rejects_function() {
+    let v = eval("fn(x) { x + 1 }");
+    assert!(SendValue::from_value(&v).is_err());
+}
+
+#[test]
+fn test_send_value_rejects_actor() {
+    let v = eval(r#"
+        actor Counter { state data = 0; on Bump() { data = data + 1; reply data } };
+        spawn Counter()
+    "#);
+    assert!(SendValue::from_value(&v).is_err());
+}
+
+#[test]
+fn test_send_value_rejects_shared() {
+    let v = eval("shared 0");
+    assert!(SendValue::from_value(&v).is_err());
+}
+
+#[test]
+fn test_send_value_rejects_task() {
+    let v = eval("task_ready(42)");
+    assert!(SendValue::from_value(&v).is_err());
+}
+
+#[test]
+fn test_send_value_is_send() {
+    // Compile-time check: SendValue must be Send + Sync
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
+    assert_send::<SendValue>();
+    assert_sync::<SendValue>();
+}
+
+// ---------------------------------------------------------------------------
+// Phase C3: ActorPid allocation + pid_of + ActorRegistry registration
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_pid_of_returns_unique_pids() {
+    let src = r#"
+        actor Counter { state data = 0; on Bump() { data = data + 1; reply data } };
+        let c1 = spawn Counter();
+        let c2 = spawn Counter();
+        // Pids are unique; c2's pid should differ from c1's.
+        pid_of(c1) != pid_of(c2)
+    "#;
+    let v = eval(src);
+    assert_eq!(v, eval("true"));
+}
+
+#[test]
+fn test_pid_of_is_positive_int() {
+    let src = r#"
+        actor Counter { state data = 0; on Bump() { data = data + 1; reply data } };
+        let c = spawn Counter();
+        pid_of(c)
+    "#;
+    let v = eval(src);
+    match v {
+        Value::Int(n) => assert!(n > num_bigint::BigInt::from(0), "pid should be positive"),
+        other => panic!("expected Int pid, got: {}", other),
+    }
+}
+
+#[test]
+fn test_pid_of_errors_on_non_actor() {
+    let result = std::panic::catch_unwind(|| {
+        let _ = eval("pid_of(42)");
+    });
+    // Should error, not panic — but eval panics on error in our test helper.
+    // Verify via separate interpreter to get the error path.
+    let mut interp = Interpreter::new();
+    let r = interp.eval_source("pid_of(42)");
+    assert!(r.is_err(), "pid_of on non-actor should error");
+    let _ = result;
 }

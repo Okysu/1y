@@ -117,9 +117,9 @@ fn serve(addr, handler) {
 To be honest, this design has costs.
 
 - **Cooperative, not preemptive.** A coroutine that never `await`s will run to completion. There is no preemption. Long CPU-bound loops should yield periodically or be offloaded to `process.exec`.
-- **Single-threaded.** True multi-core parallelism requires multiple processes (via `process`) or future work on a multi-threaded scheduler. Colorless async gives concurrency, not parallelism.
-- **Polling-based I/O.** The current scheduler polls parked Tasks each `yield`. For a few hundred connections this is fine; for tens of thousands, an `epoll`/`kqueue`-backed poller (like `mio`) would be needed.
-- **No `Task.all` / `Task.race` yet.** Only `await` is provided. Concurrent composition is done by spawning multiple Actors. This is a deliberate minimalism — matching Zig's philosophy of one primitive well.
+- **Single-threaded (for now).** True multi-core parallelism requires multiple processes (via `process`) or future work on a multi-threaded scheduler. Colorless async gives concurrency, not parallelism.
+- **Event-driven I/O.** The scheduler uses `mio` (`epoll`/`kqueue`/IOCP) to wait only on readiness of registered streams, so parked Tasks are polled only when the OS reports them ready rather than every `yield`.
+- **Task combinators are minimal.** `await` is the core primitive; `task_all([t1, ...])`, `task_any([t1, ...])`, and `task_ready(value)` compose Tasks. For long-lived concurrent state, prefer Actors. This is deliberate minimalism — matching Zig's philosophy of one primitive well.
 
 ## Why This Trade-off Is Worth It
 
