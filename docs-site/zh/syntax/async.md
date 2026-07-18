@@ -64,6 +64,25 @@ http.serve("127.0.0.1:8080", handler)
 
 当协程 await 时，调度器运行其他就绪的协程。慢处理器不会阻塞其他连接。
 
+## top-level `await` 推进调度器
+
+并非每个 `await` 都在协程内运行。例如 HTTP accept loop 就是 top-level 代码：
+
+```1y
+// lib/http.1y（简化）
+loop {
+    let stream = await socket.accept_async(listener);  // top-level await
+    let conn = spawn Connection(stream, handler);
+    yield;  // drain 待处理的 actor 消息，推进 parked 处理器
+}
+```
+
+这个 `await accept_async` **不在**协程内，因此无法 `suspend()`。它改为 busy-poll 自身的 Task——但每次轮询之间会调用 `drain_mailboxes_async()` 把调度器推进几个 tick。正因如此，parked 协程（慢处理器的 500 ms 定时器、另一个连接的 `read_async`）才能在 accept loop 等待新连接时继续取得进展。
+
+没有这种交错，top-level await 会饿死所有 parked 协程：慢处理器的定时器永远不会触发，因为其协程从未被 resume。这种交错对用户代码不可见——纯粹是 VM 与 tree-walker 的 top-level await fallback 的实现细节。
+
+完整架构见 [字节码虚拟机](../philosophy/bytecode-vm)。
+
 ## 底层原理
 
 1. **stackful 协程**（`corosensei`）：`await` 挂起整个调用栈

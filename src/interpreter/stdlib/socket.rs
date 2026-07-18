@@ -124,7 +124,7 @@ fn bi_accept_async(args: &[Value]) -> Result<Value, InterpreterError> {
                     }
                     Err(_) => crate::value::TaskPoll::Ready(Value::Nil),
                 }
-            }));
+            }), None);
             let task_ref = Rc::new(RefCell::new(task_state));
             // Register the listener with the scheduler's mio::Poll for
             // event-driven readiness notification. This makes the scheduler
@@ -218,7 +218,7 @@ fn bi_read_async(args: &[Value]) -> Result<Value, InterpreterError> {
                     }
                     Err(_) => crate::value::TaskPoll::Ready(Value::Nil),
                 }
-            }));
+            }), None);
             let task_ref = std::rc::Rc::new(std::cell::RefCell::new(task_state));
             // Register the stream with the scheduler's mio::Poll for
             // event-driven readiness notification. This makes the scheduler

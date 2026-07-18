@@ -90,6 +90,13 @@ const _: () = {
     assert_send::<ActorPid>();
 };
 
+/// A VM-side actor state namespace: a flat map of `name → Value` bindings
+/// (state vars + actor-local fn defs). When a handler frame runs, its
+/// `LoadGlobal`/`AssignGlobal`/`DefineGlobal` consult this map first (via
+/// `Frame::actor_env`), giving handlers access to actor state without
+/// polluting the module-level globals.
+pub type ActorEnvVm = Rc<RefCell<HashMap<String, Value>>>;
+
 /// An actor instance: isolated state + message handlers + mailbox.
 ///
 /// Actors run on a single-threaded event loop. `!` enqueues a message and
@@ -102,11 +109,18 @@ pub struct ActorInstance {
     /// can route messages to this actor via `CrossEnvelope`.
     pub pid: ActorPid,
     /// Environment holding the actor's `state` bindings (parent = global).
+    /// Used by the tree-walker; the VM uses `vm_env` instead.
     pub env: EnvRef,
     /// `on name(params)` handlers, keyed by handler name.
+    /// Tree-walker handlers (AST). VM handlers live in `vm_handlers`.
     pub handlers: HashMap<String, OnClause>,
     /// Pending incoming messages (FIFO).
     pub mailbox: VecDeque<Envelope>,
+    /// VM-side actor state namespace. `None` for tree-walker-created actors.
+    pub vm_env: Option<ActorEnvVm>,
+    /// VM-side handler closures, keyed by message name. Empty for
+    /// tree-walker-created actors.
+    pub vm_handlers: HashMap<String, Rc<crate::vm::closure::ClosureVm>>,
 }
 
 impl ActorInstance {
@@ -116,6 +130,8 @@ impl ActorInstance {
             env,
             handlers: HashMap::new(),
             mailbox: VecDeque::new(),
+            vm_env: None,
+            vm_handlers: HashMap::new(),
         }
     }
 }
@@ -205,7 +221,14 @@ pub enum TaskPoll {
 pub enum TaskState {
     /// Pending: holds a poll function that checks if the underlying operation
     /// (timer, I/O) has completed.
-    Pending(Box<dyn Fn() -> TaskPoll>),
+    ///
+    /// The optional `Instant` is a deadline hint used by the scheduler to
+    /// order timer-based Tasks (e.g. `process.sleep_async`). When set, the
+    /// scheduler parks the Task in a min-heap keyed by deadline and only
+    /// polls it once the deadline has passed — avoiding O(n) re-polling
+    /// every tick. When `None`, the Task is polled every tick (legacy
+    /// behavior, used by combinator Tasks without a known deadline).
+    Pending(Box<dyn Fn() -> TaskPoll>, Option<std::time::Instant>),
     /// Ready: the task has completed; the value can be extracted by `await`.
     Ready(Value),
     /// Consumed: the value has already been extracted by `await`.
@@ -262,6 +285,8 @@ pub enum Value {
 
     // --- functions ---
     Func(Rc<Closure>),
+    /// A VM-compiled closure (bytecode closure + captured upvalues).
+    Closure(Rc<crate::vm::closure::ClosureVm>),
     Native(Rc<NativeFn>),
 
     // --- user-defined types ---
@@ -347,6 +372,7 @@ impl Value {
             Value::Map(_) => "Map",
             Value::Set(_) => "Set",
             Value::Func(_) => "Func",
+            Value::Closure(_) => "Closure",
             Value::Native(_) => "NativeFunc",
             Value::Variant { .. } => "Variant",
             Value::Struct { .. } => "Struct",
@@ -399,6 +425,7 @@ impl PartialEq for Value {
             ) => an == bn && af == bf,
             // Functions: identity (same Rc).
             (Value::Func(a), Value::Func(b)) => Rc::ptr_eq(a, b),
+            (Value::Closure(a), Value::Closure(b)) => Rc::ptr_eq(a, b),
             (Value::Native(a), Value::Native(b)) => a.name == b.name,
             // Actors: identity (same Rc).
             (Value::Actor(a), Value::Actor(b)) => Rc::ptr_eq(a, b),
@@ -479,6 +506,10 @@ impl Hash for Value {
             Value::Func(f) => {
                 11u8.hash(state);
                 (Rc::as_ptr(f) as usize).hash(state);
+            }
+            Value::Closure(c) => {
+                19u8.hash(state);
+                (Rc::as_ptr(c) as usize).hash(state);
             }
             Value::Native(n) => {
                 12u8.hash(state);
@@ -561,6 +592,10 @@ impl std::fmt::Display for Value {
                 write!(f, "}}")
             }
             Value::Func(c) => match &c.name {
+                Some(n) => write!(f, "<fn {}>", n),
+                None => write!(f, "<fn>"),
+            },
+            Value::Closure(c) => match &c.name {
                 Some(n) => write!(f, "<fn {}>", n),
                 None => write!(f, "<fn>"),
             },
@@ -727,6 +762,7 @@ impl SendValue {
                 Err("cannot send Actor reference across threads (use a Pid)".into())
             }
             Value::Func(_) => Err("cannot send function across threads".into()),
+            Value::Closure(_) => Err("cannot send VM closure across threads".into()),
             Value::Native(_) => Err("cannot send native function across threads".into()),
             Value::Shared(_) => Err("cannot send shared cell across threads".into()),
             Value::Module(_) => Err("cannot send module across threads".into()),

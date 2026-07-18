@@ -1115,15 +1115,27 @@ impl Interpreter {
                     let v = crate::runtime::scheduler::await_task(task_ref);
                     Ok(v)
                 } else {
-                    // Not in a coroutine: poll synchronously (busy-wait).
-                    // This is the fallback for top-level await.
+                    // Not in a coroutine: poll synchronously, but drive the
+                    // scheduler between polls so parked coroutines (e.g.
+                    // slow handlers waiting on `sleep_async`) make progress.
+                    // This is the fallback for top-level await (e.g. the
+                    // HTTP accept loop's `await socket.accept_async`).
+                    //
+                    // Without driving the scheduler here, a top-level await
+                    // would busy-wait on its own Task and starve all parked
+                    // coroutines — e.g. a slow handler's 500ms timer would
+                    // never fire because its coroutine is never resumed.
                     loop {
+                        // Drive the scheduler: advance any parked coroutines
+                        // (timers, I/O) by one tick. This lets slow handlers
+                        // resume and complete while the top-level await waits.
+                        self.drain_mailboxes_async()?;
                         let ready = {
                             let t = task_ref.borrow();
                             match &*t {
                                 crate::value::TaskState::Ready(v) => Some(v.clone()),
                                 crate::value::TaskState::Consumed => Some(Value::Nil),
-                                crate::value::TaskState::Pending(f) => match f() {
+                                crate::value::TaskState::Pending(f, _) => match f() {
                                     crate::value::TaskPoll::Ready(v) => Some(v),
                                     crate::value::TaskPoll::Pending => None,
                                 },
@@ -1133,7 +1145,11 @@ impl Interpreter {
                             *task_ref.borrow_mut() = crate::value::TaskState::Consumed;
                             return Ok(v);
                         }
-                        // Spin briefly to avoid 100% CPU.
+                        // The tick above already waited (via mio::poll) for
+                        // I/O/timer events; if we get here, the Task is
+                        // still pending. Yield to avoid 100% CPU spin in
+                        // pathological cases (e.g. only this Task pending,
+                        // no I/O, no timers).
                         std::thread::sleep(std::time::Duration::from_millis(1));
                     }
                 }
@@ -1737,9 +1753,60 @@ impl Interpreter {
             });
         }
 
-        // Run the scheduler until all coroutines complete or park on I/O.
-        let results = self.scheduler.run_until_complete();
-        for r in results {
+        // Advance the scheduler by a small number of ticks. Previously
+        // this called `run_until_complete`, which blocked the accept loop
+        // for the full duration of slow handlers (e.g. `sleep_async(500ms)`),
+        // starving incoming connections. With bounded ticks, each `yield`
+        // makes progress on in-flight handlers but returns control to the
+        // accept loop quickly, so new connections keep being accepted while
+        // slow handlers are parked.
+        //
+        // Key invariant: the tick's internal mio::poll sleeps until the
+        // earliest of (next I/O event, next timer deadline). If a slow
+        // handler is parked on a 500ms timer AND a new connection arrives
+        // at 50ms, mio wakes at 50ms, the accept coroutine resumes, the
+        // new connection's handler runs to its first await, and control
+        // returns here. We then break out (has_ready false after draining
+        // the new connection's first read) and return to the accept loop,
+        // which can immediately accept the next connection. The slow
+        // handler remains parked and will resume on a subsequent `yield`
+        // once its 500ms timer fires.
+        //
+        // The tick cap bounds worst-case time in `yield` for pathological
+        // patterns. With 4 ticks per `yield`, a typical fast handler (read
+        // request → run handler → write response, each yielding once)
+        // completes in a single `yield` call, while a slow handler parked
+        // on a timer doesn't trap the accept loop — the next `yield`
+        // iteration of the accept loop resumes it.
+        const TICKS_PER_YIELD: usize = 4;
+        let mut last_results = Vec::new();
+        for _ in 0..TICKS_PER_YIELD {
+            let self_sched: *mut crate::runtime::scheduler::Scheduler =
+                &mut self.scheduler;
+            // SAFETY: self_sched is valid for the duration of this tick.
+            // Single-threaded runtime; no concurrent scheduler access.
+            unsafe { crate::runtime::scheduler::set_current_scheduler(self_sched) };
+            let done = self.scheduler.tick();
+            crate::runtime::scheduler::clear_current_scheduler();
+            last_results.extend(self.scheduler.take_results());
+            if done {
+                break;
+            }
+            // If no coroutines are ready to resume immediately AND no
+            // timers are pending (i.e. only I/O-waiters parked), break
+            // out — further ticks would just re-block on the same I/O
+            // wait. Return control to the caller (e.g. accept loop) so
+            // it can make progress; a subsequent `yield` will resume any
+            // parked coroutines.
+            //
+            // If timers ARE pending, continue ticking so the timer fires
+            // within this `yield` call (its mio::poll will sleep until
+            // the deadline, waking earlier if I/O arrives).
+            if !self.scheduler.has_ready() && !self.scheduler.has_pending_timers() {
+                break;
+            }
+        }
+        for r in last_results {
             r?;
         }
         Ok(())

@@ -14,6 +14,7 @@ use crate::value::Value;
 use bigdecimal::BigDecimal;
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive, Zero};
+use std::rc::Rc;
 
 // ---------------------------------------------------------------------------
 // Arithmetic
@@ -23,6 +24,12 @@ pub fn add(a: &Value, b: &Value) -> Result<Value, InterpreterError> {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => Ok(Value::Int(x + y)),
         (Value::Decimal(x), Value::Decimal(y)) => Ok(Value::Decimal(x + y)),
+        (Value::Str(x), Value::Str(y)) => {
+            let mut s = String::with_capacity(x.len() + y.len());
+            s.push_str(x);
+            s.push_str(y);
+            Ok(Value::str(s))
+        }
         _ => {
             if let (Some(x), Some(y)) = (a.to_decimal(), b.to_decimal()) {
                 Ok(Value::Decimal(x + y))
@@ -300,8 +307,53 @@ pub fn push(coll: &Value, item: &Value) -> Result<Value, InterpreterError> {
 pub fn assoc(map: &Value, key: &Value, value: &Value) -> Result<Value, InterpreterError> {
     match map {
         Value::Map(m) => Ok(Value::Map(m.update(key.clone(), value.clone()))),
+        Value::Vec(v) => {
+            // Vec index assignment: `v[i] = value`. `i` must be a non-negative
+            // Int within bounds. (Out-of-bounds insertion is not supported;
+            // use `push` for that.)
+            let i = match key {
+                Value::Int(n) => n.to_usize(),
+                _ => return Err(InterpreterError::TypeError {
+                    expected: "Int",
+                    got: key.type_name(),
+                    op: "assoc (vec index)".into(),
+                    span: None,
+                }),
+            };
+            match i {
+                Some(i) if i < v.len() => {
+                    let mut new_v = v.clone();
+                    new_v[i] = value.clone();
+                    Ok(Value::Vec(new_v))
+                }
+                _ => Err(InterpreterError::IndexError {
+                    msg: format!("index out of bounds: {}", key),
+                    span: None,
+                }),
+            }
+        }
+        // Struct field assignment: `obj.field = value`. Mirrors the
+        // tree-walker — full clone of the fields HashMap, insert, rebuild
+        // Value::Struct. Field types are not validated (dynamic typing).
+        Value::Struct { name, fields } => {
+            let field_name = match key {
+                Value::Str(s) => (**s).clone(),
+                _ => return Err(InterpreterError::TypeError {
+                    expected: "Str",
+                    got: key.type_name(),
+                    op: "assoc (struct field)".into(),
+                    span: None,
+                }),
+            };
+            let mut new_fields = (**fields).clone();
+            new_fields.insert(field_name, value.clone());
+            Ok(Value::Struct {
+                name: name.clone(),
+                fields: Rc::new(new_fields),
+            })
+        }
         _ => Err(InterpreterError::TypeError {
-            expected: "Map",
+            expected: "Map, Vec, or Struct",
             got: map.type_name(),
             op: "assoc".into(),
             span: None,

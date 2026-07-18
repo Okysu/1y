@@ -2,7 +2,7 @@
   "name": "onely-vscode",
   "displayName": "1y Language Support",
   "description": "Language support for the 1y programming language: syntax highlighting, LSP diagnostics, completions, and inline suggestions.",
-  "version": "0.1.0",
+  "version": "0.3.2",
   "publisher": "onely",
   "license": "MIT OR Apache-2.0",
   "engines": {

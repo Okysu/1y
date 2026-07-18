@@ -46,6 +46,7 @@ pub fn register(env: &EnvRef) {
         ("int", NativeFn { name: "int", func: bi_int }),
         ("decimal", NativeFn { name: "decimal", func: bi_decimal }),
         ("str", NativeFn { name: "str", func: bi_str }),
+        ("to_str", NativeFn { name: "to_str", func: bi_to_str }),
         // --- higher-order (routed in call_function, not via func) ---
         ("map", NativeFn { name: "map", func: bi_higher_order_placeholder }),
         ("filter", NativeFn { name: "filter", func: bi_higher_order_placeholder }),
@@ -337,6 +338,18 @@ fn bi_decimal(args: &[Value]) -> Result<Value, InterpreterError> {
 fn bi_str(args: &[Value]) -> Result<Value, InterpreterError> {
     let v = one_arg(args, "str")?;
     Ok(Value::str(format!("{}", v)))
+}
+
+/// `to_str(v)` — convert a value to its string representation for
+/// interpolation. Unlike `str`, `Value::Str` yields its raw content (no
+/// surrounding quotes), matching the tree-walker's string interpolation
+/// semantics.
+fn bi_to_str(args: &[Value]) -> Result<Value, InterpreterError> {
+    let v = one_arg(args, "to_str")?;
+    match &v {
+        Value::Str(s) => Ok(Value::str((**s).clone())),
+        _ => Ok(Value::str(format!("{}", v))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -686,7 +699,7 @@ fn bi_task_all(args: &[Value]) -> Result<Value, InterpreterError> {
                 match &*task_ref {
                     crate::value::TaskState::Ready(v) => v.clone(),
                     crate::value::TaskState::Consumed => Value::Nil,
-                    crate::value::TaskState::Pending(f) => match f() {
+                    crate::value::TaskState::Pending(f, _) => match f() {
                         crate::value::TaskPoll::Ready(v) => v,
                         crate::value::TaskPoll::Pending => return crate::value::TaskPoll::Pending,
                     },
@@ -702,7 +715,7 @@ fn bi_task_all(args: &[Value]) -> Result<Value, InterpreterError> {
             results.push(val);
         }
         crate::value::TaskPoll::Ready(Value::vec(results))
-    }));
+    }), None);
     Ok(Value::Task(std::rc::Rc::new(std::cell::RefCell::new(combined))))
 }
 
@@ -742,7 +755,7 @@ fn bi_task_any(args: &[Value]) -> Result<Value, InterpreterError> {
                 match &*task_ref {
                     crate::value::TaskState::Ready(v) => Some(v.clone()),
                     crate::value::TaskState::Consumed => None,
-                    crate::value::TaskState::Pending(f) => match f() {
+                    crate::value::TaskState::Pending(f, _) => match f() {
                         crate::value::TaskPoll::Ready(v) => Some(v),
                         crate::value::TaskPoll::Pending => None,
                     },
@@ -758,7 +771,7 @@ fn bi_task_any(args: &[Value]) -> Result<Value, InterpreterError> {
             }
         }
         crate::value::TaskPoll::Pending
-    }));
+    }), None);
     Ok(Value::Task(std::rc::Rc::new(std::cell::RefCell::new(combined))))
 }
 

@@ -4,6 +4,7 @@
 //! Phase 1: tree-walking interpreter with persistent collections.
 
 pub mod ast;
+pub mod compiler;
 pub mod error;
 pub mod interpreter;
 pub mod lexer;
@@ -11,6 +12,7 @@ pub mod parser;
 pub mod printer;
 pub mod runtime;
 pub mod value;
+pub mod vm;
 
 pub use ast::{Program, Span, Spanned};
 pub use error::{ErrorReport, SourceError};

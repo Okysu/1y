@@ -10,6 +10,10 @@ export enum TokenType {
     String,
     StringStart,    // opening " of an unterminated string
     Comment,
+    /// `///` line doc comment — used for hover documentation. `////`+ is a
+    /// plain comment. The token text includes the leading `///` so callers
+    /// can strip it uniformly.
+    DocComment,
     LParen, RParen,
     LBrace, RBrace,
     LBracket, RBracket,
@@ -38,12 +42,17 @@ export interface Token {
     end: number;
 }
 
+// Must mirror `Keyword::from_ident` in `src/lexer/token.rs` exactly —
+// any drift causes the editor parser to misclassify identifiers as
+// keywords (or vice versa), which then breaks statement dispatch in
+// `parser.ts`. In particular `await`/`yield` are reserved (colorless
+// async) and `receive` is NOT a keyword.
 export const KEYWORDS: ReadonlySet<string> = new Set([
     "let", "fn", "if", "else", "match", "while", "for", "in", "break",
     "continue", "loop", "enum", "type", "struct", "actor", "state", "on",
-    "spawn", "reply", "receive", "shared", "transact", "retry", "import",
-    "lazy", "as", "raise", "try", "rescue", "ensure", "return", "true",
-    "false", "nil", "and", "or", "not",
+    "spawn", "reply", "yield", "await", "shared", "transact", "retry",
+    "import", "lazy", "as", "raise", "try", "rescue", "ensure", "return",
+    "true", "false", "nil", "and", "or", "not",
 ]);
 
 export function tokenize(src: string): Token[] {
@@ -78,11 +87,16 @@ export function tokenize(src: string): Token[] {
             continue;
         }
 
-        // Line comment
+        // Line comment — `///` (but not `////`+) is a doc comment.
         if (c === "/" && peek(1) === "/") {
+            const isDoc = peek(2) === "/" && peek(3) !== "/";
             let len = 2;
             while (i + len < n && src[i + len] !== "\n") len++;
-            tokens.push({ type: TokenType.Comment, text: src.substr(i, len), line: startLine, col: startCol, start: i, end: i + len });
+            tokens.push({
+                type: isDoc ? TokenType.DocComment : TokenType.Comment,
+                text: src.substr(i, len),
+                line: startLine, col: startCol, start: i, end: i + len,
+            });
             advance(len);
             continue;
         }

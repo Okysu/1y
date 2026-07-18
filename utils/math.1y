@@ -1,0 +1,15 @@
+// math module — provides fib_memo with memoization via a shared cell.
+fn fib_memo(n) {
+    let memo = {};
+    fn fib(k) {
+        if k < 2 {
+            k
+        } else {
+            if is_nil(memo[k]) {
+                memo[k] = fib(k - 1) + fib(k - 2);
+            };
+            memo[k]
+        }
+    };
+    fib(n)
+}

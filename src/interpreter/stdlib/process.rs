@@ -144,12 +144,15 @@ fn bi_sleep_async(args: &[Value]) -> Result<Value, InterpreterError> {
         }),
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
-    let task = crate::value::TaskState::Pending(Box::new(move || {
-        if std::time::Instant::now() >= deadline {
-            crate::value::TaskPoll::Ready(Value::Nil)
-        } else {
-            crate::value::TaskPoll::Pending
-        }
-    }));
+    let task = crate::value::TaskState::Pending(
+        Box::new(move || {
+            if std::time::Instant::now() >= deadline {
+                crate::value::TaskPoll::Ready(Value::Nil)
+            } else {
+                crate::value::TaskPoll::Pending
+            }
+        }),
+        Some(deadline),
+    );
     Ok(Value::Task(std::rc::Rc::new(std::cell::RefCell::new(task))))
 }

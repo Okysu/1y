@@ -64,6 +64,25 @@ http.serve("127.0.0.1:8080", handler)
 
 When a coroutine awaits, the scheduler runs other ready coroutines. A slow handler does not block other connections.
 
+## Top-level `await` Drives the Scheduler
+
+Not every `await` runs inside a coroutine. The HTTP accept loop, for instance, is top-level code:
+
+```1y
+// lib/http.1y (simplified)
+loop {
+    let stream = await socket.accept_async(listener);  // top-level await
+    let conn = spawn Connection(stream, handler);
+    yield;  // drain pending actor messages, advance parked handlers
+}
+```
+
+This `await accept_async` is **not** in a coroutine, so it can't `suspend()`. Instead, it busy-polls its own Task — but between each poll it calls `drain_mailboxes_async()` to advance the scheduler by a few ticks. This is what lets parked coroutines (a slow handler's 500 ms timer, another connection's `read_async`) keep making progress while the accept loop waits for a new connection.
+
+Without this interleaving, a top-level await would starve every parked coroutine: the slow handler's timer would never fire because its coroutine is never resumed. The interleaving is invisible to user code — it's purely an implementation detail of the VM and tree-walker's top-level await fallback.
+
+See [Bytecode VM](../philosophy/bytecode-vm) for the full architecture.
+
 ## How It Works
 
 1. **Stackful coroutines** (`corosensei`): `await` suspends the entire call stack
