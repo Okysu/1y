@@ -31,9 +31,43 @@ use std::rc::Rc;
 // ---------------------------------------------------------------------------
 
 /// Compile a parsed [`Program`] into a top-level [`Chunk`].
+///
+/// This is the simple entry point: it starts from an empty type table, so
+/// `eval`-ed code that references `enum` variants / `type` structs defined
+/// outside the eval string will fail to compile them as constructors.
+/// Use [`compile_program_with_types`] when the caller maintains a persistent
+/// type table (e.g. the VM, which needs `eval` to see outer `enum`/`type`
+/// definitions).
 pub fn compile_program(program: &Program) -> Result<Chunk, InterpreterError> {
+    let mut variants = HashMap::new();
+    let mut structs = HashMap::new();
+    compile_program_with_types(program, &mut variants, &mut structs)
+}
+
+/// Like [`compile_program`], but seeds the compiler with the caller's
+/// already-known variant / struct names, and writes back any newly
+/// registered types encountered while compiling `program`.
+///
+/// This lets `eval(src)` recognize `enum` variants and `type` structs
+/// defined at the outer scope, so `eval("EvError.Bad(\"x\")")` works
+/// after `enum EvError { Bad(String) }` has been defined.
+pub fn compile_program_with_types(
+    program: &Program,
+    variants: &mut HashMap<String, usize>,
+    structs: &mut HashMap<String, ()>,
+) -> Result<Chunk, InterpreterError> {
     let mut compiler = Compiler::new(FunctionType::Script);
+    // Seed with the caller's known types so the compiled code can
+    // reference outer-scope enum variants / struct constructors.
+    compiler.variants = std::mem::take(variants);
+    compiler.structs = std::mem::take(structs);
+
     let n = program.stmts.len();
+    if n == 0 {
+        // Empty program: push Nil so the closing `Return` has something
+        // to pop (otherwise the VM stack-underflows).
+        compiler.emit_op(OpCode::Nil);
+    }
     for (i, stmt) in program.stmts.iter().enumerate() {
         if i + 1 == n {
             // Last top-level statement: if it's an expression, keep its value
@@ -57,6 +91,12 @@ pub fn compile_program(program: &Program) -> Result<Chunk, InterpreterError> {
         }
     }
     compiler.emit_op(OpCode::Return);
+
+    // Sync back the (possibly extended) type tables so the caller sees
+    // any `enum` / `type` definitions introduced by this program.
+    *variants = std::mem::take(&mut compiler.variants);
+    *structs = std::mem::take(&mut compiler.structs);
+
     Ok(compiler.finish())
 }
 
@@ -742,7 +782,15 @@ impl Compiler {
                         }
                         _ => self.compile_expr(k)?,
                     }
-                    self.compile_expr(v)?;
+                    // Preserve SharedRef when the value is a bare identifier
+                    // bound to a shared cell — otherwise the cell would be
+                    // auto-dereferenced here, breaking reference semantics
+                    // (e.g. closures capturing a shared environment).
+                    if let Expr::Ident(name, _) = v {
+                        self.emit_load_ref(name);
+                    } else {
+                        self.compile_expr(v)?;
+                    }
                 }
                 self.emit_op(OpCode::NewMap);
                 self.emit_u8(entries.len() as u8);
@@ -1073,11 +1121,12 @@ impl Compiler {
                 // handler. Layout:
                 //
                 //   begin_scope (for scope)
-                //     StoreLocal __for_iter, __for_i=0, __for_n=count(iter)
+                //     StoreLocal __for_iter = iter_to_vec(iter)
+                //     StoreLocal __for_i=0, __for_n=count(__for_iter)
                 //     PushLoop(continue=inc_step, break=break_handler)
                 //     loop_start:
                 //       cond (i < n); JumpIfFalse -> normal_handler
-                //       let var = get(iter, i)
+                //       let var = get(__for_iter, i)
                 //       begin_scope; body; Pop; end_scope; PopN inner_n
                 //       PopN 1 (pop var); pop_local(var)
                 //     inc_step:
@@ -1087,13 +1136,23 @@ impl Compiler {
                 //     after:
                 //   end_scope; PopN 3 (pop __for_iter, __for_i, __for_n)
                 //
+                // We materialize the iterable into a Vec via `iter_to_vec`
+                // first, so that `count` + `get` indexing works uniformly
+                // across Vec/Set/Map/Str (mirroring the tree-walker's
+                // `iter_to_vec` semantics: Map → [k, v] pairs, Str → chars).
+                //
                 // For returns nil (tree-walker semantics: break value is
                 // discarded). PushLoop is emitted outside the loop body so it
                 // runs exactly once.
                 self.begin_scope();
 
-                // __for_iter = iter
+                // __for_iter = iter_to_vec(iter)
+                let itv_idx = self.emit_const(Value::str("iter_to_vec"));
+                self.emit_op(OpCode::LoadGlobal);
+                self.emit_u8(itv_idx);
                 self.compile_expr(iter)?;
+                self.emit_op(OpCode::Call);
+                self.emit_u8(1);
                 let iter_slot = self.declare_local("__for_iter");
                 self.emit_op(OpCode::StoreLocal);
                 self.emit_u8(iter_slot as u8);

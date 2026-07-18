@@ -579,7 +579,23 @@ impl Interpreter {
                         Expr::Ident(name, _) => Value::str(name),
                         _ => self.eval_expr(env, k)?,
                     };
-                    let vv = self.eval_expr(env, v)?;
+                    // Preserve SharedRef when the value is a bare identifier
+                    // bound to a shared cell — otherwise the cell would be
+                    // auto-dereferenced here, breaking reference semantics
+                    // (e.g. closures capturing a shared environment).
+                    let vv = if let Expr::Ident(name, _) = v {
+                        if let Some(val) = env.borrow().get(name) {
+                            if matches!(val, Value::Shared(_)) {
+                                val
+                            } else {
+                                self.eval_expr(env, v)?
+                            }
+                        } else {
+                            self.eval_expr(env, v)?
+                        }
+                    } else {
+                        self.eval_expr(env, v)?
+                    };
                     pairs.push((kv, vv));
                 }
                 Ok(Value::map(pairs))
@@ -891,6 +907,12 @@ impl Interpreter {
                 target, name, span, ..
             } => {
                 let obj = self.eval_expr(env, target)?;
+                // Auto-deref SharedRef so `shared_map.field` reads the inner
+                // value's field (reference semantics for shared cells).
+                let obj = match &obj {
+                    Value::Shared(sref) => sref.borrow().value.clone(),
+                    _ => obj,
+                };
                 match &obj {
                     Value::Struct { fields, .. } => fields.get(name).cloned().ok_or_else(|| {
                         InterpreterError::IndexError {
@@ -1443,6 +1465,80 @@ impl Interpreter {
     }
 
     // -----------------------------------------------------------------------
+    // Dynamic evaluation (`eval`)
+    // -----------------------------------------------------------------------
+
+    /// `eval(src)` — parse `src` as 1y source and evaluate it in the
+    /// **global** environment. Returns the value of the last top-level
+    /// expression. Definitions (`let`, `fn`, `type`, `enum`, ...) persist
+    /// in the global environment across `eval` calls, mirroring a REPL.
+    ///
+    /// Design notes:
+    /// - We evaluate in the global env (not the caller's local env) because
+    ///   local envs are transient frame chains that may not survive a
+    ///   nested `eval_program` call cleanly. Globals give `eval` a stable,
+    ///   predictable target.
+    /// - Parse errors are raised as runtime errors (not returned as a
+    ///   structured `ParseError` Map like `ast_of`); callers who want
+    ///   structured error info should use `ast_of` first.
+    fn eval_src(&mut self, args: &[Value], span: Span) -> Result<Value, InterpreterError> {
+        let arg = args.first().cloned().ok_or_else(|| InterpreterError::ArityError {
+            expected: 1,
+            got: args.len(),
+            callee: "eval".into(),
+            span: Some(span),
+        })?;
+        let src = match arg {
+            Value::Str(s) => (*s).clone(),
+            other => {
+                return Err(InterpreterError::TypeError {
+                    expected: "Str",
+                    got: other.type_name(),
+                    op: "eval".into(),
+                    span: Some(span),
+                })
+            }
+        };
+        let output = crate::parser::parse(&src);
+        if !output.errors.is_empty() {
+            let e = &output.errors[0];
+            return Err(InterpreterError::RuntimeError {
+                msg: format!("eval parse error: {}", e.full_message()),
+                span: Some(span),
+            });
+        }
+        // Evaluate each statement in the global env. The last statement's
+        // value becomes the result. Definitions mutate the global env.
+        let program = &output.program;
+        let n = program.stmts.len();
+        let mut last = Value::Nil;
+        for (i, stmt) in program.stmts.iter().enumerate() {
+            // Treat the last statement as an expression statement so its
+            // value is preserved (mirrors `Interpreter::run`). Clone the
+            // global env ref first so the `&mut self` borrow is clean.
+            let g = self.global.clone();
+            let result = if i + 1 == n {
+                match stmt {
+                    Stmt::Expr(e) => self.eval_expr(&g, e),
+                    Stmt::Semi(e) => {
+                        self.eval_expr(&g, e)?;
+                        Ok(Value::Nil)
+                    }
+                    other => {
+                        self.eval_stmt(&g, other)?;
+                        Ok(Value::Nil)
+                    }
+                }
+            } else {
+                self.eval_stmt(&g, stmt)?;
+                Ok(Value::Nil)
+            };
+            last = result?;
+        }
+        Ok(last)
+    }
+
+    // -----------------------------------------------------------------------
     // Transaction (Phase 3)
     // -----------------------------------------------------------------------
 
@@ -1865,6 +1961,7 @@ impl Interpreter {
                     "reduce" => self.ho_reduce(&args, span),
                     "find" => self.ho_find(&args, span),
                     "each" => self.ho_each(&args, span),
+                    "eval" => self.eval_src(&args, span),
                     _ => (nf.func)(&args).map_err(|e| e.with_span(span)),
                 }
             }

@@ -8,6 +8,7 @@
 //!      are [`Expr`] variants.
 
 pub mod span;
+pub mod to_value;
 
 pub use span::{Pos, Span, Spanned};
 

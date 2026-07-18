@@ -275,6 +275,10 @@ pub enum Value {
 
     // --- primitives ---
     Str(Rc<String>),
+    /// Immutable byte buffer. Cheap to clone (Rc-shared). All "modifications"
+    /// return a new `Bytes` (structural sharing of the underlying `Vec<u8>`
+    /// is not implemented — byte buffers are typically small).
+    Bytes(Rc<Vec<u8>>),
     Bool(bool),
     Nil,
 
@@ -333,6 +337,10 @@ impl Value {
         Value::Str(Rc::new(s.into()))
     }
 
+    pub fn bytes(b: impl Into<Vec<u8>>) -> Self {
+        Value::Bytes(Rc::new(b.into()))
+    }
+
     pub fn vec(items: Vec<Value>) -> Self {
         Value::Vec(items.into_iter().collect())
     }
@@ -354,6 +362,7 @@ impl Value {
             Value::Int(n) => n != &BigInt::from(0),
             Value::Decimal(d) => d != &BigDecimal::from(0),
             Value::Str(s) => !s.is_empty(),
+            Value::Bytes(b) => !b.is_empty(),
             Value::Vec(v) => !v.is_empty(),
             Value::Map(m) => !m.is_empty(),
             Value::Set(s) => !s.is_empty(),
@@ -366,6 +375,7 @@ impl Value {
             Value::Int(_) => "Int",
             Value::Decimal(_) => "Decimal",
             Value::Str(_) => "String",
+            Value::Bytes(_) => "Bytes",
             Value::Bool(_) => "Bool",
             Value::Nil => "Nil",
             Value::Vec(_) => "Vec",
@@ -410,6 +420,7 @@ impl PartialEq for Value {
             (Value::Int(a), Value::Int(b)) => a == b,
             (Value::Decimal(a), Value::Decimal(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a == b,
+            (Value::Bytes(a), Value::Bytes(b)) => a == b,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Nil, Value::Nil) => true,
             (Value::Vec(a), Value::Vec(b)) => a == b,
@@ -466,6 +477,11 @@ impl Hash for Value {
             Value::Str(s) => {
                 2u8.hash(state);
                 s.hash(state);
+            }
+            Value::Bytes(b) => {
+                // Use a distinct tag that doesn't collide with Str's 2u8.
+                20u8.hash(state);
+                b.hash(state);
             }
             Value::Bool(b) => {
                 3u8.hash(state);
@@ -559,6 +575,7 @@ impl std::fmt::Display for Value {
             Value::Int(n) => write!(f, "{}", n),
             Value::Decimal(d) => write!(f, "{}", d),
             Value::Str(s) => write!(f, "\"{}\"", s),
+            Value::Bytes(b) => write!(f, "<bytes len={}>", b.len()),
             Value::Bool(b) => write!(f, "{}", b),
             Value::Nil => write!(f, "nil"),
             Value::Vec(v) => {
@@ -687,6 +704,8 @@ pub enum SendValue {
 
     // --- primitives ---
     Str(String),
+    /// Immutable byte buffer (clones the underlying Vec<u8>; u8 is Send).
+    Bytes(Vec<u8>),
     Bool(bool),
     Nil,
 
@@ -719,6 +738,7 @@ impl SendValue {
             Value::Int(n) => Ok(SendValue::Int(n.clone())),
             Value::Decimal(d) => Ok(SendValue::Decimal(d.clone())),
             Value::Str(s) => Ok(SendValue::Str((**s).clone())),
+            Value::Bytes(b) => Ok(SendValue::Bytes((**b).clone())),
             Value::Bool(b) => Ok(SendValue::Bool(*b)),
             Value::Nil => Ok(SendValue::Nil),
             Value::Vec(v) => {
@@ -785,6 +805,7 @@ impl SendValue {
             SendValue::Int(n) => Value::Int(n),
             SendValue::Decimal(d) => Value::Decimal(d),
             SendValue::Str(s) => Value::Str(Rc::new(s)),
+            SendValue::Bytes(b) => Value::Bytes(Rc::new(b)),
             SendValue::Bool(b) => Value::Bool(b),
             SendValue::Nil => Value::Nil,
             SendValue::Vec(v) => {
@@ -865,6 +886,10 @@ impl Hash for SendValue {
                 2u8.hash(state);
                 s.hash(state);
             }
+            SendValue::Bytes(b) => {
+                20u8.hash(state);
+                b.hash(state);
+            }
             SendValue::Bool(b) => {
                 3u8.hash(state);
                 b.hash(state);
@@ -913,6 +938,7 @@ impl std::fmt::Display for SendValue {
             SendValue::Int(n) => write!(f, "{}", n),
             SendValue::Decimal(d) => write!(f, "{}", d),
             SendValue::Str(s) => write!(f, "\"{}\"", s),
+            SendValue::Bytes(b) => write!(f, "<bytes len={}>", b.len()),
             SendValue::Bool(b) => write!(f, "{}", b),
             SendValue::Nil => write!(f, "nil"),
             SendValue::Vec(v) => {

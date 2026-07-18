@@ -253,3 +253,81 @@ let h = c.sha256("x");
 ```
 
 标准库刻意保持精简——只收录跨平台、无外部依赖的基础能力。更专用的功能（数据库驱动、HTTP 框架等）留给生态以第三方包形式提供，而与操作系统底层的交互则通过 `ffi` 直接调用动态库实现。
+
+## 全局内置函数
+
+除了上述 10 个模块，1y 还内置一组**全局函数**——无需 `import` 即可调用。完整说明见 [反射与动态求值](./introspection)，下面按用途分类给出索引。
+
+### I/O 与打印
+
+| 函数 | 作用 |
+|------|------|
+| `println(v)` / `print(v)` | 打印值到 stdout（println 带换行） |
+
+### 集合操作
+
+| 函数 | 作用 |
+|------|------|
+| `count(coll)` | 元素数量（Vec/Map/Set/Str） |
+| `first(coll)` / `rest(coll)` | 首元素 / 去掉首元素后的集合 |
+| `cons(x, xs)` / `push(xs, x)` | 头部 / 尾部追加 |
+| `get(coll, k)` / `has_key(m, k)` | 索引取值 / Map 键存在性 |
+| `assoc(m, k, v)` / `dissoc(m, k)` | Map 添加 / 删除键 |
+| `iter_to_vec(iterable)` | 任意可迭代值物化为 Vec |
+| `keys(m)` / `values(m)` / `fields(struct)` | Map/Struct 的键 / 值 / 字段对 |
+
+### 类型谓词与反射
+
+| 函数 | 作用 |
+|------|------|
+| `is_int` / `is_decimal` / `is_str` / `is_bool` / `is_nil` / `is_vec` / `is_map` / `is_set` / `is_number` / `is_func` / `is_closure` | 类型判断 |
+| `type_of(v)` | 类型名字符串 |
+| `instance_of(v, name)` | 类型名匹配（带 Str↔String、Func↔Closure 规范化） |
+| `variant_name(v)` / `variant_args(v)` | Variant 构造器名 / 携带参数 |
+| `ast_of(src)` | 把源码字符串解析成 AST 数据 |
+| `eval(src)` | 动态求值源码字符串 |
+
+### 算术与数值
+
+| 函数 | 作用 |
+|------|------|
+| `pow(a, b)` / `abs(n)` | 幂 / 绝对值 |
+| `min(a, b)` / `max(a, b)` | 较小 / 较大值 |
+| `floor` / `ceil` / `round` / `sqrt` / `sin` / `cos` / `log` / `exp` | 数学函数 |
+| `to_i64(v)` / `to_f64(v)` / `int(v)` / `decimal(v)` | 数值转换 |
+
+### 字符串
+
+| 函数 | 作用 |
+|------|------|
+| `len(s)` / `split(s, sep)` / `join(xs, sep)` | 长度 / 分割 / 拼接 |
+| `replace(s, a, b)` / `trim(s)` / `contains(s, sub)` | 替换 / 去空白 / 包含 |
+| `substring(s, start, end)` | 子串 |
+| `starts_with` / `ends_with` / `index_of` / `char_at` / `codepoint_at` / `from_codepoint` | 其他字符串操作 |
+| `byte_at(s, i)` / `byte_len(s)` | 字节级访问 |
+| `to_lower(s)` / `to_upper(s)` | 大小写转换 |
+| `is_digit(c)` / `is_alpha(c)` / `is_space(c)` | 字符分类 |
+
+### 高阶函数
+
+| 函数 | 作用 |
+|------|------|
+| `map(f, xs)` / `filter(pred, xs)` / `fold(f, init, xs)` / `reduce(f, xs)` / `find(pred, xs)` / `each(f, xs)` | 列表变换 |
+
+### 转换
+
+| 函数 | 作用 |
+|------|------|
+| `str(v)` / `to_str(v)` | 转字符串 |
+
+### Task 组合子
+
+| 函数 | 作用 |
+|------|------|
+| `task_all(tasks)` / `task_any(tasks)` / `task_ready(t)` | 异步组合（见 [Tasks](#tasks)） |
+
+### Actor 内省
+
+| 函数 | 作用 |
+|------|------|
+| `pid_of(actor)` | 返回 actor 的 Pid（u64） |

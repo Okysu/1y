@@ -1,0 +1,99 @@
+// eval(src) smoke test.
+//
+// Verifies that:
+//   - eval returns the value of the last top-level expression
+//   - definitions made inside eval persist in the global env
+//   - multi-statement programs work
+//   - an uncaught `raise` inside eval is catchable by `rescue`
+//   - empty program returns Nil
+//
+// Note: `try/rescue` only catches `raise`-d (UserException) errors, not
+// runtime errors like type errors or parse errors — this matches the
+// tree-walker's semantics.
+
+println("--- basic expression ---");
+let r1 = eval("1 + 2 * 3");
+println("eval(\"1 + 2 * 3\") = " + str(r1));
+
+let r2 = eval("\"hello\" + \" world\"");
+println("eval(string concat) = " + str(r2));
+
+println("");
+println("--- multi-statement (last expr wins) ---");
+let r3 = eval("let x = 10; let y = 20; x + y");
+println("eval(multi-stmt) = " + str(r3));
+
+println("");
+println("--- definitions persist in globals ---");
+eval("fn ev_square(n) \{ n * n \}");
+println("after eval, ev_square(5) = " + str(ev_square(5)));
+
+eval("let ev_global_val = 42;");
+println("after eval, ev_global_val = " + str(ev_global_val));
+
+println("");
+println("--- eval using existing globals ---");
+let ev_base = 100;
+let r4 = eval("ev_base + 1");
+println("eval sees global ev_base: " + str(r4));
+
+println("");
+println("--- eval with closures ---");
+let r5 = eval("fn make_adder(n) \{ fn(x) \{ x + n \} \}; let a = make_adder(10); a(5)");
+println("eval closure = " + str(r5));
+
+println("");
+println("--- nested eval ---");
+let r6 = eval("eval(\"1 + 1\") + 1");
+println("nested eval = " + str(r6));
+
+println("");
+println("--- raise inside eval is catchable ---");
+try {
+    eval("raise(\"boom from eval\")");
+    println("ERROR: should have raised");
+} rescue as e {
+    println("caught raised error: " + str(e));
+}
+
+println("");
+println("--- eval recognizes outer-scope enum variants ---");
+enum EvError { Bad(String), NoArgs, WithTwo(Int, Int) }
+let v1 = eval("Bad(\"from eval\")");
+println("variant_name: " + variant_name(v1));
+println("variant_args: " + str(variant_args(v1)));
+
+let v2 = eval("NoArgs");
+println("zero-arity variant: " + variant_name(v2));
+
+let v3 = eval("WithTwo(3, 4)");
+println("two-arg variant args: " + str(variant_args(v3)));
+
+try {
+    eval("raise(Bad(\"nested variant raise\"))");
+    println("ERROR: should have raised");
+} rescue as e {
+    println("caught variant raise: " + str(variant_name(e)) + " / " + str(variant_args(e)));
+}
+
+println("");
+println("--- eval recognizes outer-scope struct type ---");
+type EvPoint = \{ x: Int, y: Int \};
+let p = eval("EvPoint(\{ x: 10, y: 20 \})");
+println("type_of(p): " + type_of(p));
+println("instance_of(p, \"EvPoint\"): " + str(instance_of(p, "EvPoint")));
+println("fields(p): " + str(fields(p)));
+println("values(p): " + str(values(p)));
+
+println("");
+println("--- empty program returns Nil ---");
+let r7 = eval("");
+println("eval(\"\") = " + str(r7) + " (is_nil: " + str(is_nil(r7)) + ")");
+
+println("");
+println("--- eval inside eval (deep nesting) ---");
+let r8 = eval("eval(\"1 + 2\")");
+println("eval(eval(1+2)) = " + str(r8));
+
+println("");
+println("All eval tests done.");

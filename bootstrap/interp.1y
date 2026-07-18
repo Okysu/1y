@@ -1,0 +1,715 @@
+// ============================================================
+// 1y self-hosting Stage 1: a tree-walking interpreter for a
+// subset of 1y, written in 1y itself.
+//
+// Supported subset:
+//   - literals: Int, Str, Bool (true/false), Nil
+//   - identifiers
+//   - binary ops: + - * / == != < > <= >=
+//   - logical: and or not
+//   - if/else expressions
+//   - let bindings
+//   - fn definitions (with closures)
+//   - function calls
+//   - block expressions { stmt; ...; expr }
+//   - Vec literals [a, b, c]
+//   - println builtin
+//
+// AST nodes are represented as Maps:
+//   { "type": "int", "value": 42 }
+//   { "type": "str", "value": "hi" }
+//   { "type": "bool", "value": true }
+//   { "type": "nil" }
+//   { "type": "ident", "name": "x" }
+//   { "type": "binop", "op": "+", "lhs": ..., "rhs": ... }
+//   { "type": "if", "cond": ..., "then": ..., "else": ... }
+//   { "type": "let", "name": "x", "value": ... }
+//   { "type": "fn", "params": [...], "body": ... }
+//   { "type": "call", "callee": ..., "args": [...] }
+//   { "type": "block", "stmts": [...] }
+//   { "type": "vec", "items": [...] }
+//
+// Environment is a linked Map:
+//   { "vars": {name -> value}, "parent": nil_or_env }
+//
+// Closures are tagged values:
+//   { "__closure__": true, "params": [...], "body": ..., "env": ... }
+// ============================================================
+
+// ---------- Lexer ----------
+
+// Token: { "kind": "int"/"str"/"ident"/"kw"/"op"/"eof", "value": ... }
+fn lex(src) {
+    let tokens = [];
+    let i = 0;
+    let n = byte_len(src);
+    loop {
+        // skip whitespace
+        while i < n and is_space(char_at(src, i)) {
+            i = i + 1;
+        };
+        if i >= n { break };
+        let c = char_at(src, i);
+
+        // line comment: // ...
+        if c == "/" and i + 1 < n and char_at(src, i + 1) == "/" {
+            while i < n and char_at(src, i) != "\n" {
+                i = i + 1;
+            };
+            continue;
+        };
+
+        // number
+        if is_digit(c) {
+            let start = i;
+            while i < n and is_digit(char_at(src, i)) {
+                i = i + 1;
+            };
+            tokens = push(tokens, { "kind": "int", "value": str_to_int(substring(src, start, i)) });
+            continue;
+        };
+
+        // string
+        if c == "\"" {
+            i = i + 1;
+            let buf = "";
+            while i < n and char_at(src, i) != "\"" {
+                let ch = char_at(src, i);
+                if ch == "\\" and i + 1 < n {
+                    let next = char_at(src, i + 1);
+                    if next == "n" { buf = buf + "\n" }
+                    else if next == "t" { buf = buf + "\t" }
+                    else if next == "\\" { buf = buf + "\\" }
+                    else if next == "\"" { buf = buf + "\"" }
+                    else { buf = buf + next };
+                    i = i + 2;
+                } else {
+                    buf = buf + ch;
+                    i = i + 1;
+                }
+            };
+            i = i + 1;  // skip closing "
+            tokens = push(tokens, { "kind": "str", "value": buf });
+            continue;
+        };
+
+        // identifier / keyword
+        if is_alpha(c) or c == "_" {
+            let start = i;
+            while i < n and (is_alpha(char_at(src, i)) or is_digit(char_at(src, i)) or char_at(src, i) == "_") {
+                i = i + 1;
+            };
+            let word = substring(src, start, i);
+            if is_keyword(word) {
+                tokens = push(tokens, { "kind": "kw", "value": word });
+            } else {
+                tokens = push(tokens, { "kind": "ident", "value": word });
+            };
+            continue;
+        };
+
+        // two-char operators
+        if i + 1 < n {
+            let two = c + char_at(src, i + 1);
+            if two == "==" or two == "!=" or two == "<=" or two == ">=" {
+                tokens = push(tokens, { "kind": "op", "value": two });
+                i = i + 2;
+                continue;
+            }
+        };
+
+        // single-char operators / punctuation
+        if c == "+" or c == "-" or c == "*" or c == "/" or c == "<" or c == ">" or c == "="
+            or c == "(" or c == ")" or c == "\{" or c == "}" or c == "[" or c == "]"
+            or c == "," or c == ";" {
+            tokens = push(tokens, { "kind": "op", "value": c });
+            i = i + 1;
+            continue;
+        };
+
+        // unknown char: skip with error marker
+        print("lex: skipping unknown char: " + c);
+        i = i + 1;
+    };
+    push(tokens, { "kind": "eof", "value": "" })
+}
+
+fn is_keyword(w) {
+    w == "let" or w == "fn" or w == "if" or w == "else" or w == "true"
+        or w == "false" or w == "nil" or w == "and" or w == "or" or w == "not"
+        or w == "return"
+}
+
+fn str_to_int(s) {
+    let result = 0;
+    let i = 0;
+    let n = len(s);
+    while i < n {
+        let c = char_at(s, i);
+        let d = codepoint_at(c, 0) - 48;  // '0' = 48
+        result = result * 10 + d;
+        i = i + 1;
+    };
+    result
+}
+
+// ---------- Parser ----------
+
+// Parser state: { "tokens": [...], "pos": 0 }
+fn parse_program(tokens) {
+    let stmts = [];
+    let p = shared { "tokens": tokens, "pos": 0 };
+    while not at_eof(p) {
+        stmts = push(stmts, parse_stmt(p));
+    };
+    { "type": "program", "stmts": stmts }
+}
+
+fn at_eof(p) {
+    let t = p.tokens[p.pos];
+    t.kind == "eof"
+}
+
+fn peek(p) {
+    p.tokens[p.pos]
+}
+
+fn advance(p) {
+    let t = p.tokens[p.pos];
+    p.pos = p.pos + 1;
+    t
+}
+
+fn expect_op(p, op) {
+    let t = peek(p);
+    if t.kind == "op" and t.value == op {
+        advance(p)
+    } else {
+        print("parse error: expected '" + op + "', found: " + to_str(t));
+        nil
+    }
+}
+
+fn match_op(p, op) {
+    let t = peek(p);
+    if t.kind == "op" and t.value == op {
+        advance(p);
+        true
+    } else {
+        false
+    }
+}
+
+fn match_kw(p, kw) {
+    let t = peek(p);
+    if t.kind == "kw" and t.value == kw {
+        advance(p);
+        true
+    } else {
+        false
+    }
+}
+
+fn parse_stmt(p) {
+    if match_kw(p, "let") {
+        let name = advance(p).value;  // ident
+        expect_op(p, "=");
+        let value = parse_expr(p);
+        match_op(p, ";");
+        { "type": "let", "name": name, "value": value }
+    } else if match_kw(p, "fn") {
+        let name = advance(p).value;  // ident
+        let params = parse_params(p);
+        let body = parse_block(p);
+        match_op(p, ";");
+        { "type": "fn", "name": name, "params": params, "body": body }
+    } else {
+        let e = parse_expr(p);
+        match_op(p, ";");
+        { "type": "expr", "expr": e }
+    }
+}
+
+fn parse_params(p) {
+    expect_op(p, "(");
+    let params = [];
+    if not (peek(p).kind == "op" and peek(p).value == ")") {
+        params = push(params, advance(p).value);
+        while match_op(p, ",") {
+            params = push(params, advance(p).value);
+        }
+    };
+    expect_op(p, ")");
+    params
+}
+
+fn parse_block(p) {
+    expect_op(p, "\{");
+    let stmts = [];
+    while not (peek(p).kind == "op" and peek(p).value == "}") {
+        stmts = push(stmts, parse_stmt(p));
+    };
+    expect_op(p, "}");
+    { "type": "block", "stmts": stmts }
+}
+
+// Expression grammar (lowest to highest precedence):
+//   expr      := or_expr
+//   or_expr   := and_expr ("or" and_expr)*
+//   and_expr  := not_expr ("and" not_expr)*
+//   not_expr  := "not" not_expr | cmp_expr
+//   cmp_expr  := add_expr (("=="|"!="|"<"|">"|"<="|">=") add_expr)?
+//   add_expr  := mul_expr (("+"|"-") mul_expr)*
+//   mul_expr  := unary (("*"|"/") unary)*
+//   unary     := "-" unary | atom
+//   atom      := int | str | true | false | nil | ident | call | "(" expr ")" | block | vec
+
+fn parse_expr(p) {
+    parse_or(p)
+}
+
+fn parse_or(p) {
+    let lhs = parse_and(p);
+    let result = lhs;
+    while match_kw(p, "or") {
+        let rhs = parse_and(p);
+        result = { "type": "binop", "op": "or", "lhs": result, "rhs": rhs };
+    };
+    result
+}
+
+fn parse_and(p) {
+    let lhs = parse_not(p);
+    let result = lhs;
+    while match_kw(p, "and") {
+        let rhs = parse_not(p);
+        result = { "type": "binop", "op": "and", "lhs": result, "rhs": rhs };
+    };
+    result
+}
+
+fn parse_not(p) {
+    if match_kw(p, "not") {
+        let operand = parse_not(p);
+        { "type": "unop", "op": "not", "operand": operand }
+    } else {
+        parse_cmp(p)
+    }
+}
+
+fn parse_cmp(p) {
+    let lhs = parse_add(p);
+    let t = peek(p);
+    if t.kind == "op" and (t.value == "==" or t.value == "!=" or t.value == "<"
+        or t.value == ">" or t.value == "<=" or t.value == ">=") {
+        advance(p);
+        let rhs = parse_add(p);
+        { "type": "binop", "op": t.value, "lhs": lhs, "rhs": rhs }
+    } else {
+        lhs
+    }
+}
+
+fn parse_add(p) {
+    let lhs = parse_mul(p);
+    let result = lhs;
+    loop {
+        let t = peek(p);
+        if t.kind == "op" and (t.value == "+" or t.value == "-") {
+            advance(p);
+            let rhs = parse_mul(p);
+            result = { "type": "binop", "op": t.value, "lhs": result, "rhs": rhs };
+        } else {
+            break
+        }
+    };
+    result
+}
+
+fn parse_mul(p) {
+    let lhs = parse_unary(p);
+    let result = lhs;
+    loop {
+        let t = peek(p);
+        if t.kind == "op" and (t.value == "*" or t.value == "/") {
+            advance(p);
+            let rhs = parse_unary(p);
+            result = { "type": "binop", "op": t.value, "lhs": result, "rhs": rhs };
+        } else {
+            break
+        }
+    };
+    result
+}
+
+fn parse_unary(p) {
+    if peek(p).kind == "op" and peek(p).value == "-" {
+        advance(p);
+        let operand = parse_unary(p);
+        { "type": "unop", "op": "neg", "operand": operand }
+    } else {
+        parse_atom(p)
+    }
+}
+
+fn parse_atom(p) {
+    let t = peek(p);
+    if t.kind == "int" {
+        advance(p);
+        { "type": "int", "value": t.value }
+    } else if t.kind == "str" {
+        advance(p);
+        { "type": "str", "value": t.value }
+    } else if t.kind == "kw" and t.value == "true" {
+        advance(p);
+        { "type": "bool", "value": true }
+    } else if t.kind == "kw" and t.value == "false" {
+        advance(p);
+        { "type": "bool", "value": false }
+    } else if t.kind == "kw" and t.value == "nil" {
+        advance(p);
+        { "type": "nil" }
+    } else if t.kind == "kw" and t.value == "if" {
+        parse_if(p)
+    } else if t.kind == "kw" and t.value == "fn" {
+        // anonymous fn
+        advance(p);  // consume "fn"
+        let params = parse_params(p);
+        let body = parse_block(p);
+        { "type": "fn", "params": params, "body": body }
+    } else if t.kind == "ident" {
+        advance(p);
+        let name = t.value;
+        // function call?
+        if peek(p).kind == "op" and peek(p).value == "(" {
+            let args = parse_args(p);
+            { "type": "call", "callee": { "type": "ident", "name": name }, "args": args }
+        } else {
+            { "type": "ident", "name": name }
+        }
+    } else if t.kind == "op" and t.value == "(" {
+        advance(p);
+        let e = parse_expr(p);
+        expect_op(p, ")");
+        e
+    } else if t.kind == "op" and t.value == "\{" {
+        parse_block(p)
+    } else if t.kind == "op" and t.value == "[" {
+        advance(p);
+        let items = [];
+        if not (peek(p).kind == "op" and peek(p).value == "]") {
+            items = push(items, parse_expr(p));
+            while match_op(p, ",") {
+                items = push(items, parse_expr(p));
+            }
+        };
+        expect_op(p, "]");
+        { "type": "vec", "items": items }
+    } else {
+        print("parse error: unexpected token: " + to_str(t));
+        advance(p);
+        { "type": "nil" }
+    }
+}
+
+fn parse_args(p) {
+    expect_op(p, "(");
+    let args = [];
+    if not (peek(p).kind == "op" and peek(p).value == ")") {
+        args = push(args, parse_expr(p));
+        while match_op(p, ",") {
+            args = push(args, parse_expr(p));
+        }
+    };
+    expect_op(p, ")");
+    args
+}
+
+fn parse_if(p) {
+    advance(p);  // consume "if"
+    let cond = parse_expr(p);
+    let then_branch = parse_block(p);
+    let else_branch = nil;
+    if match_kw(p, "else") {
+        if peek(p).kind == "kw" and peek(p).value == "if" {
+            else_branch = parse_if(p);
+        } else {
+            else_branch = parse_block(p);
+        }
+    };
+    { "type": "if", "cond": cond, "then": then_branch, "else": else_branch }
+}
+
+// ---------- Evaluator ----------
+
+fn new_env(parent) {
+    shared { "vars": {}, "parent": parent }
+}
+
+fn env_lookup(env, name) {
+    if env == nil {
+        print("error: undefined variable: " + name);
+        nil
+    } else if has_key(env.vars, name) {
+        env.vars[name]
+    } else {
+        env_lookup(env.parent, name)
+    }
+}
+
+fn env_lookup_dbg(env, name) {
+    print("lookup " + name + " in env vars=" + to_str(env.vars) + "\n");
+    if env == nil {
+        print("  env is nil\n");
+        nil
+    } else if has_key(env.vars, name) {
+        print("  found\n");
+        env.vars[name]
+    } else {
+        print("  not found, go parent\n");
+        env_lookup_dbg(env.parent, name)
+    }
+}
+
+fn env_define(env, name, value) {
+    env.vars = assoc(env.vars, name, value)
+}
+
+fn eval_program(prog, env) {
+    let result = nil;
+    let i = 0;
+    let stmts = prog.stmts;
+    let n = count(stmts);
+    while i < n {
+        result = eval_stmt(stmts[i], env);
+        i = i + 1;
+    };
+    result
+}
+
+fn eval_stmt(stmt, env) {
+    if stmt.type == "let" {
+        let v = eval_expr(stmt.value, env);
+        env_define(env, stmt.name, v);
+        nil
+    } else if stmt.type == "fn" {
+        let closure = { "__closure__": true, "params": stmt.params, "body": stmt.body, "env": env };
+        env_define(env, stmt.name, closure);
+        nil
+    } else if stmt.type == "expr" {
+        eval_expr(stmt.expr, env)
+    } else {
+        print("unknown stmt type: " + to_str(stmt.type));
+        nil
+    }
+}
+
+fn eval_expr(node, env) {
+    let t = node.type;
+    if t == "int" {
+        node.value
+    } else if t == "str" {
+        node.value
+    } else if t == "bool" {
+        node.value
+    } else if t == "nil" {
+        nil
+    } else if t == "ident" {
+        env_lookup(env, node.name)
+    } else if t == "binop" {
+        eval_binop(node, env)
+    } else if t == "unop" {
+        eval_unop(node, env)
+    } else if t == "if" {
+        let c = eval_expr(node.cond, env);
+        if is_truthy(c) {
+            eval_block(node.then, env)
+        } else if node.else != nil {
+            eval_expr(node.else, env)
+        } else {
+            nil
+        }
+    } else if t == "block" {
+        eval_block(node, env)
+    } else if t == "fn" {
+        { "__closure__": true, "params": node.params, "body": node.body, "env": env }
+    } else if t == "call" {
+        eval_call(node, env)
+    } else if t == "vec" {
+        eval_vec(node, env)
+    } else {
+        print("eval: unknown node type: " + to_str(t));
+        nil
+    }
+}
+
+fn eval_binop(node, env) {
+    let op = node.op;
+    // short-circuit
+    if op == "and" {
+        let l = eval_expr(node.lhs, env);
+        if not is_truthy(l) { l } else { eval_expr(node.rhs, env) }
+    } else if op == "or" {
+        let l = eval_expr(node.lhs, env);
+        if is_truthy(l) { l } else { eval_expr(node.rhs, env) }
+    } else {
+        let l = eval_expr(node.lhs, env);
+        let r = eval_expr(node.rhs, env);
+        if op == "+" { l + r }
+        else if op == "-" { l - r }
+        else if op == "*" { l * r }
+        else if op == "/" { l / r }
+        else if op == "==" { l == r }
+        else if op == "!=" { l != r }
+        else if op == "<" { l < r }
+        else if op == ">" { l > r }
+        else if op == "<=" { l <= r }
+        else if op == ">=" { l >= r }
+        else {
+            print("unknown op: " + op);
+            nil
+        }
+    }
+}
+
+fn eval_unop(node, env) {
+    let v = eval_expr(node.operand, env);
+    if node.op == "neg" { 0 - v }
+    else if node.op == "not" {
+        if is_truthy(v) { false } else { true }
+    } else {
+        print("unknown unop: " + node.op);
+        nil
+    }
+}
+
+fn eval_block(block, env) {
+    // block introduces a new scope
+    let inner = new_env(env);
+    let result = nil;
+    let i = 0;
+    let stmts = block.stmts;
+    let n = count(stmts);
+    while i < n {
+        result = eval_stmt(stmts[i], inner);
+        i = i + 1;
+    };
+    result
+}
+
+fn eval_call(node, env) {
+    let callee = eval_expr(node.callee, env);
+    let args = eval_args(node.args, env);
+    if is_closure(callee) {
+        apply_closure(callee, args)
+    } else if is_native(callee) {
+        callee(args)
+    } else {
+        print("error: cannot call non-function: " + to_str(callee));
+        nil
+    }
+}
+
+fn is_closure(v) {
+    is_map(v) and has_key(v, "__closure__")
+}
+
+fn is_native(v) {
+    is_func(v)
+}
+
+fn apply_closure(closure, args) {
+    let call_env = new_env(closure.env);
+    let params = closure.params;
+    let i = 0;
+    let n = count(params);
+    while i < n {
+        env_define(call_env, params[i], args[i]);
+        i = i + 1;
+    };
+    eval_block(closure.body, call_env)
+}
+
+fn eval_args(args, env) {
+    let result = [];
+    let i = 0;
+    let n = count(args);
+    while i < n {
+        result = push(result, eval_expr(args[i], env));
+        i = i + 1;
+    };
+    result
+}
+
+fn eval_vec(node, env) {
+    let result = [];
+    let i = 0;
+    let n = count(node.items);
+    while i < n {
+        result = push(result, eval_expr(node.items[i], env));
+        i = i + 1;
+    };
+    result
+}
+
+fn is_truthy(v) {
+    if v == nil { false }
+    else if v == false { false }
+    else if is_int(v) and v == 0 { false }
+    else { true }
+}
+
+// ---------- Builtin println ----------
+
+fn builtin_println(args) {
+    if count(args) == 0 {
+        print("\n")
+    } else {
+        print(to_str(args[0]) + "\n")
+    }
+}
+
+fn builtin_print(args) {
+    if count(args) >= 1 {
+        print(to_str(args[0]))
+    };
+    nil
+}
+
+// ---------- Top-level run ----------
+
+fn run(src) {
+    let tokens = lex(src);
+    let prog = parse_program(tokens);
+    let env = new_env(nil);
+    env_define(env, "println", builtin_println);
+    env_define(env, "print", builtin_print);
+    eval_program(prog, env)
+}
+
+// ---------- Self-test ----------
+// This program is itself run by the host 1y. It also contains an `src`
+// string that another (subset) 1y program is written in; we run that
+// program via `run(src)` to prove 1y can interpret 1y.
+
+let demo = "let x = 10;
+let y = 20;
+fn add(a, b) \{ a + b \}
+fn fib(n) \{
+    if n < 2 \{ n \} else \{ fib(n - 1) + fib(n - 2) \}
+\}
+println(fib(10));
+println(x + y);
+println(add(3, 4));
+let arr = [1, 2, 3];
+println(arr);
+";
+
+println("--- running 1y-in-1y tree-walker ---");
+let tokens = lex(demo);
+let prog = parse_program(tokens);
+let env = new_env(nil);
+env_define(env, "println", builtin_println);
+env_define(env, "print", builtin_print);
+eval_program(prog, env);
+println("--- done ---");

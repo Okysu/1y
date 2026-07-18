@@ -253,3 +253,81 @@ let h = c.sha256("x");
 ```
 
 The standard library is deliberately lean — it includes only cross-platform, dependency-free basics. More specialized capabilities (database drivers, HTTP frameworks, etc.) are left to the ecosystem as third-party packages, while low-level interaction with the operating system is achieved through `ffi` by calling dynamic libraries directly.
+
+## Global Built-in Functions
+
+In addition to the 10 modules above, 1y ships a set of **global functions** — callable without `import`. Full descriptions in [Reflection & Dynamic Evaluation](./introspection); below is an index by category.
+
+### I/O
+
+| Function | Effect |
+|----------|--------|
+| `println(v)` / `print(v)` | print to stdout (println adds newline) |
+
+### Collection operations
+
+| Function | Effect |
+|----------|--------|
+| `count(coll)` | element count (Vec/Map/Set/Str) |
+| `first(coll)` / `rest(coll)` | first element / collection without first |
+| `cons(x, xs)` / `push(xs, x)` | prepend / append |
+| `get(coll, k)` / `has_key(m, k)` | index lookup / Map key existence |
+| `assoc(m, k, v)` / `dissoc(m, k)` | Map add / remove key |
+| `iter_to_vec(iterable)` | materialize any iterable as a Vec |
+| `keys(m)` / `values(m)` / `fields(struct)` | Map/Struct keys / values / field pairs |
+
+### Type predicates & reflection
+
+| Function | Effect |
+|----------|--------|
+| `is_int` / `is_decimal` / `is_str` / `is_bool` / `is_nil` / `is_vec` / `is_map` / `is_set` / `is_number` / `is_func` / `is_closure` | type tests |
+| `type_of(v)` | type name string |
+| `instance_of(v, name)` | type-name match (with Str↔String, Func↔Closure normalization) |
+| `variant_name(v)` / `variant_args(v)` | Variant constructor name / carried values |
+| `ast_of(src)` | parse source string into AST data |
+| `eval(src)` | dynamically evaluate a source string |
+
+### Arithmetic & numbers
+
+| Function | Effect |
+|----------|--------|
+| `pow(a, b)` / `abs(n)` | power / absolute value |
+| `min(a, b)` / `max(a, b)` | smaller / larger |
+| `floor` / `ceil` / `round` / `sqrt` / `sin` / `cos` / `log` / `exp` | math functions |
+| `to_i64(v)` / `to_f64(v)` / `int(v)` / `decimal(v)` | numeric conversions |
+
+### Strings
+
+| Function | Effect |
+|----------|--------|
+| `len(s)` / `split(s, sep)` / `join(xs, sep)` | length / split / join |
+| `replace(s, a, b)` / `trim(s)` / `contains(s, sub)` | replace / trim / contains |
+| `substring(s, start, end)` | substring |
+| `starts_with` / `ends_with` / `index_of` / `char_at` / `codepoint_at` / `from_codepoint` | other string ops |
+| `byte_at(s, i)` / `byte_len(s)` | byte-level access |
+| `to_lower(s)` / `to_upper(s)` | case conversion |
+| `is_digit(c)` / `is_alpha(c)` / `is_space(c)` | character classification |
+
+### Higher-order functions
+
+| Function | Effect |
+|----------|--------|
+| `map(f, xs)` / `filter(pred, xs)` / `fold(f, init, xs)` / `reduce(f, xs)` / `find(pred, xs)` / `each(f, xs)` | list transformations |
+
+### Conversions
+
+| Function | Effect |
+|----------|--------|
+| `str(v)` / `to_str(v)` | to string |
+
+### Task combinators
+
+| Function | Effect |
+|----------|--------|
+| `task_all(tasks)` / `task_any(tasks)` / `task_ready(t)` | async composition (see [Tasks](#tasks)) |
+
+### Actor introspection
+
+| Function | Effect |
+|----------|--------|
+| `pid_of(actor)` | return the actor's Pid (u64) |

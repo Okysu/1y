@@ -1,0 +1,41 @@
+// Introspection functions smoke test.
+
+println("--- keys/values/fields ---");
+let m = { "a": 1, "b": 2, "c": 3 };
+println("keys: " + str(keys(m)));
+println("values: " + str(values(m)));
+
+type Point = { x: Int, y: Int };
+let p = Point({ x: 10, y: 20 });
+println("type_of(p): " + type_of(p));
+println("keys(p): " + str(keys(p)));
+println("values(p): " + str(values(p)));
+println("fields(p): " + str(fields(p)));
+
+println("");
+println("--- variant_name / variant_args ---");
+enum Option { Some(v), None }
+let s = Some(42);
+let n = None;
+println("variant_name(Some(42)): " + variant_name(s));
+println("variant_args(Some(42)): " + str(variant_args(s)));
+println("variant_name(None): " + variant_name(n));
+println("variant_args(None): " + str(variant_args(n)));
+
+println("");
+println("--- instance_of ---");
+println("instance_of(Some(42), \"Some\"): " + str(instance_of(s, "Some")));
+println("instance_of(Some(42), \"None\"): " + str(instance_of(s, "None")));
+println("instance_of(p, \"Point\"): " + str(instance_of(p, "Point")));
+println("instance_of(42, \"Int\"): " + str(instance_of(42, "Int")));
+println("instance_of(42, \"Str\"): " + str(instance_of(42, "Str")));
+println("instance_of(\"hi\", \"Str\"): " + str(instance_of("hi", "Str")));
+
+println("");
+println("--- is_closure ---");
+fn add(a, b) { a + b };
+println("is_closure(add): " + str(is_closure(add)));
+println("is_closure(println): " + str(is_closure(println)));
+println("is_closure(42): " + str(is_closure(42)));
+println("is_func(add): " + str(is_func(add)));
+println("is_func(println): " + str(is_func(println)));

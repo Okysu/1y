@@ -4,15 +4,21 @@
 
 > A streaming, concurrent, functional programming language implemented in Rust.
 
-`1y` (pronounced "one-why") is a tree-walking interpreted language that
-brings together persistent data structures, pattern matching, actor-based
-concurrency, software transactional memory (STM), and a pragmatic module
-system — all backed by arbitrary-precision arithmetic.
+`1y` (pronounced "one-why") is a language with **two execution backends** — a
+tree-walking interpreter and a stack-based bytecode VM — that brings together
+persistent data structures, pattern matching, actor-based concurrency,
+software transactional memory (STM), Zig-style colorless async, and a
+pragmatic module system, all backed by arbitrary-precision arithmetic. It
+also ships **runtime reflection** (`ast_of`, `eval`, type predicates) that
+forms the foundation of an in-progress self-bootstrapping effort.
 
 ---
 
 ## Highlights
 
+- **Two execution backends** — a bytecode VM (default, `1y <file>`) with
+  heap-allocated call frames that survives `fib_memo(100000)` without stack
+  growth, plus a tree-walker (`1y run <file>`) for debugging and comparison.
 - **Arbitrary-precision numbers** — integers and decimals never overflow.
   `fact(500)` returns a 1135-digit number natively.
 - **Persistent collections** — `Vec`, `Map`, `Set` are immutable and
@@ -24,8 +30,16 @@ system — all backed by arbitrary-precision arithmetic.
   actors.
 - **Software Transactional Memory** — `shared` cells + `transact` blocks
   with snapshot isolation, atomic commit, rollback, nesting, and `retry`.
+- **Colorless async (Zig-style)** — `await` works inside any function
+  without `async` coloring; corosensei stackful coroutines drive the
+  scheduler so `accept_async` and slow handlers progress concurrently.
 - **Module system** — `import` standard libraries or your own `.1y` files;
   `lazy import` defers loading until first access; circular-import detection.
+- **Reflection & dynamic evaluation** — `eval(src)` executes 1y source
+  strings sharing the caller's globals and type table; `ast_of(src)`
+  returns the parsed AST as data; `type_of` / `instance_of` /
+  `variant_name` / `variant_args` / `keys` / `values` / `fields` round out
+  the introspection surface.
 - **Standard library** — `io`, `json`, `env`, `process`, `random`,
   `socket` (TCP), `serial` (RS-232), `crypto` (SHA/HMAC/base64/CSPRNG),
   `tls` (rustls), `ffi` (dynamic library loading via `libloading`).
@@ -47,13 +61,15 @@ cargo build --release
 ### Hello World
 
 ```bash
-1y run -e 'println("Hello, World!")'
+1y -e 'println("Hello, World!")'          # VM (default)
+1y run -e 'println("Hello, World!")'      # tree-walker
 ```
 
 ### Run a file
 
 ```bash
-1y run examples/phase1.1y
+1y examples/phase1.1y                     # VM (default)
+1y run examples/phase1.1y                 # tree-walker
 ```
 
 ### REPL
@@ -110,6 +126,13 @@ import io
 import json
 import utils.math as m       // loads <entry_dir>/utils/math.1y
 lazy import heavy_lib        // loaded on first use
+
+// Reflection & dynamic evaluation.
+let ast = ast_of("1 + 2");   // { "type": "Program", "stmts": [...] }
+eval("let x = 10; x * 2");   // 20 — definitions persist into globals
+enum EvError { Bad(String) }
+let v = eval("Bad(\"boom\")");
+variant_name(v);             // "Bad"
 ```
 
 ---
@@ -125,6 +148,29 @@ lazy import heavy_lib        // loaded on first use
 | `examples/phase4.5.1y` | Crypto (SHA/HMAC/base64), TLS client, FFI stubs |
 | `examples/phase4.6.1y` | Real FFI: load shared libraries, call native functions |
 | `examples/bench.1y` | Benchmark suite: fib, factorial, loops, collections, JSON |
+| `bootstrap/interp.1y` | **Self-bootstrap phase 1**: a 1y tree-walker written in 1y |
+| `bootstrap/test_eval.1y` | `eval` / `ast_of` / introspection test suite |
+
+---
+
+## Self-Bootstrapping Roadmap
+
+1y aims to eventually host its own implementation. The reflection builtins
+(`ast_of`, `eval`, type predicates) are the foundation for this effort.
+The planned 5-phase path:
+
+1. **✅ tree-walker in 1y** — [`bootstrap/interp.1y`](./bootstrap/interp.1y)
+   implements a tree-walker for a 1y subset inside 1y itself. Phase 1 is
+   complete and runs against the existing test suite.
+2. **⏳ parser in 1y** — hand-written recursive descent producing `Vec` /
+   `Map` ASTs (the structure returned by `ast_of`).
+3. **⏳ bytecode compiler in 1y** — compile ASTs to `Vec<Int>` bytecode.
+4. **⏳ VM interpreter loop in 1y** — `match`-dispatched opcode handling.
+5. **⏳ replace the Rust VM** — run the full existing test suite under the
+   1y-implemented VM.
+
+See [Reflection & Dynamic Evaluation](https://okysu.github.io/1y/syntax/introspection)
+in the docs for details.
 
 ---
 
@@ -177,9 +223,12 @@ Online docs: https://okysu.github.io/1y/
 ```
 1y/
 ├── src/
-│   ├── ast/            # AST definitions + spans
+│   ├── ast/            # AST definitions + spans + to_value (AST → Value)
 │   ├── lexer/          # Hand-written lexer
 │   ├── parser/         # Recursive-descent parser
+│   ├── compiler/       # AST → bytecode Chunk compiler
+│   ├── vm/             # Stack-based bytecode VM (Vm + VmCtx)
+│   ├── runtime/        # Coroutine scheduler + cross-thread actor registry
 │   ├── interpreter/    # Tree-walking evaluator
 │   │   ├── builtins.rs # Built-in functions
 │   │   ├── env.rs      # Lexical environment
@@ -188,8 +237,9 @@ Online docs: https://okysu.github.io/1y/
 │   ├── value.rs        # Runtime value types
 │   ├── main.rs         # CLI entry point
 │   └── lib.rs          # Library API
-├── tests/              # Integration tests (410 tests)
+├── tests/              # Integration tests (502 tests)
 ├── examples/           # Example programs
+├── bootstrap/          # Self-bootstrapping effort (phase 1: interp.1y)
 ├── editor/             # VSCode extension
 ├── docs-site/          # VitePress documentation
 ├── docs/               # Language guide, stdlib reference, architecture
@@ -201,7 +251,7 @@ Online docs: https://okysu.github.io/1y/
 ## Testing
 
 ```bash
-cargo test              # run all 410 tests
+cargo test              # run all 502 tests
 cargo test -- --nocapture phase1   # run a specific suite
 ```
 

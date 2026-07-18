@@ -8,6 +8,7 @@ use crate::value::{ModuleData, ModuleRef};
 use std::rc::Rc;
 use std::collections::HashMap;
 
+pub mod bytes;
 pub mod crypto;
 pub mod env;
 pub mod ffi;
@@ -26,6 +27,7 @@ pub mod tls;
 /// up `"io"` here before trying the file system.
 pub fn build_std_modules() -> HashMap<String, ModuleRef> {
     let mut map = HashMap::new();
+    map.insert("bytes".to_string(), bytes::build());
     map.insert("crypto".to_string(), crypto::build());
     map.insert("env".to_string(), env::build());
     map.insert("ffi".to_string(), ffi::build());

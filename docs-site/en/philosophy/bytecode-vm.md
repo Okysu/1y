@@ -123,17 +123,49 @@ The tree-walker's `fib_memo(10000)` used to overflow the 256 MB Rust stack becau
 
 Benchmark: `fib_memo(10000)` runs in the VM with no stack growth; `fib_memo(100000)` completes in ~1 second.
 
-## What's Not Yet in the VM
+## Control Signals & Handler Stacks
 
-A handful of 1y features are still tree-walker-only (the VM falls back to the tree-walker or raises a clear error):
+The VM has 6 control signals: `Break` / `Continue` / `Retry` / `UserException` / `Reply` / `Return`. The first four need to find their corresponding handler (loop / transact / exception) before they can be consumed.
 
-- `for` loops (compile-time stub)
-- `break` / `continue`
-- String interpolation
-- `try` / `transact` (in progress)
-- `actor` definitions (actor *spawn* and message passing work; actor body compilation is partial)
+The original implementation matched handlers with `stack_depth >= cur_frame_base`, but this has a subtle hazard: a child frame's `stack_base` can equal the parent frame's handler `stack_depth`, causing the parent's handler to match incorrectly — `try { fn_that_raises() } rescue { ... }` would jump rescue to the wrong location, IP out of bounds and panic.
 
-For maximum compatibility, the tree-walker (`1y run`) remains fully featured and is the reference implementation.
+The fix adds a `frame_depth` field (`frames.len()`) to all three handler stacks and switches to exact matching `handler.frame_depth == cur_frame_depth`:
+
+- [`ExceptionHandler`](https://github.com/Okysu/1y/blob/main/src/vm/vm.rs) — `try`/`rescue`/`ensure`
+- [`TransactHandler`](https://github.com/Okysu/1y/blob/main/src/vm/vm.rs) — `transact`/`retry`
+- [`LoopHandler`](https://github.com/Okysu/1y/blob/main/src/vm/vm.rs) — `for`/`break`/`continue`
+
+All three signal-dispatch paths go through `VmCtx::handle_signal(err, propagate_depth)`, which returns `SignalOutcome::Continue` (signal consumed) or `SignalOutcome::Done(value)` (`Reply`/`Return` hit target).
+
+## Dynamic Evaluation (eval)
+
+The VM-side `eval(src)` is implemented in [`VmCtx::eval_src`](https://github.com/Okysu/1y/blob/main/src/vm/vm.rs). The flow:
+
+1. Parse the source (`crate::parser::parse`)
+2. Compile to a chunk via `compile_program_with_types` — this injects the VM's persistent `variant_table` / `struct_table`, so eval'd code recognizes outer `enum` variants and `type` constructors
+3. Push a child `Frame` on the current `VmCtx` and run the chunk (sharing `vm.globals`)
+4. Step until the child frame returns; signals are routed through `handle_signal(e, target_depth)` — `raise` can be caught by an outer `try`
+
+**Persistent type tables** are the `variant_table: HashMap<String, usize>` and `struct_table: HashMap<String, ()>` fields on `Vm`. All three compile entry points (`run_source` / `load_module` / `eval_src`) share them, so `enum`/`type` definitions stay visible across `eval` and `import` boundaries.
+
+See [Reflection & Dynamic Evaluation](../syntax/introspection).
+
+## Features Supported by the VM
+
+The VM is now feature-complete with the tree-walker — every 1y language feature is natively supported in the bytecode backend, with no fallback:
+
+- **Control flow**: `if`/`match`/`while`/`loop`/`for`/`break`/`continue`/`return`
+- **String interpolation**: `"x = {x}"` compiles to a `to_str` + `+` chain
+- **Pattern matching**: literals, bindings, `Variant`/`Struct`/`Vec` destructuring, Or-patterns, guards
+- **Closures & upvalues**: Lua-style open/closed upvalues; recursively closes escaping upvalues on actor send
+- **Exceptions**: `try`/`rescue`/`ensure`/`raise` via `PushTry`/`PopTry`/`RescueMatch`/`EnsureExit` opcodes
+- **Software transactional memory**: `transact`/`retry` via `PushTransact`/`TransactCommit` with conflict detection and retry
+- **Actor concurrency**: `actor` definitions, `spawn`, `!` (send), `?` (request), `reply`, `yield`
+- **Colorless async**: `await` on corosensei stackful coroutines; top-level await drives the scheduler via `drain_mailboxes_async`
+- **Module system**: `import path [as alias] [lazy]`, loaded on demand and cached
+- **Reflection & eval**: `ast_of` / `eval` / `type_of` / `instance_of` / `variant_name` / `variant_args` and other builtins
+
+All 502 tests pass, covering every feature above. The tree-walker (`1y run`) is kept as a reference implementation for comparison and debugging.
 
 ## Trying It
 

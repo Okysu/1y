@@ -83,11 +83,16 @@ impl TransactionContext {
 /// One entry on the transact handler stack. `retry_addr` is the address of
 /// the `PushTransact` instruction (where retries jump back to).
 /// `stack_depth` records the stack height at entry, for unwind on exception.
+/// `frame_depth` records `frames.len()` at push time so that `retry` only
+/// matches handlers pushed within the current frame (a child frame may
+/// reuse the same operand-stack range as a parent, so `stack_depth` alone
+/// is insufficient).
 /// `retry_count` is incremented on each conflict/retry; capped at MAX_RETRIES.
 #[derive(Clone)]
 struct TransactHandler {
     retry_addr: usize,
     stack_depth: usize,
+    frame_depth: usize,
     retry_count: u32,
 }
 
@@ -119,17 +124,44 @@ pub struct Vm {
     /// Coroutine-based async scheduler. Drives actor handlers that may
     /// `await` on Tasks. Each spawned handler runs in its own `VmCtx`.
     scheduler: crate::runtime::scheduler::Scheduler,
+    /// Persistent type table: `enum` variant name → arity. Shared across
+    /// every `compile_program` call (top-level / `import` / `eval`) so
+    /// that `eval("Foo.Bar(...)")` recognizes variants defined in the
+    /// outer scope. Updated by the compiler whenever an `enum` is
+    /// compiled; read by the compiler when a `Name(args)` call is
+    /// compiled, to decide between `ConstructVariant` and `Call`.
+    variant_table: HashMap<String, usize>,
+    /// Persistent type table: `struct` names registered via
+    /// `type Name = { ... }`. Same sharing story as `variant_table`.
+    struct_table: HashMap<String, ()>,
 }
 
 /// One entry on the exception handler stack. `rescue_pc` is the address
 /// of the rescue dispatcher (if any); `ensure_pc` is the address of the
 /// ensure body (if any). `stack_depth` records the stack height at the
 /// time the handler was pushed, so `raise` can truncate back to it.
+/// `frame_depth` records `frames.len()` at push time; `handle_signal`
+/// matches handlers only within the current frame, since a child frame
+/// may reuse the same operand-stack range as its parent.
 #[derive(Clone)]
 pub struct ExceptionHandler {
     pub rescue_pc: Option<usize>,
     pub ensure_pc: Option<usize>,
     pub stack_depth: usize,
+    pub frame_depth: usize,
+}
+
+/// One entry on the loop handler stack. Pushed by `PushLoop`, popped by
+/// `PopLoop`. `continue_addr` / `break_addr` are jump targets;
+/// `stack_depth` is the operand-stack height at push time (for unwind
+/// on `break`); `frame_depth` is `frames.len()` at push time so that
+/// `Break`/`Continue` only match loops within the current frame.
+#[derive(Clone)]
+pub struct LoopHandler {
+    pub continue_addr: usize,
+    pub break_addr: usize,
+    pub stack_depth: usize,
+    pub frame_depth: usize,
 }
 
 /// Per-handler VM execution state. Each coroutine (actor handler) owns its
@@ -141,9 +173,12 @@ pub struct VmCtx {
     /// Open upvalues, sorted by stack index descending (topmost first) so
     /// that closing on frame return is a linear scan from the front.
     pub open_upvalues: Vec<UpvalueRef>,
-    /// Loop handler stack: (continue_addr, break_addr, stack_depth_at_push).
-    /// Used to unwind `Break`/`Continue` signals to the enclosing loop.
-    pub loop_handlers: Vec<(usize, usize, usize)>,
+    /// Loop handler stack. Used to unwind `Break`/`Continue` signals to
+    /// the enclosing loop. `frame_depth` records `frames.len()` at push
+    /// time so that `Break`/`Continue` only match loops within the
+    /// current frame (a child frame may reuse the same operand-stack
+    /// range as its parent).
+    pub loop_handlers: Vec<LoopHandler>,
     /// Exception handler stack: each `try` pushes one entry. `raise` (or
     /// any `UserException` propagation) unwinds to the nearest handler
     /// whose `stack_depth` is within the current frame.
@@ -158,6 +193,23 @@ pub struct VmCtx {
     /// or a commit conflict unwinds to the nearest handler. Exceptions also
     /// pop the handler + context when unwinding past it.
     transact_handlers: Vec<TransactHandler>,
+}
+
+/// Outcome of [`VmCtx::handle_signal`] when a control-flow signal
+/// (`Break` / `Continue` / `Retry` / `UserException` / `Reply` / `Return`)
+/// is returned by [`VmCtx::step`].
+///
+/// Both [`Vm::run_chunk`] and [`VmCtx::run_handler`] route signals through
+/// `handle_signal` so that the unwinding rules (loop / transact / exception
+/// handler lookup, frame-pop on propagation) stay consistent between the
+/// top-level dispatch loop and nested actor-handler dispatch.
+enum SignalOutcome {
+    /// Signal was consumed internally (e.g. `break` jumped to the loop exit,
+    /// `retry` rewound to the transact entry). Continue stepping.
+    Continue,
+    /// A `Reply(value)` or `Return(value)` signal was caught — the caller
+    /// should stop stepping and return `value`.
+    Done(Value),
 }
 
 impl Default for Vm {
@@ -178,6 +230,8 @@ impl Vm {
             current_spawning_actor: None,
             live_actors: Vec::new(),
             scheduler: crate::runtime::scheduler::Scheduler::new(),
+            variant_table: HashMap::new(),
+            struct_table: HashMap::new(),
         }
     }
 
@@ -215,7 +269,11 @@ impl Vm {
                 span: Some(e.span),
             });
         }
-        let chunk = crate::compiler::compile_program(&output.program)?;
+        let chunk = crate::compiler::compile_program_with_types(
+            &output.program,
+            &mut self.variant_table,
+            &mut self.struct_table,
+        )?;
         self.run_chunk(Rc::new(chunk))
     }
 
@@ -231,146 +289,20 @@ impl Vm {
             stack_base,
             actor_env: None,
         });
-        loop {
-            if ctx.frames.is_empty() {
-                break;
-            }
+        // `propagate_depth = 1` keeps the script frame intact: signals that
+        // would unwind past it (uncaught exceptions, top-level `return`)
+        // escape as `Err`.
+        while !ctx.frames.is_empty() {
             match ctx.step(self) {
                 Ok(()) => {}
-                Err(InterpreterError::Break { value, .. }) => {
-                    // Uncaught break at top level: error.
-                    // Note: we do NOT pop the loop handler here. The
-                    // break_handler's PopLoop instruction will pop it. This
-                    // keeps PushLoop/PopLoop balanced whether we exit via
-                    // `break` or via normal condition-false.
-                    if let Some((_, break_addr, depth)) = ctx.loop_handlers.last().cloned() {
-                        // Only catch if we're still inside the same frame.
-                        let cur_frame_base = ctx.frames.last().unwrap().stack_base;
-                        if depth >= cur_frame_base {
-                            ctx.stack.truncate(depth);
-                            if let Some(v) = value {
-                                ctx.stack.push(v);
-                            } else {
-                                ctx.stack.push(Value::Nil);
-                            }
-                            ctx.set_ip(break_addr);
-                            continue;
-                        }
+                Err(e) => match ctx.handle_signal(e, 1)? {
+                    SignalOutcome::Continue => {}
+                    SignalOutcome::Done(_) => {
+                        // Reply/Return reached the script frame — treat as
+                        // top-level result (mirrors tree-walker).
+                        break;
                     }
-                    return Err(InterpreterError::RuntimeError {
-                        msg: "break outside of loop".into(),
-                        span: None,
-                    });
-                }
-                Err(InterpreterError::Continue { .. }) => {
-                    if let Some((continue_addr, _, depth)) = ctx.loop_handlers.last().cloned() {
-                        let cur_frame_base = ctx.frames.last().unwrap().stack_base;
-                        if depth >= cur_frame_base {
-                            ctx.stack.truncate(depth);
-                            ctx.set_ip(continue_addr);
-                            continue;
-                        }
-                    }
-                    return Err(InterpreterError::RuntimeError {
-                        msg: "continue outside of loop".into(),
-                        span: None,
-                    });
-                }
-                Err(InterpreterError::Retry { .. }) => {
-                    // Find the nearest transact handler within the current frame.
-                    let cur_frame_base = ctx.frames.last().unwrap().stack_base;
-                    let handler_idx = ctx
-                        .transact_handlers
-                        .iter()
-                        .rposition(|h| h.stack_depth >= cur_frame_base);
-                    if let Some(idx) = handler_idx {
-                        let handler = ctx.transact_handlers[idx].clone();
-                        // Pop any inner transact handlers + contexts (nested
-                        // transacts being unwound by the retry).
-                        let drop_n = ctx.transact_handlers.len() - idx - 1;
-                        for _ in 0..drop_n {
-                            ctx.transact_handlers.pop();
-                            ctx.txn_stack.pop();
-                        }
-                        // Pop this handler's context (discard writes).
-                        ctx.txn_stack.pop();
-                        // Truncate stack to handler entry point.
-                        ctx.stack.truncate(handler.stack_depth);
-                        // Increment retry count, check MAX.
-                        let new_count = handler.retry_count + 1;
-                        if new_count > MAX_TXN_RETRIES {
-                            ctx.transact_handlers.pop();
-                            return Err(InterpreterError::RuntimeError {
-                                msg: format!(
-                                    "transaction exceeded {} retries",
-                                    MAX_TXN_RETRIES
-                                ),
-                                span: None,
-                            });
-                        }
-                        ctx.transact_handlers[idx].retry_count = new_count;
-                        ctx.set_ip(handler.retry_addr);
-                        continue;
-                    }
-                    return Err(InterpreterError::RuntimeError {
-                        msg: "retry outside of transact".into(),
-                        span: None,
-                    });
-                }
-                Err(InterpreterError::UserException { value, span }) => {
-                    // Find the nearest handler whose stack_depth is within
-                    // the current frame. If the current frame has no
-                    // handler, pop the frame (propagating the exception to
-                    // the caller) and retry.
-                    let mut value = value;
-                    loop {
-                        let cur_frame_base = ctx.frames.last().unwrap().stack_base;
-                        // Find the topmost handler within this frame.
-                        let handler_idx = ctx
-                            .exception_handlers
-                            .iter()
-                            .rposition(|h| h.stack_depth >= cur_frame_base);
-                        if let Some(idx) = handler_idx {
-                            let handler = ctx.exception_handlers[idx].clone();
-                            // Truncate any inner handlers (shouldn't normally happen).
-                            ctx.exception_handlers.truncate(idx + 1);
-                            ctx.exception_handlers.pop();
-                            ctx.pending_exception = Some(value.clone());
-                            // Roll back any transacts whose stack_depth is
-                            // above this handler's (they're being unwound).
-                            ctx.cleanup_transact_above(handler.stack_depth);
-                            ctx.stack.truncate(handler.stack_depth);
-                            ctx.stack.push(value);
-                            if let Some(rescue_pc) = handler.rescue_pc {
-                                ctx.set_ip(rescue_pc);
-                            } else if let Some(ensure_pc) = handler.ensure_pc {
-                                ctx.set_ip(ensure_pc);
-                            } else {
-                                // Neither rescue nor ensure: re-raise to outer.
-                                value = ctx.pending_exception.take().unwrap();
-                                continue;
-                            }
-                            break;
-                        } else {
-                            // No handler in current frame: pop frame and
-                            // retry. If at the script frame, propagate out.
-                            if ctx.frames.len() <= 1 {
-                                return Err(InterpreterError::UserException {
-                                    value,
-                                    span,
-                                });
-                            }
-                            let frame = ctx.frames.pop().unwrap();
-                            ctx.close_upvalues_above(frame.stack_base);
-                            // Roll back any transacts in this frame.
-                            ctx.cleanup_transact_above(frame.stack_base);
-                            ctx.stack.truncate(frame.stack_base);
-                            // continue the inner loop: re-check handlers in
-                            // the caller frame.
-                        }
-                    }
-                }
-                Err(other) => return Err(other),
+                },
             }
         }
         // Drain pending `!` messages from live actors, mirroring the
@@ -522,6 +454,155 @@ impl VmCtx {
             pending_exception: None,
             txn_stack: Vec::new(),
             transact_handlers: Vec::new(),
+        }
+    }
+
+    /// Try to consume a control-flow signal returned by [`Self::step`].
+    ///
+    /// `propagate_depth` is the minimum frame count we may unwind down to
+    /// before the signal must escape: `run_chunk` passes `1` (keep the
+    /// script frame), `run_handler` / `call_closure_sync` pass the frame
+    /// depth at which the nested execution started.
+    ///
+    /// - `Break` / `Continue` / `Retry` are resolved against the
+    ///   nearest loop / transact handler in the current frame; if none
+    ///   exists the signal is returned as `Err` (caller surfaces it).
+    /// - `UserException` walks the exception-handler stack, popping
+    ///   frames down to `propagate_depth` if no handler matches; when it
+    ///   can't unwind further the original error is returned as `Err`.
+    /// - `Reply` / `Return` unwind to `propagate_depth` and yield
+    ///   `SignalOutcome::Done(value)`.
+    fn handle_signal(
+        &mut self,
+        err: InterpreterError,
+        propagate_depth: usize,
+    ) -> Result<SignalOutcome, InterpreterError> {
+        match err {
+            InterpreterError::Break { value, .. } => {
+                let cur_frame_depth = self.frames.len();
+                if let Some(h) = self.loop_handlers.last().cloned() {
+                    if h.frame_depth == cur_frame_depth {
+                        self.stack.truncate(h.stack_depth);
+                        self.stack.push(value.unwrap_or(Value::Nil));
+                        self.set_ip(h.break_addr);
+                        return Ok(SignalOutcome::Continue);
+                    }
+                }
+                Err(InterpreterError::RuntimeError {
+                    msg: "break outside of loop".into(),
+                    span: None,
+                })
+            }
+            InterpreterError::Continue { .. } => {
+                let cur_frame_depth = self.frames.len();
+                if let Some(h) = self.loop_handlers.last().cloned() {
+                    if h.frame_depth == cur_frame_depth {
+                        self.stack.truncate(h.stack_depth);
+                        self.set_ip(h.continue_addr);
+                        return Ok(SignalOutcome::Continue);
+                    }
+                }
+                Err(InterpreterError::RuntimeError {
+                    msg: "continue outside of loop".into(),
+                    span: None,
+                })
+            }
+            InterpreterError::Retry { .. } => {
+                let cur_frame_depth = self.frames.len();
+                let handler_idx = self
+                    .transact_handlers
+                    .iter()
+                    .rposition(|h| h.frame_depth == cur_frame_depth);
+                if let Some(idx) = handler_idx {
+                    let handler = self.transact_handlers[idx].clone();
+                    let drop_n = self.transact_handlers.len() - idx - 1;
+                    for _ in 0..drop_n {
+                        self.transact_handlers.pop();
+                        self.txn_stack.pop();
+                    }
+                    self.txn_stack.pop();
+                    self.stack.truncate(handler.stack_depth);
+                    let new_count = handler.retry_count + 1;
+                    if new_count > MAX_TXN_RETRIES {
+                        self.transact_handlers.pop();
+                        return Err(InterpreterError::RuntimeError {
+                            msg: format!("transaction exceeded {} retries", MAX_TXN_RETRIES),
+                            span: None,
+                        });
+                    }
+                    self.transact_handlers[idx].retry_count = new_count;
+                    self.set_ip(handler.retry_addr);
+                    Ok(SignalOutcome::Continue)
+                } else {
+                    Err(InterpreterError::RuntimeError {
+                        msg: "retry outside of transact".into(),
+                        span: None,
+                    })
+                }
+            }
+            InterpreterError::UserException { value, span } => {
+                let mut value = value;
+                loop {
+                    let cur_frame_depth = self.frames.len();
+                    let handler_idx = self
+                        .exception_handlers
+                        .iter()
+                        .rposition(|h| h.frame_depth == cur_frame_depth);
+                    if let Some(idx) = handler_idx {
+                        let handler = self.exception_handlers[idx].clone();
+                        self.exception_handlers.truncate(idx + 1);
+                        self.exception_handlers.pop();
+                        self.pending_exception = Some(value.clone());
+                        self.cleanup_transact_above(handler.stack_depth);
+                        self.stack.truncate(handler.stack_depth);
+                        self.stack.push(value);
+                        if let Some(rescue_pc) = handler.rescue_pc {
+                            self.set_ip(rescue_pc);
+                        } else if let Some(ensure_pc) = handler.ensure_pc {
+                            self.set_ip(ensure_pc);
+                        } else {
+                            value = self.pending_exception.take().unwrap();
+                            continue;
+                        }
+                        return Ok(SignalOutcome::Continue);
+                    } else {
+                        if self.frames.len() <= propagate_depth {
+                            return Err(InterpreterError::UserException { value, span });
+                        }
+                        let frame = self.frames.pop().unwrap();
+                        self.close_upvalues_above(frame.stack_base);
+                        self.cleanup_transact_above(frame.stack_base);
+                        self.stack.truncate(frame.stack_base);
+                    }
+                }
+            }
+            InterpreterError::Reply { value, .. } => {
+                // Unwind all frames down to `propagate_depth`, closing
+                // upvalues and rolling back transacts as we go.
+                while self.frames.len() > propagate_depth {
+                    let frame = self.frames.pop().unwrap();
+                    self.close_upvalues_above(frame.stack_base);
+                    self.cleanup_transact_above(frame.stack_base);
+                }
+                self.stack.truncate(self.stack.len());
+                Ok(SignalOutcome::Done(value))
+            }
+            InterpreterError::Return { value, .. } => {
+                // `return` pops the frame that emitted it; if that brings
+                // us to `propagate_depth`, the caller is the target and
+                // the value becomes its result.
+                if self.frames.len() > propagate_depth {
+                    let frame = self.frames.pop().unwrap();
+                    self.close_upvalues_above(frame.stack_base);
+                    self.cleanup_transact_above(frame.stack_base);
+                    self.stack.truncate(frame.stack_base);
+                    self.stack.push(value.clone());
+                    Ok(SignalOutcome::Continue)
+                } else {
+                    Ok(SignalOutcome::Done(value))
+                }
+            }
+            other => Err(other),
         }
     }
 
@@ -1089,6 +1170,7 @@ impl VmCtx {
                     rescue_pc: if rescue_pc == 0 { None } else { Some(rescue_pc) },
                     ensure_pc: if ensure_pc == 0 { None } else { Some(ensure_pc) },
                     stack_depth: self.stack.len(),
+                    frame_depth: self.frames.len(),
                 });
             }
             OpCode::PopTry => {
@@ -1150,6 +1232,7 @@ impl VmCtx {
                     self.transact_handlers.push(TransactHandler {
                         retry_addr: self_addr,
                         stack_depth: self.stack.len(),
+                        frame_depth: self.frames.len(),
                         retry_count: 0,
                     });
                 }
@@ -1477,7 +1560,12 @@ impl VmCtx {
             OpCode::PushLoop => {
                 let continue_addr = self.read_u16() as usize;
                 let break_addr = self.read_u16() as usize;
-                self.loop_handlers.push((continue_addr, break_addr, self.stack.len()));
+                self.loop_handlers.push(LoopHandler {
+                    continue_addr,
+                    break_addr,
+                    stack_depth: self.stack.len(),
+                    frame_depth: self.frames.len(),
+                });
             }
             OpCode::PopLoop => {
                 self.loop_handlers.pop();
@@ -1563,6 +1651,11 @@ impl VmCtx {
             "reduce" => self.ho_reduce(vm, &args, span),
             "find" => self.ho_find(vm, &args, span),
             "each" => self.ho_each(vm, &args, span),
+            "eval" => {
+                let v = self.eval_src(vm, &args, span)?;
+                self.push(v);
+                Ok(())
+            }
             _ => {
                 // Auto-deref SharedRef arguments, matching the tree-walker.
                 let args: Vec<Value> = args
@@ -1607,30 +1700,31 @@ impl VmCtx {
             stack_base,
             actor_env,
         });
-        while self.frames.len() > target_depth {
+        // `handle_signal(target_depth)` routes Break/Continue/Retry to
+        // handlers within the closure's own frame; if none exists the
+        // signal escapes as an `Err` (mirrors the tree-walker, where these
+        // signals don't cross function boundaries). Reply/Return unwind
+        // to `target_depth` and yield `Done(value)`.
+        let result: Result<Value, InterpreterError> = loop {
+            if self.frames.len() <= target_depth {
+                break Ok(self.stack.pop().unwrap_or(Value::Nil));
+            }
             match self.step(vm) {
                 Ok(()) => {}
-                // Break/Continue escaping a closure boundary: error (mirrors
-                // the tree-walker, where these signals don't cross function
-                // calls).
-                Err(InterpreterError::Break { .. })
-                | Err(InterpreterError::Continue { .. }) => {
-                    // Restore loop handler stack (the closure may have pushed
-                    // then not popped due to the escape).
-                    self.loop_handlers.truncate(saved_loop_len);
-                    return Err(InterpreterError::RuntimeError {
-                        msg: "break/continue escaping closure boundary".into(),
-                        span: Some(self.current_span()),
-                    });
-                }
-                Err(other) => {
-                    self.loop_handlers.truncate(saved_loop_len);
-                    return Err(other);
-                }
+                Err(e) => match self.handle_signal(e, target_depth) {
+                    Ok(SignalOutcome::Continue) => {}
+                    Ok(SignalOutcome::Done(v)) => break Ok(v),
+                    Err(err) => break Err(err),
+                },
             }
+        };
+        self.loop_handlers.truncate(saved_loop_len);
+        while self.frames.len() > target_depth {
+            let f = self.frames.pop().unwrap();
+            self.close_upvalues_above(f.stack_base);
         }
-        // The frame returned; its value is on top of the stack.
-        Ok(self.stack.pop().unwrap_or(Value::Nil))
+        self.stack.truncate(stack_base);
+        result
     }
 
     fn return_from_frame(&mut self, ret: Value) -> Result<(), InterpreterError> {
@@ -1808,40 +1902,34 @@ impl VmCtx {
             stack_base,
             actor_env: Some(actor_env),
         });
-        while self.frames.len() > target_depth {
+        let result: Result<Value, InterpreterError> = loop {
+            if self.frames.len() <= target_depth {
+                // Handler frame returned normally — discard the body value
+                // (mirrors the tree-walker, which returns Nil when a handler
+                // falls through without `reply`).
+                let _ = self.stack.pop();
+                break Ok(Value::Nil);
+            }
             match self.step(vm) {
                 Ok(()) => {}
-                Err(InterpreterError::Reply { value, .. }) => {
-                    // Drop the handler frame (it didn't return normally).
-                    // Truncate stack to handler base, push reply value.
-                    self.loop_handlers.truncate(saved_loop_len);
-                    // Pop frames down to target_depth.
-                    while self.frames.len() > target_depth {
-                        let f = self.frames.pop().unwrap();
-                        self.close_upvalues_above(f.stack_base);
-                    }
-                    self.stack.truncate(stack_base);
-                    return Ok(value);
-                }
-                Err(InterpreterError::Break { .. })
-                | Err(InterpreterError::Continue { .. }) => {
-                    self.loop_handlers.truncate(saved_loop_len);
-                    return Err(InterpreterError::RuntimeError {
-                        msg: "break/continue escaping actor handler".into(),
-                        span: Some(self.current_span()),
-                    });
-                }
-                Err(e) => {
-                    self.loop_handlers.truncate(saved_loop_len);
-                    return Err(e);
-                }
+                Err(e) => match self.handle_signal(e, target_depth) {
+                    Ok(SignalOutcome::Continue) => {}
+                    Ok(SignalOutcome::Done(v)) => break Ok(v),
+                    Err(err) => break Err(err),
+                },
             }
+        };
+        // Always restore loop-handler stack and truncate handler-local
+        // stack so the caller sees a clean state whether we succeeded or
+        // errored. The result value (if any) is re-pushed after truncation.
+        self.loop_handlers.truncate(saved_loop_len);
+        // Pop any frames still above target_depth (e.g. on error escape).
+        while self.frames.len() > target_depth {
+            let f = self.frames.pop().unwrap();
+            self.close_upvalues_above(f.stack_base);
         }
-        // Handler returned normally: discard the body value (mirrors
-        // the tree-walker, which returns Nil when a handler falls
-        // through without `reply`).
-        let _ = self.stack.pop();
-        Ok(Value::Nil)
+        self.stack.truncate(stack_base);
+        result
     }
 
     /// Process all pending `!` messages in every live actor's mailbox.
@@ -2052,8 +2140,14 @@ impl VmCtx {
             });
         }
 
-        // 6. compile to a top-level chunk
-        let chunk = crate::compiler::compile_program(&output.program)?;
+        // 6. compile to a top-level chunk (share VM's persistent type
+        //    table so module-level `enum`/`type` definitions are visible
+        //    to later `eval` / `import`).
+        let chunk = crate::compiler::compile_program_with_types(
+            &output.program,
+            &mut vm.variant_table,
+            &mut vm.struct_table,
+        )?;
 
         // 7. run it on a child frame, capturing top-level globals as exports.
         //    We snapshot globals before, run, then diff to extract exports.
@@ -2115,6 +2209,93 @@ impl VmCtx {
         });
         vm.module_cache.insert(canonical, module.clone());
         Ok(module)
+    }
+
+    // -----------------------------------------------------------------------
+    // Dynamic eval
+    // -----------------------------------------------------------------------
+
+    /// `eval(src)` — parse, compile, and execute a source string on the
+    /// current `VmCtx`, sharing `vm.globals` so definitions persist.
+    /// Returns the value of the last top-level expression (or `Nil`).
+    ///
+    /// Mirrors `Interpreter::eval_src` in the tree-walker. The compiled
+    /// chunk runs on a child frame pushed onto the current `VmCtx`; we step
+    /// until that frame returns, then pop the result. Control signals
+    /// (`Break`/`Continue`/`Retry`/`UserException`/`Reply`/`Return`) are
+    /// routed through `handle_signal` with `target_depth` set to the
+    /// pre-eval frame count, so an uncaught `raise` inside `eval` propagates
+    /// out as `Err` (matching the tree-walker) and a top-level `return`
+    /// yields its value.
+    fn eval_src(
+        &mut self,
+        vm: &mut Vm,
+        args: &[Value],
+        span: crate::ast::Span,
+    ) -> Result<Value, InterpreterError> {
+        let arg = args.first().cloned().ok_or_else(|| InterpreterError::ArityError {
+            expected: 1,
+            got: args.len(),
+            callee: "eval".into(),
+            span: Some(span),
+        })?;
+        let src = match arg {
+            Value::Str(s) => (*s).clone(),
+            other => {
+                return Err(InterpreterError::TypeError {
+                    expected: "Str",
+                    got: other.type_name(),
+                    op: "eval".into(),
+                    span: Some(span),
+                })
+            }
+        };
+        let output = crate::parser::parse(&src);
+        if !output.errors.is_empty() {
+            let e = &output.errors[0];
+            return Err(InterpreterError::RuntimeError {
+                msg: format!("eval parse error: {}", e.full_message()),
+                span: Some(span),
+            });
+        }
+        let chunk = crate::compiler::compile_program_with_types(
+            &output.program,
+            &mut vm.variant_table,
+            &mut vm.struct_table,
+        )?;
+        // Run the compiled chunk on a child frame, sharing `vm.globals` so
+        // definitions made inside `eval` persist (matches the tree-walker,
+        // which mutates `self.global`). The chunk's arity is 0, so no args
+        // are pushed onto the operand stack.
+        let stack_base = self.stack.len();
+        let target_depth = self.frames.len();
+        let saved_loop_len = self.loop_handlers.len();
+        let closure = Rc::new(ClosureVm::new(Rc::new(chunk), Vec::new()));
+        self.frames.push(Frame {
+            closure,
+            ip: 0,
+            stack_base,
+            actor_env: None,
+        });
+        let result: Result<Value, InterpreterError> = loop {
+            if self.frames.len() <= target_depth {
+                break Ok(self.stack.pop().unwrap_or(Value::Nil));
+            }
+            match self.step(vm) {
+                Ok(()) => {}
+                Err(e) => match self.handle_signal(e, target_depth)? {
+                    SignalOutcome::Continue => {}
+                    SignalOutcome::Done(v) => break Ok(v),
+                },
+            }
+        };
+        self.loop_handlers.truncate(saved_loop_len);
+        while self.frames.len() > target_depth {
+            let f = self.frames.pop().unwrap();
+            self.close_upvalues_above(f.stack_base);
+        }
+        self.stack.truncate(stack_base);
+        result
     }
 
     // -----------------------------------------------------------------------
@@ -2771,6 +2952,12 @@ impl VmCtx {
     }
 
     fn do_field(&self, target: &Value, name: &str) -> Result<Value, InterpreterError> {
+        // Auto-deref SharedRef so `shared_map.field` reads the inner
+        // value's field (reference semantics for shared cells).
+        let target = match target {
+            Value::Shared(sref) => &sref.borrow().value,
+            other => other,
+        };
         match target {
             // Struct field access is strict (missing field raises IndexError),
             // mirroring the tree-walker. Map field access is lenient (missing

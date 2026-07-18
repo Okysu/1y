@@ -28,6 +28,8 @@ pub fn register(env: &EnvRef) {
         ("assoc", NativeFn { name: "assoc", func: bi_assoc }),
         ("dissoc", NativeFn { name: "dissoc", func: bi_dissoc }),
         ("get", NativeFn { name: "get", func: bi_get }),
+        ("has_key", NativeFn { name: "has_key", func: bi_has_key }),
+        ("iter_to_vec", NativeFn { name: "iter_to_vec", func: bi_iter_to_vec }),
         // --- type predicates ---
         ("is_int", NativeFn { name: "is_int", func: bi_is_int }),
         ("is_decimal", NativeFn { name: "is_decimal", func: bi_is_decimal }),
@@ -39,7 +41,21 @@ pub fn register(env: &EnvRef) {
         ("is_set", NativeFn { name: "is_set", func: bi_is_set }),
         ("is_number", NativeFn { name: "is_number", func: bi_is_number }),
         ("is_func", NativeFn { name: "is_func", func: bi_is_func }),
+        ("is_closure", NativeFn { name: "is_closure", func: bi_is_closure }),
         ("type_of", NativeFn { name: "type_of", func: bi_type_of }),
+        // --- introspection ---
+        ("keys", NativeFn { name: "keys", func: bi_keys }),
+        ("values", NativeFn { name: "values", func: bi_values }),
+        ("fields", NativeFn { name: "fields", func: bi_fields }),
+        ("variant_name", NativeFn { name: "variant_name", func: bi_variant_name }),
+        ("variant_args", NativeFn { name: "variant_args", func: bi_variant_args }),
+        ("instance_of", NativeFn { name: "instance_of", func: bi_instance_of }),
+        ("ast_of", NativeFn { name: "ast_of", func: bi_ast_of }),
+        // `eval` is a stub — the tree-walker and VM intercept calls by name
+        // and dispatch to Interpreter::eval_src / Vm::eval_src so the call
+        // has access to interpreter state (global env, etc.). The stub is
+        // never invoked directly.
+        ("eval", NativeFn { name: "eval", func: bi_eval_stub }),
         // --- conversions ---
         ("to_i64", NativeFn { name: "to_i64", func: bi_to_i64 }),
         ("to_f64", NativeFn { name: "to_f64", func: bi_to_f64 }),
@@ -62,6 +78,20 @@ pub fn register(env: &EnvRef) {
         ("trim", NativeFn { name: "trim", func: bi_trim }),
         ("contains", NativeFn { name: "contains", func: bi_contains }),
         ("substring", NativeFn { name: "substring", func: bi_substring }),
+        // --- string ops (lexer/parser infrastructure) ---
+        ("starts_with", NativeFn { name: "starts_with", func: bi_starts_with }),
+        ("ends_with", NativeFn { name: "ends_with", func: bi_ends_with }),
+        ("index_of", NativeFn { name: "index_of", func: bi_index_of }),
+        ("char_at", NativeFn { name: "char_at", func: bi_char_at }),
+        ("codepoint_at", NativeFn { name: "codepoint_at", func: bi_codepoint_at }),
+        ("from_codepoint", NativeFn { name: "from_codepoint", func: bi_from_codepoint }),
+        ("byte_at", NativeFn { name: "byte_at", func: bi_byte_at }),
+        ("byte_len", NativeFn { name: "byte_len", func: bi_byte_len }),
+        ("to_lower", NativeFn { name: "to_lower", func: bi_to_lower }),
+        ("to_upper", NativeFn { name: "to_upper", func: bi_to_upper }),
+        ("is_digit", NativeFn { name: "is_digit", func: bi_is_digit }),
+        ("is_alpha", NativeFn { name: "is_alpha", func: bi_is_alpha }),
+        ("is_space", NativeFn { name: "is_space", func: bi_is_space }),
         // --- math (Phase 3.5d) ---
         ("min", NativeFn { name: "min", func: bi_min }),
         ("max", NativeFn { name: "max", func: bi_max }),
@@ -217,6 +247,30 @@ fn bi_get(args: &[Value]) -> Result<Value, InterpreterError> {
     ops::get(&args[0], &args[1])
 }
 
+/// `has_key(map, key)` — whether `map` contains `key`. Works on Map only.
+fn bi_has_key(args: &[Value]) -> Result<Value, InterpreterError> {
+    if args.len() != 2 {
+        return Err(InterpreterError::ArityError {
+            expected: 2, got: args.len(), callee: "has_key".into(), span: None,
+        });
+    }
+    match &args[0] {
+        Value::Map(m) => Ok(Value::Bool(m.contains_key(&args[1]))),
+        _ => Err(InterpreterError::TypeError {
+            expected: "Map",
+            got: args[0].type_name(),
+            op: "has_key".into(),
+            span: None,
+        }),
+    }
+}
+
+/// `iter_to_vec(iterable)` — materialize any iterable into a Vec.
+/// Used by the VM's `for...in` lowering so it can index with `get`.
+fn bi_iter_to_vec(args: &[Value]) -> Result<Value, InterpreterError> {
+    one_arg(args, "iter_to_vec").and_then(|v| ops::iter_to_vec(&v))
+}
+
 // ---------------------------------------------------------------------------
 // type predicates
 // ---------------------------------------------------------------------------
@@ -249,10 +303,210 @@ fn bi_is_number(args: &[Value]) -> Result<Value, InterpreterError> {
     Ok(Value::Bool(one_arg(args, "is_number")?.is_number()))
 }
 fn bi_is_func(args: &[Value]) -> Result<Value, InterpreterError> {
-    Ok(Value::Bool(matches!(one_arg(args, "is_func")?, Value::Func(_) | Value::Native(_))))
+    Ok(Value::Bool(matches!(
+        one_arg(args, "is_func")?,
+        Value::Func(_) | Value::Native(_) | Value::Closure(_)
+    )))
 }
+
+/// `is_closure(v)` — true if `v` is a user-defined closure (either a
+/// tree-walker `Func` or a VM `Closure`). Native builtins return false.
+fn bi_is_closure(args: &[Value]) -> Result<Value, InterpreterError> {
+    Ok(Value::Bool(matches!(
+        one_arg(args, "is_closure")?,
+        Value::Func(_) | Value::Closure(_)
+    )))
+}
+
 fn bi_type_of(args: &[Value]) -> Result<Value, InterpreterError> {
     Ok(Value::str(one_arg(args, "type_of")?.type_name()))
+}
+
+// ---------------------------------------------------------------------------
+// Introspection: keys / values / fields / variant_{name,args} / instance_of
+// ---------------------------------------------------------------------------
+
+/// `keys(map)` → Vec of keys. Map keys are returned in iteration order.
+/// Struct fields are returned as a Vec of field-name strings.
+/// Returns an error for non-collection types.
+fn bi_keys(args: &[Value]) -> Result<Value, InterpreterError> {
+    let v = one_arg(args, "keys")?;
+    match v {
+        Value::Map(m) => Ok(Value::vec(m.keys().cloned().collect())),
+        Value::Struct { fields, .. } => Ok(Value::vec(
+            fields.keys().map(|k| Value::str(k.clone())).collect(),
+        )),
+        _ => Err(InterpreterError::TypeError {
+            expected: "Map or Struct",
+            got: v.type_name(),
+            op: "keys".into(),
+            span: None,
+        }),
+    }
+}
+
+/// `values(map)` → Vec of values in iteration order. Struct field values
+/// are returned in the same order as `keys`.
+fn bi_values(args: &[Value]) -> Result<Value, InterpreterError> {
+    let v = one_arg(args, "values")?;
+    match v {
+        Value::Map(m) => Ok(Value::vec(m.values().cloned().collect())),
+        Value::Struct { fields, .. } => Ok(Value::vec(fields.values().cloned().collect())),
+        _ => Err(InterpreterError::TypeError {
+            expected: "Map or Struct",
+            got: v.type_name(),
+            op: "values".into(),
+            span: None,
+        }),
+    }
+}
+
+/// `fields(struct)` → Map of {field_name: value}. Errors for non-structs.
+fn bi_fields(args: &[Value]) -> Result<Value, InterpreterError> {
+    let v = one_arg(args, "fields")?;
+    match v {
+        Value::Struct { fields, .. } => {
+            let entries: Vec<(Value, Value)> = fields
+                .iter()
+                .map(|(k, val)| (Value::str(k.clone()), val.clone()))
+                .collect();
+            Ok(Value::map(entries))
+        }
+        _ => Err(InterpreterError::TypeError {
+            expected: "Struct",
+            got: v.type_name(),
+            op: "fields".into(),
+            span: None,
+        }),
+    }
+}
+
+/// `variant_name(v)` → Str. The variant's name (e.g. "Some" for `Some(42)`).
+fn bi_variant_name(args: &[Value]) -> Result<Value, InterpreterError> {
+    let v = one_arg(args, "variant_name")?;
+    match v {
+        Value::Variant { name, .. } => Ok(Value::str((*name).clone())),
+        Value::Struct { name, .. } => Ok(Value::str((*name).clone())),
+        _ => Err(InterpreterError::TypeError {
+            expected: "Variant or Struct",
+            got: v.type_name(),
+            op: "variant_name".into(),
+            span: None,
+        }),
+    }
+}
+
+/// `variant_args(v)` → Vec. The variant's arguments (empty for nullary).
+fn bi_variant_args(args: &[Value]) -> Result<Value, InterpreterError> {
+    let v = one_arg(args, "variant_args")?;
+    match v {
+        Value::Variant { args, .. } => Ok(Value::vec(args.iter().cloned().collect())),
+        Value::Struct { fields, .. } => Ok(Value::vec(fields.values().cloned().collect())),
+        _ => Err(InterpreterError::TypeError {
+            expected: "Variant or Struct",
+            got: v.type_name(),
+            op: "variant_args".into(),
+            span: None,
+        }),
+    }
+}
+
+/// `instance_of(v, type_name)` → Bool.
+///
+/// - For `Variant { name, .. }` and `Struct { name, .. }`, true if
+///   `type_name` matches the constructor name.
+/// - Otherwise falls back to comparing `type_of(v)` with `type_name`
+///   (so `instance_of(42, "Int")` is true).
+fn bi_instance_of(args: &[Value]) -> Result<Value, InterpreterError> {
+    if args.len() != 2 {
+        return Err(InterpreterError::ArityError {
+            expected: 2,
+            got: args.len(),
+            callee: "instance_of".into(),
+            span: None,
+        });
+    }
+    let v = &args[0];
+    let type_name = match &args[1] {
+        Value::Str(s) => (**s).clone(),
+        _ => {
+            return Err(InterpreterError::TypeError {
+                expected: "Str",
+                got: args[1].type_name(),
+                op: "instance_of".into(),
+                span: None,
+            })
+        }
+    };
+    let matches = match v {
+        Value::Variant { name, .. } | Value::Struct { name, .. } => {
+            name.as_str() == type_name.as_str()
+        }
+        _ => {
+            // Normalize string type names: both "Str" and "String" are
+            // accepted (the language uses "Str" in predicates like
+            // `is_str` but `type_of` returns "String"). Likewise "Func"
+            // and "Closure" are interchangeable for closures.
+            fn norm(s: &str) -> &str {
+                match s {
+                    "Str" => "String",
+                    "Func" => "Closure",
+                    other => other,
+                }
+            }
+            norm(v.type_name()) == norm(&type_name)
+        }
+    };
+    Ok(Value::Bool(matches))
+}
+
+/// `ast_of(src)` → Map. Parses `src` as 1y source and returns the AST
+/// encoded as a 1y Map (see `ast::to_value`). On parse error, returns
+/// an error Map `{"type": "ParseError", "message": str, "line": int, "col": int}`.
+fn bi_ast_of(args: &[Value]) -> Result<Value, InterpreterError> {
+    let src = match one_arg(args, "ast_of")? {
+        Value::Str(s) => (*s).clone(),
+        other => {
+            return Err(InterpreterError::TypeError {
+                expected: "Str",
+                got: other.type_name(),
+                op: "ast_of".into(),
+                span: None,
+            })
+        }
+    };
+    let output = crate::parser::parse(&src);
+    if !output.errors.is_empty() {
+        let e = &output.errors[0];
+        let msg = e.full_message();
+        // Encode the parse error as a structured value so callers can
+        // distinguish "parse failed" from "ast returned" without try/catch.
+        let entries = vec![
+            (Value::str("type".to_string()), Value::str("ParseError".to_string())),
+            (Value::str("message".to_string()), Value::str(msg)),
+            (
+                Value::str("line".to_string()),
+                Value::Int(e.span.start.line.into()),
+            ),
+            (
+                Value::str("col".to_string()),
+                Value::Int(e.span.start.col.into()),
+            ),
+        ];
+        return Ok(Value::map(entries));
+    }
+    Ok(crate::ast::to_value::program_to_value(&output.program))
+}
+
+/// `eval(src)` stub. The real implementation lives in
+/// `Interpreter::eval_src` / `Vm::eval_src` and is dispatched by name from
+/// the native-call path. This function is never called directly — if it
+/// ever is, it means the interpreter didn't intercept `eval` (a bug).
+fn bi_eval_stub(_args: &[Value]) -> Result<Value, InterpreterError> {
+    Err(InterpreterError::RuntimeError {
+        msg: "eval is not available in this context (stub called)".into(),
+        span: None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -474,6 +728,196 @@ fn bi_substring(args: &[Value]) -> Result<Value, InterpreterError> {
     let end = end.max(start as i64).min(n) as usize;
     let result: String = chars[start..end].iter().collect();
     Ok(Value::str(result))
+}
+
+// --- string ops (lexer/parser infrastructure) ---
+//
+// These primitives are intentionally minimal so a 1y-written lexer/parser can
+// compose them into higher-level scanners without needing regex or a native
+// parser library.
+
+/// `starts_with(s, prefix)` — whether `s` begins with `prefix`.
+fn bi_starts_with(args: &[Value]) -> Result<Value, InterpreterError> {
+    if args.len() != 2 {
+        return Err(InterpreterError::ArityError {
+            expected: 2, got: args.len(), callee: "starts_with".into(), span: None,
+        });
+    }
+    let s = str_arg(&args[0], "starts_with")?;
+    let p = str_arg(&args[1], "starts_with")?;
+    Ok(Value::Bool(s.starts_with(p)))
+}
+
+/// `ends_with(s, suffix)` — whether `s` ends with `suffix`.
+fn bi_ends_with(args: &[Value]) -> Result<Value, InterpreterError> {
+    if args.len() != 2 {
+        return Err(InterpreterError::ArityError {
+            expected: 2, got: args.len(), callee: "ends_with".into(), span: None,
+        });
+    }
+    let s = str_arg(&args[0], "ends_with")?;
+    let p = str_arg(&args[1], "ends_with")?;
+    Ok(Value::Bool(s.ends_with(p)))
+}
+
+/// `index_of(s, sub)` — character index of the first occurrence of `sub` in
+/// `s`, or -1 if not found.
+fn bi_index_of(args: &[Value]) -> Result<Value, InterpreterError> {
+    if args.len() != 2 {
+        return Err(InterpreterError::ArityError {
+            expected: 2, got: args.len(), callee: "index_of".into(), span: None,
+        });
+    }
+    let s = str_arg(&args[0], "index_of")?;
+    let sub = str_arg(&args[1], "index_of")?;
+    if sub.is_empty() {
+        return Ok(Value::int(0));
+    }
+    // Find by byte position, then translate to char index.
+    match s.find(sub) {
+        Some(byte_pos) => {
+            let char_pos = s[..byte_pos].chars().count() as i64;
+            Ok(Value::int(char_pos))
+        }
+        None => Ok(Value::int(-1)),
+    }
+}
+
+/// `char_at(s, i)` — the character at character-index `i` as a single-char
+/// Str. Errors if out of range.
+fn bi_char_at(args: &[Value]) -> Result<Value, InterpreterError> {
+    if args.len() != 2 {
+        return Err(InterpreterError::ArityError {
+            expected: 2, got: args.len(), callee: "char_at".into(), span: None,
+        });
+    }
+    let s = str_arg(&args[0], "char_at")?;
+    let i = int_arg(&args[1], "char_at", "i")?;
+    if i < 0 {
+        return Err(InterpreterError::RuntimeError {
+            msg: format!("char_at: index {} is negative", i), span: None,
+        });
+    }
+    match s.chars().nth(i as usize) {
+        Some(c) => Ok(Value::str(c.to_string())),
+        None => Err(InterpreterError::RuntimeError {
+            msg: format!("char_at: index {} out of range (len={})", i, s.chars().count()),
+            span: None,
+        }),
+    }
+}
+
+/// `codepoint_at(s, i)` — Unicode codepoint of the char at character-index
+/// `i`. Errors if out of range.
+fn bi_codepoint_at(args: &[Value]) -> Result<Value, InterpreterError> {
+    if args.len() != 2 {
+        return Err(InterpreterError::ArityError {
+            expected: 2, got: args.len(), callee: "codepoint_at".into(), span: None,
+        });
+    }
+    let s = str_arg(&args[0], "codepoint_at")?;
+    let i = int_arg(&args[1], "codepoint_at", "i")?;
+    if i < 0 {
+        return Err(InterpreterError::RuntimeError {
+            msg: format!("codepoint_at: index {} is negative", i), span: None,
+        });
+    }
+    match s.chars().nth(i as usize) {
+        Some(c) => Ok(Value::int(c as u32 as i64)),
+        None => Err(InterpreterError::RuntimeError {
+            msg: format!("codepoint_at: index {} out of range (len={})", i, s.chars().count()),
+            span: None,
+        }),
+    }
+}
+
+/// `from_codepoint(n)` — single-char string from a Unicode codepoint.
+/// Errors if the codepoint is invalid (outside 0..=0x10FFFF or a surrogate).
+fn bi_from_codepoint(args: &[Value]) -> Result<Value, InterpreterError> {
+    if args.len() != 1 {
+        return Err(InterpreterError::ArityError {
+            expected: 1, got: args.len(), callee: "from_codepoint".into(), span: None,
+        });
+    }
+    let n = int_arg(&args[0], "from_codepoint", "n")?;
+    if !(0..=0x10FFFF).contains(&n) {
+        return Err(InterpreterError::RuntimeError {
+            msg: format!("from_codepoint: {} out of Unicode range", n), span: None,
+        });
+    }
+    match char::from_u32(n as u32) {
+        Some(c) => Ok(Value::str(c.to_string())),
+        None => Err(InterpreterError::RuntimeError {
+            msg: format!("from_codepoint: {} is not a valid scalar value", n), span: None,
+        }),
+    }
+}
+
+/// `byte_at(s, i)` — byte value (0..255) at byte-index `i`. Errors if out
+/// of range.
+fn bi_byte_at(args: &[Value]) -> Result<Value, InterpreterError> {
+    if args.len() != 2 {
+        return Err(InterpreterError::ArityError {
+            expected: 2, got: args.len(), callee: "byte_at".into(), span: None,
+        });
+    }
+    let s = str_arg(&args[0], "byte_at")?;
+    let i = int_arg(&args[1], "byte_at", "i")?;
+    if i < 0 {
+        return Err(InterpreterError::RuntimeError {
+            msg: format!("byte_at: index {} is negative", i), span: None,
+        });
+    }
+    match s.as_bytes().get(i as usize) {
+        Some(&b) => Ok(Value::int(b as i64)),
+        None => Err(InterpreterError::RuntimeError {
+            msg: format!("byte_at: index {} out of range (byte_len={})", i, s.len()),
+            span: None,
+        }),
+    }
+}
+
+/// `byte_len(s)` — number of UTF-8 bytes in `s`.
+fn bi_byte_len(args: &[Value]) -> Result<Value, InterpreterError> {
+    let v = one_arg(args, "byte_len")?;
+    let s = str_arg(&v, "byte_len")?;
+    Ok(Value::int(s.len() as i64))
+}
+
+/// `to_lower(s)` — lowercase copy of `s`.
+fn bi_to_lower(args: &[Value]) -> Result<Value, InterpreterError> {
+    let v = one_arg(args, "to_lower")?;
+    let s = str_arg(&v, "to_lower")?;
+    Ok(Value::str(s.to_lowercase()))
+}
+
+/// `to_upper(s)` — uppercase copy of `s`.
+fn bi_to_upper(args: &[Value]) -> Result<Value, InterpreterError> {
+    let v = one_arg(args, "to_upper")?;
+    let s = str_arg(&v, "to_upper")?;
+    Ok(Value::str(s.to_uppercase()))
+}
+
+/// `is_digit(s)` — whether `s` is a single ASCII digit '0'..'9'.
+fn bi_is_digit(args: &[Value]) -> Result<Value, InterpreterError> {
+    let v = one_arg(args, "is_digit")?;
+    let s = str_arg(&v, "is_digit")?;
+    Ok(Value::Bool(s.len() == 1 && s.as_bytes()[0].is_ascii_digit()))
+}
+
+/// `is_alpha(s)` — whether `s` is a single ASCII alphabetic char [A-Za-z].
+fn bi_is_alpha(args: &[Value]) -> Result<Value, InterpreterError> {
+    let v = one_arg(args, "is_alpha")?;
+    let s = str_arg(&v, "is_alpha")?;
+    Ok(Value::Bool(s.len() == 1 && s.as_bytes()[0].is_ascii_alphabetic()))
+}
+
+/// `is_space(s)` — whether `s` is a single ASCII whitespace char
+/// (' ', '\t', '\n', '\r').
+fn bi_is_space(args: &[Value]) -> Result<Value, InterpreterError> {
+    let v = one_arg(args, "is_space")?;
+    let s = str_arg(&v, "is_space")?;
+    Ok(Value::Bool(matches!(s, " " | "\t" | "\n" | "\r")))
 }
 
 /// Extract a `&str` from a `Value::Str` argument.

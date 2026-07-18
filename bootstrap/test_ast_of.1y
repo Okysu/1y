@@ -1,0 +1,39 @@
+// ast_of smoke test.
+
+let src = "let x = 1 + 2; fn add(a, b) \{ a + b \}";
+let ast = ast_of(src);
+
+println("type: " + str(get(ast, "type")));
+let stmts = get(ast, "stmts");
+println("num stmts: " + str(count(stmts)));
+
+let s0 = get(stmts, 0);
+println("s0 type: " + str(get(s0, "type")));
+println("s0 name: " + str(get(s0, "name")));
+let s0val = get(s0, "value");
+println("s0 val type: " + str(get(s0val, "type")));
+println("s0 val op: " + str(get(s0val, "op")));
+println("s0 val lhs: " + str(get(get(s0val, "lhs"), "value")));
+println("s0 val rhs: " + str(get(get(s0val, "rhs"), "value")));
+
+let s1 = get(stmts, 1);
+println("s1 type: " + str(get(s1, "type")));
+println("s1 name: " + str(get(s1, "name")));
+let s1params = get(s1, "params");
+println("s1 num params: " + str(count(s1params)));
+println("s1 param0 name: " + str(get(get(s1params, 0), "name")));
+println("s1 param1 name: " + str(get(get(s1params, 1), "name")));
+
+println("");
+println("--- parse error ---");
+let bad = ast_of("let x = ;");
+println("error type: " + str(get(bad, "type")));
+println("error msg: " + str(get(bad, "message")));
+println("error line: " + str(get(bad, "line")));
+println("error col: " + str(get(bad, "col")));
+
+println("");
+println("--- introspection on ast ---");
+println("is_map(ast): " + str(is_map(ast)));
+println("has_key(ast, \"stmts\"): " + str(has_key(ast, "stmts")));
+println("keys(ast): " + str(keys(ast)));

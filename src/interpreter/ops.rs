@@ -397,6 +397,40 @@ pub fn get(coll: &Value, key: &Value) -> Result<Value, InterpreterError> {
     }
 }
 
+/// `iter_to_vec(v)` → Vec of items from any iterable (Vec/Set/Map/Str).
+///
+/// Mirrors the tree-walker's `Interpreter::iter_to_vec` so that the VM's
+/// `for...in` (which compiles to `count` + `get` indexing) can iterate over
+/// all the same types by first materializing them into a Vec:
+///
+/// - `Vec`  → itself (cloned)
+/// - `Set`  → elements in iteration order
+/// - `Map`  → `[key, value]` pairs
+/// - `Str`  → single-character strings (Unicode chars)
+pub fn iter_to_vec(v: &Value) -> Result<Value, InterpreterError> {
+    let out = match v {
+        Value::Vec(v) => v.iter().cloned().collect::<Vec<_>>(),
+        Value::Set(s) => s.iter().cloned().collect::<Vec<_>>(),
+        Value::Map(m) => m
+            .iter()
+            .map(|(k, val)| Value::vec(vec![k.clone(), val.clone()]))
+            .collect::<Vec<_>>(),
+        Value::Str(s) => s
+            .chars()
+            .map(|c| Value::str(c.to_string()))
+            .collect::<Vec<_>>(),
+        _ => {
+            return Err(InterpreterError::TypeError {
+                expected: "Vec, Set, Map, or Str (iterable)",
+                got: v.type_name(),
+                op: "iter_to_vec".into(),
+                span: None,
+            })
+        }
+    };
+    Ok(Value::vec(out))
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
