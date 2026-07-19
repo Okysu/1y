@@ -51,6 +51,8 @@ These are available without any `import`.
 | `task_ready` | `(Value) -> Task` | Immediately-ready Task |
 | `task_all` | `(Vec<Task>) -> Task` | Resolves when all inputs resolve |
 | `task_any` | `(Vec<Task>) -> Task` | Resolves when any input resolves |
+| `now_ms` | `() -> Int` | Wall-clock ms since UNIX epoch (for timing) |
+| `now_ns` | `() -> Int` | Wall-clock ns since UNIX epoch (high-res timing) |
 
 ## `env`
 

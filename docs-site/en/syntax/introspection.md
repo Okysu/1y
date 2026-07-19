@@ -257,15 +257,19 @@ Current known limits of `eval` and the reflection builtins:
 
 ## Bootstrapping roadmap
 
-These capabilities are the foundation for 1y's self-bootstrapping. The planned 5-phase path:
+These capabilities were the foundation for 1y's self-bootstrapping, which is
+now **complete**. The 5-phase path:
 
-1. ✅ **tree-walker in 1y** (`bootstrap/interp.1y`) — implement a tree-walker for a 1y subset inside 1y itself, proving self-interpretation is feasible.
-2. ⏳ **parser in 1y** — hand-written recursive descent parser producing `Vec` / `Map` ASTs (i.e. the structure returned by `ast_of`).
-3. ⏳ **bytecode compiler in 1y** — compile ASTs into `Vec<Int>` bytecode.
-4. ⏳ **VM interpreter loop in 1y** — `match`-dispatched opcode handling.
-5. ⏳ **replace the Rust VM** — run the full existing test suite under the 1y-implemented VM.
+1. ✅ **tree-walker in 1y** (`bootstrap/interp.1y`) — a tree-walker for a 1y subset inside 1y itself, proving self-interpretation is feasible.
+2. ✅ **parser in 1y** (`bootstrap/parser.1y`) — hand-written recursive descent parser producing `Vec` / `Map` ASTs (i.e. the structure returned by `ast_of`).
+3. ✅ **bytecode compiler in 1y** (`bootstrap/compiler.1y`) — compiles ASTs into `Vec<Int>` bytecode.
+4. ✅ **VM interpreter loop in 1y** (`bootstrap/vm.1y`) — `match`-dispatched opcode handling.
+5. ✅ **self-hosted end-to-end runner** (`bootstrap/selfvm.1y`) — `1y selfvm <file.1y>` lexes, parses, compiles, and executes 1y source using only 1y-implemented components.
 
-Phase 1 is complete; phases 2–5 are pending. See [Bytecode VM](../philosophy/bytecode-vm).
+All 5 phases are complete. Run the self-hosted toolchain with `1y selfvm <file.1y>`,
+and the self-hosted test suites with `1y selfvm bootstrap/test_parser.1y`,
+`1y selfvm bootstrap/test_compiler.1y`, and `1y selfvm bootstrap/test_vm.1y`.
+See [Bytecode VM](../philosophy/bytecode-vm) for details.
 
 ## References
 

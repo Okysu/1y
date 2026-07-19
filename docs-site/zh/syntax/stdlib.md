@@ -331,3 +331,18 @@ let h = c.sha256("x");
 | 函数 | 作用 |
 |------|------|
 | `pid_of(actor)` | 返回 actor 的 Pid（u64） |
+
+### 时间
+
+| 函数 | 作用 |
+|------|------|
+| `now_ms()` | 返回自 UNIX epoch 起的毫秒数（Int），用于计时 |
+| `now_ns()` | 返回自 UNIX epoch 起的纳秒数（Int），高分辨率计时 |
+
+用于基准测试和计时：
+
+```1y
+let t0 = now_ms();
+// ... 待测代码 ...
+println("耗时: " + to_str(now_ms() - t0) + " ms")
+```

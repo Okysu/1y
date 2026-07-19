@@ -331,3 +331,18 @@ In addition to the 10 modules above, 1y ships a set of **global functions** — 
 | Function | Effect |
 |----------|--------|
 | `pid_of(actor)` | return the actor's Pid (u64) |
+
+### Time
+
+| Function | Effect |
+|----------|--------|
+| `now_ms()` | wall-clock milliseconds since UNIX epoch (Int) |
+| `now_ns()` | wall-clock nanoseconds since UNIX epoch (Int, higher resolution) |
+
+Used for benchmarking and timing:
+
+```1y
+let t0 = now_ms();
+// ... work ...
+println("elapsed: " + to_str(now_ms() - t0) + " ms")
+```

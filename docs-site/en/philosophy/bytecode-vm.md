@@ -176,9 +176,37 @@ All 502 tests pass, covering every feature above. The tree-walker (`1y run`) is 
 # Tree-walker (for comparison / debugging)
 1y run examples/fibonacci.1y
 
-# Run the VM test suite
-1y vm tests/vm_test.1y
+# Run the Rust VM test suite (cargo integration tests)
+cargo test
+
+# Run the 1y-implemented (self-hosted) VM on a file
+1y selfvm examples/phase1.1y
+
+# Run the self-hosted VM test suites
+1y selfvm bootstrap/test_parser.1y
+1y selfvm bootstrap/test_compiler.1y
+1y selfvm bootstrap/test_vm.1y
 ```
+
+See [Self-Bootstrapping](#self-bootstrapping) below for the 1y-implemented
+toolchain.
+
+## Self-Bootstrapping
+
+1y is fully self-bootstrapping: the lexer, parser, compiler, and VM are
+themselves implemented in 1y under `bootstrap/`. The 5-phase path is
+**complete**:
+
+1. ✅ **tree-walker in 1y** (`bootstrap/interp.1y`) — proves self-interpretation is feasible.
+2. ✅ **parser in 1y** (`bootstrap/parser.1y`) — hand-written recursive descent producing `Vec` / `Map` ASTs (the structure returned by `ast_of`).
+3. ✅ **bytecode compiler in 1y** (`bootstrap/compiler.1y`) — compiles ASTs into `Vec<Int>` bytecode.
+4. ✅ **VM interpreter loop in 1y** (`bootstrap/vm.1y`) — `match`-dispatched opcode handling.
+5. ✅ **self-hosted end-to-end runner** (`bootstrap/selfvm.1y`) — `1y selfvm <file.1y>` lexes, parses, compiles, and executes 1y source using only 1y-implemented components.
+
+The 1y-implemented VM is a tree-walker over bytecode (it runs on the Rust
+tree-walker), so it is slower than the Rust VM — but it proves the language
+can self-host. See [Reflection & Dynamic Evaluation](../syntax/introspection)
+for the `ast_of` / `eval` foundation that made this possible.
 
 ## Implementation
 

@@ -176,9 +176,35 @@ VM 已与 tree-walker 功能对齐——所有 1y 语言特性都在字节码后
 # Tree-walker（用于对比 / 调试）
 1y run examples/fibonacci.1y
 
-# 运行 VM 测试套件
-1y vm tests/vm_test.1y
+# 运行 Rust VM 集成测试
+cargo test
+
+# 用 1y 实现（自托管）的 VM 跑一个文件
+1y selfvm examples/phase1.1y
+
+# 运行自托管 VM 测试套件
+1y selfvm bootstrap/test_parser.1y
+1y selfvm bootstrap/test_compiler.1y
+1y selfvm bootstrap/test_vm.1y
 ```
+
+1y 实现的工具链见下方[自举](#自举)章节。
+
+## 自举
+
+1y 已完全自举：lexer、parser、编译器、VM 都在 `bootstrap/` 下用 1y 自身
+实现。5 阶段路径**全部完成**：
+
+1. ✅ **tree-walker in 1y**（`bootstrap/interp.1y`）—— 证明自解释可行。
+2. ✅ **parser in 1y**（`bootstrap/parser.1y`）—— 手写递归下降 parser，输出 `Vec` / `Map` 形式的 AST（即 `ast_of` 的返回结构）。
+3. ✅ **字节码编译器 in 1y**（`bootstrap/compiler.1y`）—— 把 AST 编译成 `Vec<Int>` 字节流。
+4. ✅ **VM 解释循环 in 1y**（`bootstrap/vm.1y`）—— `match` 分发操作码。
+5. ✅ **自托管端到端运行器**（`bootstrap/selfvm.1y`）—— `1y selfvm <file.1y>` 完整地用 1y 实现的组件完成 lex → parse → compile → VM 执行。
+
+1y 实现的 VM 本身是一个对字节码的 tree-walker（它跑在 Rust tree-walker
+之上），所以比 Rust VM 慢——但它证明了这门语言可以自托管。详见
+[反射与动态求值](../syntax/introspection)，其中 `ast_of` / `eval` 是这一切
+的基础。
 
 ## 实现
 

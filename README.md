@@ -5,12 +5,13 @@
 > A streaming, concurrent, functional programming language implemented in Rust.
 
 `1y` (pronounced "one-why") is a language with **two execution backends** — a
-tree-walking interpreter and a stack-based bytecode VM — that brings together
-persistent data structures, pattern matching, actor-based concurrency,
-software transactional memory (STM), Zig-style colorless async, and a
-pragmatic module system, all backed by arbitrary-precision arithmetic. It
-also ships **runtime reflection** (`ast_of`, `eval`, type predicates) that
-forms the foundation of an in-progress self-bootstrapping effort.
+stack-based bytecode VM (default) and a tree-walking interpreter — that
+brings together persistent data structures, pattern matching, actor-based
+concurrency, software transactional memory (STM), Zig-style colorless async,
+and a pragmatic module system, all backed by arbitrary-precision arithmetic.
+It also ships **runtime reflection** (`ast_of`, `eval`, type predicates)
+and is **fully self-bootstrapping**: the bytecode VM, compiler, parser, and
+lexer are themselves implemented in 1y under `bootstrap/`.
 
 ---
 
@@ -148,26 +149,43 @@ variant_name(v);             // "Bad"
 | `examples/phase4.5.1y` | Crypto (SHA/HMAC/base64), TLS client, FFI stubs |
 | `examples/phase4.6.1y` | Real FFI: load shared libraries, call native functions |
 | `examples/bench.1y` | Benchmark suite: fib, factorial, loops, collections, JSON |
-| `bootstrap/interp.1y` | **Self-bootstrap phase 1**: a 1y tree-walker written in 1y |
-| `bootstrap/test_eval.1y` | `eval` / `ast_of` / introspection test suite |
+| `bootstrap/lexer.1y` | **Self-bootstrap**: 1y lexer written in 1y |
+| `bootstrap/parser.1y` | **Self-bootstrap**: recursive-descent parser → AST |
+| `bootstrap/compiler.1y` | **Self-bootstrap**: AST → bytecode compiler |
+| `bootstrap/vm.1y` | **Self-bootstrap**: bytecode VM interpreter loop |
+| `bootstrap/selfvm.1y` | **Self-bootstrap**: end-to-end runner (lex → parse → compile → VM) |
+| `bootstrap/test_parser.1y` | Parser test suite (compares 1y output vs Rust `ast_of`) |
+| `bootstrap/test_compiler.1y` | Bytecode compiler test suite |
+| `bootstrap/test_vm.1y` | VM test suite (arithmetic, closures, match/try, etc.) |
 
 ---
 
-## Self-Bootstrapping Roadmap
+## Self-Bootstrapping
 
-1y aims to eventually host its own implementation. The reflection builtins
-(`ast_of`, `eval`, type predicates) are the foundation for this effort.
-The planned 5-phase path:
+1y hosts its own implementation. The reflection builtins (`ast_of`, `eval`,
+type predicates) made this possible — the 1y toolchain is now implemented
+in 1y itself under [`bootstrap/`](./bootstrap/). The 5-phase path is
+**complete**:
 
 1. **✅ tree-walker in 1y** — [`bootstrap/interp.1y`](./bootstrap/interp.1y)
-   implements a tree-walker for a 1y subset inside 1y itself. Phase 1 is
-   complete and runs against the existing test suite.
-2. **⏳ parser in 1y** — hand-written recursive descent producing `Vec` /
-   `Map` ASTs (the structure returned by `ast_of`).
-3. **⏳ bytecode compiler in 1y** — compile ASTs to `Vec<Int>` bytecode.
-4. **⏳ VM interpreter loop in 1y** — `match`-dispatched opcode handling.
-5. **⏳ replace the Rust VM** — run the full existing test suite under the
-   1y-implemented VM.
+   implements a tree-walker for a 1y subset inside 1y itself.
+2. **✅ parser in 1y** — [`bootstrap/parser.1y`](./bootstrap/parser.1y) is a
+   hand-written recursive descent parser producing `Vec` / `Map` ASTs (the
+   structure returned by `ast_of`).
+3. **✅ bytecode compiler in 1y** — [`bootstrap/compiler.1y`](./bootstrap/compiler.1y)
+   compiles ASTs to `Vec<Int>` bytecode.
+4. **✅ VM interpreter loop in 1y** — [`bootstrap/vm.1y`](./bootstrap/vm.1y)
+   is a `match`-dispatched bytecode VM.
+5. **✅ self-hosted VM** — [`bootstrap/selfvm.1y`](./bootstrap/selfvm.1y)
+   ties them together: `1y selfvm <file.1y>` lexes, parses, compiles, and
+   executes 1y source using only 1y-implemented components.
+
+Run the self-hosted VM:
+
+```bash
+1y selfvm examples/phase1.1y     # 1y running 1y-implemented VM
+1y selfvm bootstrap/test_vm.1y   # self-hosted VM test suite
+```
 
 See [Reflection & Dynamic Evaluation](https://okysu.github.io/1y/syntax/introspection)
 in the docs for details.
@@ -239,7 +257,7 @@ Online docs: https://okysu.github.io/1y/
 │   └── lib.rs          # Library API
 ├── tests/              # Integration tests (502 tests)
 ├── examples/           # Example programs
-├── bootstrap/          # Self-bootstrapping effort (phase 1: interp.1y)
+├── bootstrap/          # Self-bootstrapping toolchain (lexer/parser/compiler/vm in 1y)
 ├── editor/             # VSCode extension
 ├── docs-site/          # VitePress documentation
 ├── docs/               # Language guide, stdlib reference, architecture

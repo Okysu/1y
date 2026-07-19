@@ -1,0 +1,236 @@
+// ============================================================
+// test_compiler.1y — verify 1y compiler output structure
+//
+// Compiles various source snippets and asserts the opcode layout
+// matches the expected encoding (per src/vm/chunk.rs).
+// ============================================================
+
+import lexer;
+import parser;
+import compiler;
+
+let lex = lexer.lex;
+let parse = parser.parse;
+let compile_program = compiler.compile_program;
+
+// ---------- assertion helpers ----------
+
+let pass_count = 0;
+let fail_count = 0;
+
+fn assert_eq(actual, expected, msg) {
+    if actual == expected {
+        pass_count = pass_count + 1
+    } else {
+        fail_count = fail_count + 1;
+        println("FAIL: " + msg + " — expected " + to_str(expected) + ", got " + to_str(actual))
+    }
+}
+
+fn code_at(chunk, i) { chunk.code[i] }
+fn code_len(chunk) { count(chunk.code) }
+fn consts_at(chunk, i) { chunk.consts[i] }
+fn consts_count(chunk) { count(chunk.consts) }
+fn sub_chunks_count(chunk) { count(chunk.sub_chunks) }
+fn sub_chunk_at(chunk, i) { chunk.sub_chunks[i] }
+
+// OP_* constants (mirror compiler.1y)
+let OP_NIL = 0;
+let OP_CONST = 3;
+let OP_LOAD_LOCAL = 4;
+let OP_STORE_LOCAL = 5;
+let OP_LOAD_GLOBAL = 8;
+let OP_DEFINE_GLOBAL = 10;
+let OP_POP = 14;
+let OP_POP_N = 15;
+let OP_POP_LOCAL_KEEP = 16;
+let OP_ADD = 21;
+let OP_MUL = 23;
+let OP_LT = 30;
+let OP_JUMP = 34;
+let OP_JUMP_IF_FALSE = 35;
+let OP_LOOP = 37;
+let OP_CLOSURE = 38;
+let OP_CALL = 39;
+let OP_RETURN = 43;
+let OP_PUSH_LOOP = 76;
+let OP_POP_LOOP = 77;
+
+fn compile_src(src) {
+    let toks = lex(src);
+    let prog = parse(toks);
+    compile_program(prog)
+}
+
+// ---------- tests ----------
+
+fn test_simple_expr() {
+    // `1 + 2 * 3` as last expr stmt → value kept for OP_RETURN
+    // Layout: [3,0, 3,1, 3,2, 23, 21, 43]  (9 bytes, no OP_POP)
+    let chunk = compile_src("1 + 2 * 3");
+    assert_eq(code_len(chunk), 9, "simple_expr code_len");
+    assert_eq(code_at(chunk, 0), OP_CONST, "simple_expr [0] OP_CONST");
+    assert_eq(code_at(chunk, 1), 0, "simple_expr [1] const idx 0");
+    assert_eq(code_at(chunk, 2), OP_CONST, "simple_expr [2] OP_CONST");
+    assert_eq(code_at(chunk, 4), OP_CONST, "simple_expr [4] OP_CONST");
+    assert_eq(code_at(chunk, 6), OP_MUL, "simple_expr [6] OP_MUL");
+    assert_eq(code_at(chunk, 7), OP_ADD, "simple_expr [7] OP_ADD");
+    assert_eq(code_at(chunk, 8), OP_RETURN, "simple_expr [8] OP_RETURN");
+    assert_eq(consts_count(chunk), 3, "simple_expr consts_count");
+    assert_eq(consts_at(chunk, 0), 1, "simple_expr const[0]=1");
+    assert_eq(consts_at(chunk, 1), 2, "simple_expr const[1]=2");
+    assert_eq(consts_at(chunk, 2), 3, "simple_expr const[2]=3")
+}
+
+fn test_let_global() {
+    // `let x = 1 + 2` → OP_CONST 0, OP_CONST 1, OP_ADD, OP_DEFINE_GLOBAL 2, OP_NIL, OP_RETURN
+    // (Let is last stmt → emit OP_NIL so OP_RETURN has something to pop)
+    // Layout: [3,0, 3,1, 21, 10,2, 0, 43]  (9 bytes)
+    let chunk = compile_src("let x = 1 + 2");
+    assert_eq(code_len(chunk), 9, "let_global code_len");
+    assert_eq(code_at(chunk, 0), OP_CONST, "let_global [0] OP_CONST");
+    assert_eq(code_at(chunk, 2), OP_CONST, "let_global [2] OP_CONST");
+    assert_eq(code_at(chunk, 4), OP_ADD, "let_global [4] OP_ADD");
+    assert_eq(code_at(chunk, 5), OP_DEFINE_GLOBAL, "let_global [5] OP_DEFINE_GLOBAL");
+    assert_eq(code_at(chunk, 6), 2, "let_global [6] const idx 2 (x)");
+    assert_eq(code_at(chunk, 7), OP_NIL, "let_global [7] OP_NIL");
+    assert_eq(code_at(chunk, 8), OP_RETURN, "let_global [8] OP_RETURN");
+    assert_eq(consts_count(chunk), 3, "let_global consts_count");
+    assert_eq(consts_at(chunk, 0), 1, "let_global const[0]=1");
+    assert_eq(consts_at(chunk, 1), 2, "let_global const[1]=2");
+    assert_eq(consts_at(chunk, 2), "x", "let_global const[2]=x")
+}
+
+fn test_function_def() {
+    // `fn add(a, b) { a + b }` at top level
+    let chunk = compile_src("fn add(a, b) \{ a + b \}");
+    // script: OP_CLOSURE 0, OP_DEFINE_GLOBAL 1, OP_NIL, OP_RETURN
+    // (FuncDef is last stmt → emit OP_NIL so OP_RETURN has something to pop)
+    // Layout: [38,0, 10,1, 0, 43]  (6 bytes)
+    assert_eq(code_len(chunk), 6, "func_def script code_len");
+    assert_eq(code_at(chunk, 0), OP_CLOSURE, "func_def [0] OP_CLOSURE");
+    assert_eq(code_at(chunk, 1), 0, "func_def [1] chunk_idx 0");
+    assert_eq(code_at(chunk, 2), OP_DEFINE_GLOBAL, "func_def [2] OP_DEFINE_GLOBAL");
+    assert_eq(code_at(chunk, 4), OP_NIL, "func_def [4] OP_NIL");
+    assert_eq(code_at(chunk, 5), OP_RETURN, "func_def [5] OP_RETURN");
+    // sub_chunk: add
+    assert_eq(sub_chunks_count(chunk), 1, "func_def sub_chunks_count");
+    let add = sub_chunk_at(chunk, 0);
+    assert_eq(add.arity, 2, "func_def add.arity");
+    assert_eq(code_len(add), 6, "func_def add code_len");
+    assert_eq(code_at(add, 0), OP_LOAD_LOCAL, "func_def add[0] OP_LOAD_LOCAL");
+    assert_eq(code_at(add, 1), 0, "func_def add[1] slot 0 (a)");
+    assert_eq(code_at(add, 2), OP_LOAD_LOCAL, "func_def add[2] OP_LOAD_LOCAL");
+    assert_eq(code_at(add, 3), 1, "func_def add[3] slot 1 (b)");
+    assert_eq(code_at(add, 4), OP_ADD, "func_def add[4] OP_ADD");
+    assert_eq(code_at(add, 5), OP_RETURN, "func_def add[5] OP_RETURN")
+}
+
+fn test_function_call() {
+    // `add(1, 2)` as last expr stmt → value kept for OP_RETURN (no OP_POP)
+    // Layout: [8,0, 3,1, 3,2, 39,2, 43]  (9 bytes)
+    let chunk = compile_src("add(1, 2)");
+    assert_eq(code_len(chunk), 9, "func_call code_len");
+    assert_eq(code_at(chunk, 0), OP_LOAD_GLOBAL, "func_call [0] OP_LOAD_GLOBAL");
+    assert_eq(code_at(chunk, 2), OP_CONST, "func_call [2] OP_CONST (arg 1)");
+    assert_eq(code_at(chunk, 4), OP_CONST, "func_call [4] OP_CONST (arg 2)");
+    assert_eq(code_at(chunk, 6), OP_CALL, "func_call [6] OP_CALL");
+    assert_eq(code_at(chunk, 7), 2, "func_call [7] argc=2");
+    assert_eq(code_at(chunk, 8), OP_RETURN, "func_call [8] OP_RETURN")
+}
+
+fn test_if_expr() {
+    // `if true { 1 } else { 2 }` as expr stmt
+    let chunk = compile_src("if true \{ 1 \} else \{ 2 \}");
+    // OP_TRUE, OP_JUMP_IF_FALSE <2 bytes>, OP_CONST 0, OP_JUMP <2 bytes>,
+    // OP_CONST 1, OP_POP, OP_RETURN
+    // Layout: [1, 35, lo, hi, 3, 0, 34, lo, hi, 3, 1, 14, 43]
+    assert_eq(code_at(chunk, 0), 1, "if [0] OP_TRUE");
+    assert_eq(code_at(chunk, 1), OP_JUMP_IF_FALSE, "if [1] OP_JUMP_IF_FALSE");
+    assert_eq(code_at(chunk, 4), OP_CONST, "if [4] OP_CONST (then=1)");
+    assert_eq(code_at(chunk, 6), OP_JUMP, "if [6] OP_JUMP");
+    assert_eq(code_at(chunk, 9), OP_CONST, "if [9] OP_CONST (else=2)");
+    // Verify jump targets patched correctly:
+    // jump_if_false at offset 2 → target = 9 (else branch start)
+    let jif_lo = code_at(chunk, 2);
+    let jif_hi = code_at(chunk, 3);
+    let jif_target = jif_lo + jif_hi * 256;
+    assert_eq(jif_target, 9, "if jump_if_false target=9 (else start)");
+    // jump at offset 7 → target = 11 (after else, before OP_POP)
+    let j_lo = code_at(chunk, 7);
+    let j_hi = code_at(chunk, 8);
+    let j_target = j_lo + j_hi * 256;
+    assert_eq(j_target, 11, "if jump target=11 (after else value)")
+}
+
+fn test_while_loop() {
+    // `while x < 10 { x }` — x is global, just check structure
+    let chunk = compile_src("while x < 10 \{ x \}");
+    // OP_PUSH_LOOP, <continue 2 bytes>, <break 2 bytes>,
+    // loop_start: OP_LOAD_GLOBAL 0 (x), OP_CONST 1 (10), OP_LT,
+    // OP_JUMP_IF_FALSE <2 bytes>,
+    // body: OP_LOAD_GLOBAL 0 (x), OP_POP,
+    // OP_LOOP <2 bytes>,
+    // normal: OP_POP_LOOP, OP_NIL, OP_JUMP <2 bytes>,
+    // break: OP_POP_LOOP
+    assert_eq(code_at(chunk, 0), OP_PUSH_LOOP, "while [0] OP_PUSH_LOOP");
+    let continue_lo = code_at(chunk, 1);
+    let continue_hi = code_at(chunk, 2);
+    let continue_target = continue_lo + continue_hi * 256;
+    // continue should point to cond evaluation (loop_start)
+    // loop_start is at offset 5 (after PUSH_LOOP + 4 bytes)
+    assert_eq(continue_target, 5, "while continue target=5 (loop_start)");
+    assert_eq(code_at(chunk, 5), OP_LOAD_GLOBAL, "while [5] OP_LOAD_GLOBAL (cond x)");
+    assert_eq(code_at(chunk, 7), OP_CONST, "while [7] OP_CONST (10)");
+    assert_eq(code_at(chunk, 9), OP_LT, "while [9] OP_LT");
+    assert_eq(code_at(chunk, 10), OP_JUMP_IF_FALSE, "while [10] OP_JUMP_IF_FALSE")
+}
+
+fn test_nested_let_in_function() {
+    // Function with local let: verify OP_STORE_LOCAL / OP_LOAD_LOCAL
+    let chunk = compile_src("fn f(a) \{ let b = a + 1; b * 2 \}");
+    assert_eq(sub_chunks_count(chunk), 1, "nested_let sub_chunks_count");
+    let f = sub_chunk_at(chunk, 0);
+    assert_eq(f.arity, 1, "nested_let f.arity");
+    // b is slot 1 (a is slot 0)
+    // Body: OP_LOAD_LOCAL 0 (a), OP_CONST 0 (1), OP_ADD, OP_STORE_LOCAL 1 (b),
+    //       OP_LOAD_LOCAL 1 (b), OP_CONST 1 (2), OP_MUL,
+    //       OP_POP_LOCAL_KEEP 1 (pop b, keep tail value), OP_RETURN
+    assert_eq(code_at(f, 0), OP_LOAD_LOCAL, "nested_let f[0] OP_LOAD_LOCAL (a)");
+    assert_eq(code_at(f, 1), 0, "nested_let f[1] slot 0 (a)");
+    assert_eq(code_at(f, 2), OP_CONST, "nested_let f[2] OP_CONST (1)");
+    assert_eq(code_at(f, 4), OP_ADD, "nested_let f[4] OP_ADD");
+    assert_eq(code_at(f, 5), OP_STORE_LOCAL, "nested_let f[5] OP_STORE_LOCAL (b)");
+    assert_eq(code_at(f, 6), 1, "nested_let f[6] slot 1 (b)");
+    assert_eq(code_at(f, 7), OP_LOAD_LOCAL, "nested_let f[7] OP_LOAD_LOCAL (b)");
+    assert_eq(code_at(f, 8), 1, "nested_let f[8] slot 1 (b)");
+    assert_eq(code_at(f, 9), OP_CONST, "nested_let f[9] OP_CONST (2)");
+    assert_eq(code_at(f, 11), OP_MUL, "nested_let f[11] OP_MUL");
+    assert_eq(code_at(f, 12), OP_POP_LOCAL_KEEP, "nested_let f[12] OP_POP_LOCAL_KEEP");
+    assert_eq(code_at(f, 13), 1, "nested_let f[13] pop count 1 (b)");
+    assert_eq(code_at(f, 14), OP_RETURN, "nested_let f[14] OP_RETURN")
+}
+
+fn test_return_value() {
+    let chunk = compile_src("fn f() \{ return 42 \}");
+    let f = sub_chunk_at(chunk, 0);
+    // OP_CONST 0 (42), OP_RETURN
+    assert_eq(code_at(f, 0), OP_CONST, "return f[0] OP_CONST (42)");
+    assert_eq(code_at(f, 2), OP_RETURN, "return f[2] OP_RETURN")
+}
+
+// ---------- run ----------
+
+test_simple_expr();
+test_let_global();
+test_function_def();
+test_function_call();
+test_if_expr();
+test_while_loop();
+test_nested_let_in_function();
+test_return_value();
+
+println("");
+println("=========================================");
+println("test_compiler: " + to_str(pass_count) + " passed, " + to_str(fail_count) + " failed");
+println("=========================================");

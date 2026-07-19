@@ -1,0 +1,14 @@
+// Test struct construction and match struct pattern via selfvm.
+type Point = { x: Int, y: Int };
+
+let p = Point({ x: 1, y: 2 });
+println("p.x = " + to_str(p.x) + " (expect 1)");
+println("p.y = " + to_str(p.y) + " (expect 2)");
+
+let r = match p { Point { x: a, y: b } => a + b, _ => 0 };
+println("match struct: " + to_str(r) + " (expect 3)");
+
+// Variant-style via map literal (since enum parser not supported).
+let some = { "__variant__": "Some", "args": [42] };
+let r2 = match some { Some(v) => v + 1, _ => 0 };
+println("match variant: " + to_str(r2) + " (expect 43)");

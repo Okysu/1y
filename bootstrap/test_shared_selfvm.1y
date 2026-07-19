@@ -1,0 +1,52 @@
+// Test SharedRef write-through via selfvm.
+println("--- shared write-through tests ---");
+
+// 1. shared local + reassign
+let x = shared 0;
+x = x + 1;
+println("shared x = shared 0; x = x + 1: " + to_str(x) + " (expect 1)");
+
+// 2. shared local + closure write-through
+let counter = shared 0;
+let inc = fn() { counter = counter + 1 };
+inc();
+inc();
+println("shared counter + closure inc x2: " + to_str(counter) + " (expect 2)");
+
+// 3. shared global + reassign
+let g = shared 100;
+g = g + 50;
+println("shared g = shared 100; g = g + 50: " + to_str(g) + " (expect 150)");
+
+// 4. shared as function parameter (pass-by-ref)
+let bump = fn(c) { c = c + 10 };
+let cell = shared 5;
+bump(cell);
+println("shared cell = shared 5; bump(cell): " + to_str(cell) + " (expect 15)");
+
+// 5. shared in if-block
+let h = shared 0;
+if true { h = h + 7 };
+println("shared h after if-block: " + to_str(h) + " (expect 7)");
+
+// 6. shared in while-loop
+let i = 0;
+let acc = shared 0;
+while i < 5 {
+    acc = acc + i;
+    i = i + 1
+};
+println("shared acc after while 0..5: " + to_str(acc) + " (expect 10)");
+
+// 7. multiple closures share the same cell
+let sh = shared 0;
+let add1 = fn() { sh = sh + 1 };
+let add10 = fn() { sh = sh + 10 };
+add10();
+add1();
+println("shared sh after add10; add1: " + to_str(sh) + " (expect 11)");
+
+// 8. shared reassign via negative / complex expr
+let v = shared 10;
+v = v * 2 - 3;
+println("shared v after v*2-3: " + to_str(v) + " (expect 17)");

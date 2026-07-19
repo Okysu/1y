@@ -1,0 +1,1676 @@
+// ============================================================
+// 1y self-hosting Stage 3: bytecode compiler written in 1y.
+//
+// Consumes a Program AST (from parser.1y) and produces a Chunk
+// matching the encoding in src/vm/chunk.rs:
+//   { "code": Vec<Int>, "consts": Vec<Value>, "sub_chunks": Vec<Chunk>,
+//     "arity": Int, "upvalue_count": Int, "name": Str, "jumps": Vec<Map> }
+//
+// The "jumps" field is a deferred-patch table: patch_jump records
+// {offset, target} pairs, and finish_chunk writes them back into
+// `code` as u16 little-endian. This avoids immediate u16 rewrite
+// (which would require Vec index assignment).
+//
+// Supported AST nodes (phase 3 minimal):
+//   stmt    : Let, SharedDecl, FuncDef, TypeDef, Import, Expr, Semi
+//   expr    : Int, Decimal, Str, Bool, Nil, Ident, BinOp, UnaryOp,
+//             Pipe, If, Lambda, Block, Paren, Call, MethodCall,
+//             Index, Field, Assign, CompoundAssign, VecLit, MapLit,
+//             SetLit, While, Loop, For, Return, Break, Continue, Raise,
+//             SharedExpr
+// ============================================================
+
+import lexer;
+import parser;
+
+let lex = lexer.lex;
+let parse = parser.parse;
+
+// ---------- OpCode constants (from src/vm/chunk.rs #[repr(u8)]) ----------
+
+let OP_NIL = 0;
+let OP_TRUE = 1;
+let OP_FALSE = 2;
+let OP_CONST = 3;
+let OP_LOAD_LOCAL = 4;
+let OP_STORE_LOCAL = 5;
+let OP_LOAD_UPVALUE = 6;
+let OP_STORE_UPVALUE = 7;
+let OP_LOAD_GLOBAL = 8;
+let OP_STORE_GLOBAL = 9;
+let OP_DEFINE_GLOBAL = 10;
+let OP_LOAD_LOCAL_REF = 11;
+let OP_LOAD_UPVALUE_REF = 12;
+let OP_LOAD_GLOBAL_REF = 13;
+let OP_POP = 14;
+let OP_POP_N = 15;
+let OP_POP_LOCAL_KEEP = 16;
+let OP_DUP = 17;
+let OP_NEW_VEC = 18;
+let OP_NEW_MAP = 19;
+let OP_NEW_SET = 20;
+let OP_ADD = 21;
+let OP_SUB = 22;
+let OP_MUL = 23;
+let OP_DIV = 24;
+let OP_MOD = 25;
+let OP_NEG = 26;
+let OP_NOT = 27;
+let OP_EQ = 28;
+let OP_NEQ = 29;
+let OP_LT = 30;
+let OP_GT = 31;
+let OP_LTE = 32;
+let OP_GTE = 33;
+let OP_JUMP = 34;
+let OP_JUMP_IF_FALSE = 35;
+let OP_JUMP_IF_TRUE = 36;
+let OP_LOOP = 37;
+let OP_CLOSURE = 38;
+let OP_CALL = 39;
+let OP_METHOD_CALL = 40;
+let OP_CONSTRUCT_VARIANT = 41;
+let OP_CONSTRUCT_STRUCT = 42;
+let OP_RETURN = 43;
+let OP_ASSIGN_LOCAL = 44;
+let OP_ASSIGN_UPVALUE = 45;
+let OP_ASSIGN_GLOBAL = 46;
+let OP_INDEX = 47;
+let OP_INDEX_ASSIGN = 48;
+let OP_FIELD = 49;
+let OP_FIELD_ASSIGN = 50;
+let OP_MATCH = 51;
+let OP_BREAK = 52;
+let OP_CONTINUE = 53;
+let OP_RETURN_SIGNAL = 54;
+let OP_RETRY = 55;
+let OP_RAISE = 56;
+let OP_PUSH_TRY = 57;
+let OP_POP_TRY = 58;
+let OP_RESCUE_MATCH = 59;
+let OP_ENSURE_EXIT = 60;
+let OP_CLEAR_PENDING = 61;
+let OP_SHARED_EXPR = 62;
+let OP_PUSH_TRANSACT = 63;
+let OP_TRANSACT_COMMIT = 64;
+let OP_YIELD = 65;
+let OP_REPLY = 66;
+let OP_AWAIT = 67;
+let OP_SPAWN = 68;
+let OP_ACTOR_SEND = 69;
+let OP_ACTOR_REQUEST = 70;
+let OP_DEFINE_ACTOR = 71;
+let OP_REGISTER_HANDLER = 72;
+let OP_IMPORT = 73;
+let OP_SWAP = 74;
+let OP_ROT3 = 75;
+let OP_PUSH_LOOP = 76;
+let OP_POP_LOOP = 77;
+
+// ---------- Chunk ----------
+
+// Return a new Vec equal to `v` without its last element.
+// (1y's `rest` drops the FIRST element, so we need this for stack pops.)
+fn pop_last(v) {
+    let n = count(v);
+    let out = [];
+    let i = 0;
+    while i < n - 1 {
+        out = push(out, v[i]);
+        i = i + 1
+    };
+    out
+}
+
+fn new_chunk(name, arity) {
+    shared {
+        "code": [],
+        "consts": [],
+        "sub_chunks": [],
+        "arity": arity,
+        "upvalue_count": 0,
+        "name": name,
+        "jumps": [],
+        "patterns": []
+    }
+}
+
+// ---------- FuncCtx ----------
+
+fn new_func_ctx(function_type, name) {
+    shared {
+        "chunk": new_chunk(name, 0),
+        "function_type": function_type,
+        "scope_depth_box": shared { "val": 0 },
+        "locals_box": shared { "items": [] },
+        "upvalues_box": shared { "items": [] }
+    }
+}
+
+// ---------- Compiler (shared state) ----------
+//   func_stack: Vec<FuncCtx>  (last = current)
+//   variants: Map<name, arity>   (enum variants — not yet populated)
+//   structs: Map<name, ()>       (type defs — not yet populated)
+
+fn new_compiler() {
+    shared {
+        "func_stack": [],
+        "structs": {},
+        "variants": {}
+    }
+}
+
+fn cur(compiler) {
+    let n = count(compiler.func_stack);
+    compiler.func_stack[n - 1]
+}
+
+fn cur_chunk(compiler) {
+    cur(compiler).chunk
+}
+
+fn cur_code_len(compiler) {
+    count(cur_chunk(compiler).code)
+}
+
+// ---------- emit helpers ----------
+
+fn emit_op(compiler, op_byte) {
+    let chunk = cur_chunk(compiler);
+    chunk.code = push(chunk.code, op_byte)
+}
+
+fn emit_u8(compiler, v) {
+    let chunk = cur_chunk(compiler);
+    chunk.code = push(chunk.code, v)
+}
+
+fn emit_u16(compiler, v) {
+    let chunk = cur_chunk(compiler);
+    let lo = v % 256;
+    let hi = int(v / 256);
+    chunk.code = push(chunk.code, lo);
+    chunk.code = push(chunk.code, hi)
+}
+
+// Emit a jump opcode + u16 placeholder. Returns the offset of the
+// placeholder (for later patching).
+fn emit_jump(compiler, op_byte) {
+    emit_op(compiler, op_byte);
+    let offset = cur_code_len(compiler);
+    emit_u16(compiler, 0);
+    offset
+}
+
+// Record a deferred patch: at `offset` in code, write `target` as u16.
+// The actual write happens in finish_chunk.
+fn patch_jump(compiler, offset) {
+    let chunk = cur_chunk(compiler);
+    let target = count(chunk.code);
+    chunk.jumps = push(chunk.jumps, { "offset": offset, "target": target })
+}
+
+// Patch a u16 placeholder at `offset` with the current code length.
+// Used for PushLoop's continue/break addresses (which are not jumps
+// from the end of a region but addresses embedded inline).
+fn patch_u16_now(compiler, offset, value) {
+    let chunk = cur_chunk(compiler);
+    let lo = value % 256;
+    let hi = int(value / 256);
+    chunk.code = assoc(chunk.code, offset, lo);
+    chunk.code = assoc(chunk.code, offset + 1, hi)
+}
+
+// Finish a chunk: apply all deferred jump patches.
+fn finish_chunk(chunk) {
+    let i = 0;
+    let n = count(chunk.jumps);
+    while i < n {
+        let p = chunk.jumps[i];
+        let offset = p.offset;
+        let target = p.target;
+        let lo = target % 256;
+        let hi = int(target / 256);
+        chunk.code = assoc(chunk.code, offset, lo);
+        chunk.code = assoc(chunk.code, offset + 1, hi);
+        i = i + 1
+    }
+}
+
+// ---------- constant pool ----------
+
+fn emit_const(compiler, value) {
+    let chunk = cur_chunk(compiler);
+    let n = count(chunk.consts);
+    let i = 0;
+    while i < n {
+        if chunk.consts[i] == value { return i };
+        i = i + 1
+    };
+    chunk.consts = push(chunk.consts, value);
+    count(chunk.consts) - 1
+}
+
+// ---------- scope management ----------
+
+fn begin_scope(compiler) {
+    let f = cur(compiler);
+    let sbox = f.scope_depth_box;
+    sbox.val = sbox.val + 1
+}
+
+// End the current scope. Returns the number of locals popped.
+fn end_scope(compiler) {
+    let f = cur(compiler);
+    let sbox = f.scope_depth_box;
+    let depth = sbox.val;
+    let n = 0;
+    let lbox = f.locals_box;
+    let locals = lbox.items;
+    // pop from end while last local.depth == depth
+    while count(locals) > 0 {
+        let last = locals[count(locals) - 1];
+        if last.depth == depth {
+            locals = pop_last(locals);  // immutable pop; will reassign
+            n = n + 1
+        } else {
+            break
+        }
+    };
+    lbox.items = locals;
+    sbox.val = depth - 1;
+    n
+}
+
+fn declare_local(compiler, name) {
+    let f = cur(compiler);
+    let sbox = f.scope_depth_box;
+    let depth = sbox.val;
+    let lbox = f.locals_box;
+    let slot = count(lbox.items);
+    lbox.items = push(lbox.items, { "name": name, "depth": depth, "is_captured": false });
+    slot
+}
+
+// Remove the last-declared local (compiler bookkeeping only — does not
+// emit any bytecode). Used by compile_for to drop the loop var before
+// the for-scope end_scope runs.
+fn pop_local(compiler) {
+    let f = cur(compiler);
+    let lbox = f.locals_box;
+    lbox.items = pop_last(lbox.items)
+}
+
+// Resolve `name` in the current function's locals. Returns slot index or nil.
+fn resolve_local(compiler, name) {
+    let f = cur(compiler);
+    let lbox = f.locals_box;
+    let locals = lbox.items;
+    let sbox = f.scope_depth_box;
+    let depth = sbox.val;
+    let i = count(locals) - 1;
+    while i >= 0 {
+        let l = locals[i];
+        if l.name == name and l.depth <= depth {
+            return i
+        };
+        i = i - 1
+    };
+    nil
+}
+
+// ---------- upvalue resolution ----------
+
+// Resolve `name` as an upvalue of the current function. Returns upvalue
+// index or nil. Adds upvalue entries to intermediate functions as needed.
+fn resolve_upvalue(compiler, name) {
+    let n = count(compiler.func_stack);
+    if n <= 1 { return nil };
+    resolve_upvalue_at(compiler, n - 1, name)
+}
+
+fn resolve_upvalue_at(compiler, func_idx, name) {
+    if func_idx == 0 { return nil };
+    let enclosing_idx = func_idx - 1;
+    let enclosing = compiler.func_stack[enclosing_idx];
+    // Try enclosing's locals.
+    let lbox = enclosing.locals_box;
+    let locals = lbox.items;
+    let sbox = enclosing.scope_depth_box;
+    let enc_depth = sbox.val;
+    let i = count(locals) - 1;
+    let found = nil;
+    while i >= 0 {
+        let l = locals[i];
+        if l.name == name and l.depth <= enc_depth {
+            found = i;
+            break
+        };
+        i = i - 1
+    };
+    if found != nil {
+        // Mark as captured.
+        let cap_local = locals[found];
+        cap_local.is_captured = true;
+        return add_upvalue(compiler, func_idx, true, found)
+    };
+    // Recurse into enclosing's upvalues.
+    if enclosing_idx > 0 {
+        let enc_uv = resolve_upvalue_at(compiler, enclosing_idx, name);
+        if enc_uv != nil {
+            return add_upvalue(compiler, func_idx, false, enc_uv)
+        }
+    };
+    nil
+}
+
+fn add_upvalue(compiler, func_idx, is_local, index) {
+    let f = compiler.func_stack[func_idx];
+    let ubox = f.upvalues_box;
+    let uvs = ubox.items;
+    let n = count(uvs);
+    let i = 0;
+    while i < n {
+        let uv = uvs[i];
+        if uv.is_local == is_local and uv.index == index {
+            return i
+        };
+        i = i + 1
+    };
+    ubox.items = push(uvs, { "is_local": is_local, "index": index });
+    let fc = f.chunk;
+    fc.upvalue_count = fc.upvalue_count + 1;
+    n
+}
+
+// ---------- variable load / store ----------
+
+fn emit_load(compiler, name) {
+    let slot = resolve_local(compiler, name);
+    if slot != nil {
+        emit_op(compiler, OP_LOAD_LOCAL);
+        emit_u8(compiler, slot)
+    } else {
+        let uv = resolve_upvalue(compiler, name);
+        if uv != nil {
+            emit_op(compiler, OP_LOAD_UPVALUE);
+            emit_u8(compiler, uv)
+        } else {
+            let idx = emit_const(compiler, name);
+            emit_op(compiler, OP_LOAD_GLOBAL);
+            emit_u8(compiler, idx)
+        }
+    }
+}
+
+fn emit_load_ref(compiler, name) {
+    let slot = resolve_local(compiler, name);
+    if slot != nil {
+        emit_op(compiler, OP_LOAD_LOCAL_REF);
+        emit_u8(compiler, slot)
+    } else {
+        let uv = resolve_upvalue(compiler, name);
+        if uv != nil {
+            emit_op(compiler, OP_LOAD_UPVALUE_REF);
+            emit_u8(compiler, uv)
+        } else {
+            let idx = emit_const(compiler, name);
+            emit_op(compiler, OP_LOAD_GLOBAL_REF);
+            emit_u8(compiler, idx)
+        }
+    }
+}
+
+fn emit_store(compiler, name) {
+    let slot = resolve_local(compiler, name);
+    if slot != nil {
+        emit_op(compiler, OP_ASSIGN_LOCAL);
+        emit_u8(compiler, slot)
+    } else {
+        let uv = resolve_upvalue(compiler, name);
+        if uv != nil {
+            emit_op(compiler, OP_ASSIGN_UPVALUE);
+            emit_u8(compiler, uv)
+        } else {
+            let idx = emit_const(compiler, name);
+            emit_op(compiler, OP_ASSIGN_GLOBAL);
+            emit_u8(compiler, idx)
+        }
+    }
+}
+
+// Compile a call argument. Bare identifiers use emit_load_ref (pass
+// SharedRef by reference); others use compile_expr.
+fn compile_call_arg(compiler, arg) {
+    if get(arg, "type") == "Ident" {
+        emit_load_ref(compiler, get(arg, "name"))
+    } else {
+        compile_expr(compiler, arg)
+    }
+}
+
+// ---------- function compilation ----------
+
+// Compile a function body into a sub-chunk. Returns [chunk_idx, upvalues].
+fn compile_function(compiler, name, params, body) {
+    let f = new_func_ctx("Function", if name == nil { "<lambda>" } else { name });
+    compiler.func_stack = push(compiler.func_stack, f);
+    // Declare params as locals (slots 0..arity).
+    let i = 0;
+    let np = count(params);
+    while i < np {
+        let p = params[i];
+        declare_local(compiler, get(p, "name"));
+        i = i + 1
+    };
+    let fchunk = f.chunk;
+    fchunk.arity = np;
+    // Compile body.
+    compile_expr(compiler, body);
+    // Ensure Return.
+    emit_op(compiler, OP_RETURN);
+    // Pop FuncCtx.
+    let n = count(compiler.func_stack);
+    let done = compiler.func_stack[n - 1];
+    compiler.func_stack = pop_last(compiler.func_stack);
+    finish_chunk(done.chunk);
+    let ubox = done.upvalues_box;
+    let upvalues = ubox.items;
+    // Add to parent's sub_chunks.
+    let parent = cur(compiler);
+    let pchunk = parent.chunk;
+    let chunk_idx = count(pchunk.sub_chunks);
+    pchunk.sub_chunks = push(pchunk.sub_chunks, done.chunk);
+    [chunk_idx, upvalues]
+}
+
+fn emit_closure(compiler, chunk_idx, upvalues) {
+    emit_op(compiler, OP_CLOSURE);
+    emit_u8(compiler, chunk_idx);
+    let i = 0;
+    let n = count(upvalues);
+    while i < n {
+        let uv = upvalues[i];
+        emit_u8(compiler, if uv.is_local { 1 } else { 0 });
+        emit_u8(compiler, uv.index);
+        i = i + 1
+    }
+}
+
+// ---------- entry point ----------
+
+fn compile_program(program) {
+    let compiler = new_compiler();
+    let script = new_func_ctx("Script", "<script>");
+    compiler.func_stack = push(compiler.func_stack, script);
+    let stmts = get(program, "stmts");
+    let n = count(stmts);
+    if n == 0 {
+        // Empty program: push Nil so OP_RETURN has something to pop.
+        emit_op(compiler, OP_NIL)
+    } else {
+        let i = 0;
+        while i < n {
+            let stmt = stmts[i];
+            if i + 1 == n {
+                // Last top-level statement: keep its value for OP_RETURN.
+                let t = get(stmt, "type");
+                if t == "Expr" {
+                    compile_expr(compiler, get(stmt, "expr"))
+                } else if t == "Semi" {
+                    compile_expr(compiler, get(stmt, "expr"));
+                    emit_op(compiler, OP_POP);
+                    emit_op(compiler, OP_NIL)
+                } else {
+                    compile_stmt(compiler, stmt);
+                    emit_op(compiler, OP_NIL)
+                }
+            } else {
+                compile_stmt(compiler, stmt)
+            };
+            i = i + 1
+        }
+    };
+    emit_op(compiler, OP_RETURN);
+    finish_chunk(script.chunk);
+    script.chunk
+}
+
+// ---------- statements ----------
+
+fn is_top_level(compiler) {
+    let f = cur(compiler);
+    let sbox = f.scope_depth_box;
+    f.function_type == "Script" and sbox.val == 0
+}
+
+fn compile_stmt(compiler, stmt) {
+    let t = get(stmt, "type");
+    if t == "Let" {
+        compile_expr(compiler, get(stmt, "value"));
+        if is_top_level(compiler) {
+            let idx = emit_const(compiler, get(stmt, "name"));
+            emit_op(compiler, OP_DEFINE_GLOBAL);
+            emit_u8(compiler, idx)
+        } else {
+            let slot = declare_local(compiler, get(stmt, "name"));
+            emit_op(compiler, OP_STORE_LOCAL);
+            emit_u8(compiler, slot)
+        };
+        return
+    };
+    if t == "SharedDecl" {
+        compile_expr(compiler, get(stmt, "value"));
+        emit_op(compiler, OP_SHARED_EXPR);
+        if is_top_level(compiler) {
+            let idx = emit_const(compiler, get(stmt, "name"));
+            emit_op(compiler, OP_DEFINE_GLOBAL);
+            emit_u8(compiler, idx)
+        } else {
+            let slot = declare_local(compiler, get(stmt, "name"));
+            emit_op(compiler, OP_STORE_LOCAL);
+            emit_u8(compiler, slot)
+        };
+        return
+    };
+    if t == "FuncDef" {
+        let name_slot = nil;
+        if is_top_level(compiler) {
+            name_slot = nil
+        } else {
+            name_slot = declare_local(compiler, get(stmt, "name"))
+        };
+        let r = compile_function(compiler, get(stmt, "name"), get(stmt, "params"), get(stmt, "body"));
+        emit_closure(compiler, r[0], r[1]);
+        if name_slot != nil {
+            emit_op(compiler, OP_STORE_LOCAL);
+            emit_u8(compiler, name_slot)
+        } else {
+            let idx = emit_const(compiler, get(stmt, "name"));
+            emit_op(compiler, OP_DEFINE_GLOBAL);
+            emit_u8(compiler, idx)
+        };
+        return
+    };
+    if t == "Expr" or t == "Semi" {
+        compile_expr(compiler, get(stmt, "expr"));
+        emit_op(compiler, OP_POP);
+        return
+    };
+    if t == "Import" {
+        let path_idx = emit_const(compiler, get(stmt, "path"));
+        let alias = get(stmt, "alias");
+        let alias_idx = 0;
+        if alias != nil {
+            alias_idx = emit_const(compiler, alias)
+        };
+        emit_op(compiler, OP_IMPORT);
+        emit_u8(compiler, path_idx);
+        emit_u8(compiler, alias_idx);
+        emit_u8(compiler, if get(stmt, "lazy") { 1 } else { 0 });
+        return
+    };
+    if t == "TypeDef" {
+        // Register struct name so `Name({...})` calls compile as ConstructStruct.
+        let name = get(stmt, "name");
+        compiler.structs = assoc(compiler.structs, name, true);
+        return
+    };
+    // Unknown stmt: ignore.
+    nil
+}
+
+// ---------- expressions ----------
+
+fn compile_expr(compiler, expr) {
+    let t = get(expr, "type");
+    if t == "Int" {
+        let idx = emit_const(compiler, get(expr, "value"));
+        emit_op(compiler, OP_CONST);
+        emit_u8(compiler, idx);
+        return
+    };
+    if t == "Decimal" {
+        let idx = emit_const(compiler, get(expr, "value"));
+        emit_op(compiler, OP_CONST);
+        emit_u8(compiler, idx);
+        return
+    };
+    if t == "Bool" {
+        if get(expr, "value") {
+            emit_op(compiler, OP_TRUE)
+        } else {
+            emit_op(compiler, OP_FALSE)
+        };
+        return
+    };
+    if t == "Nil" {
+        emit_op(compiler, OP_NIL);
+        return
+    };
+    if t == "Str" {
+        compile_str(compiler, expr);
+        return
+    };
+    if t == "Ident" {
+        emit_load(compiler, get(expr, "name"));
+        return
+    };
+    if t == "BinOp" {
+        compile_binop(compiler, get(expr, "op"), get(expr, "lhs"), get(expr, "rhs"));
+        return
+    };
+    if t == "UnaryOp" {
+        compile_expr(compiler, get(expr, "expr"));
+        let op = get(expr, "op");
+        if op == "-" {
+            emit_op(compiler, OP_NEG)
+        } else if op == "not" {
+            emit_op(compiler, OP_NOT)
+        };
+        return
+    };
+    if t == "If" {
+        compile_expr(compiler, get(expr, "cond"));
+        let else_jump = emit_jump(compiler, OP_JUMP_IF_FALSE);
+        compile_expr(compiler, get(expr, "then"));
+        let end_jump = emit_jump(compiler, OP_JUMP);
+        patch_jump(compiler, else_jump);
+        let else_ = get(expr, "else");
+        if else_ != nil {
+            compile_expr(compiler, else_)
+        } else {
+            emit_op(compiler, OP_NIL)
+        };
+        patch_jump(compiler, end_jump);
+        return
+    };
+    if t == "Block" {
+        begin_scope(compiler);
+        let stmts = get(expr, "stmts");
+        let i = 0;
+        let n = count(stmts);
+        while i < n {
+            compile_stmt(compiler, stmts[i]);
+            i = i + 1
+        };
+        let tail = get(expr, "tail");
+        if tail != nil {
+            compile_expr(compiler, tail)
+        } else {
+            emit_op(compiler, OP_NIL)
+        };
+        let popped = end_scope(compiler);
+        if popped > 0 {
+            emit_op(compiler, OP_POP_LOCAL_KEEP);
+            emit_u8(compiler, popped)
+        };
+        return
+    };
+    if t == "Paren" {
+        compile_expr(compiler, get(expr, "expr"));
+        return
+    };
+    if t == "Call" {
+        compile_call(compiler, get(expr, "callee"), get(expr, "args"));
+        return
+    };
+    if t == "MethodCall" {
+        compile_call_arg(compiler, get(expr, "receiver"));
+        let args = get(expr, "args");
+        let i = 0;
+        let n = count(args);
+        while i < n {
+            compile_call_arg(compiler, args[i]);
+            i = i + 1
+        };
+        let m_idx = emit_const(compiler, get(expr, "method"));
+        emit_op(compiler, OP_METHOD_CALL);
+        emit_u8(compiler, m_idx);
+        emit_u8(compiler, n);
+        return
+    };
+    if t == "Index" {
+        compile_expr(compiler, get(expr, "target"));
+        compile_expr(compiler, get(expr, "index"));
+        emit_op(compiler, OP_INDEX);
+        return
+    };
+    if t == "Field" {
+        compile_expr(compiler, get(expr, "target"));
+        let idx = emit_const(compiler, get(expr, "name"));
+        emit_op(compiler, OP_FIELD);
+        emit_u8(compiler, idx);
+        return
+    };
+    if t == "Assign" {
+        compile_assign(compiler, get(expr, "target"), get(expr, "value"));
+        return
+    };
+    if t == "CompoundAssign" {
+        compile_compound_assign(compiler, get(expr, "op"), get(expr, "target"), get(expr, "value"));
+        return
+    };
+    if t == "VecLit" {
+        let items = get(expr, "items");
+        let i = 0;
+        let n = count(items);
+        while i < n {
+            compile_expr(compiler, items[i]);
+            i = i + 1
+        };
+        emit_op(compiler, OP_NEW_VEC);
+        emit_u8(compiler, n);
+        return
+    };
+    if t == "MapLit" {
+        let entries = get(expr, "entries");
+        let i = 0;
+        let n = count(entries);
+        while i < n {
+            let pair = entries[i];
+            let k = pair[0];
+            let v = pair[1];
+            // Shorthand: bare ident key → string
+            if get(k, "type") == "Ident" {
+                let idx = emit_const(compiler, get(k, "name"));
+                emit_op(compiler, OP_CONST);
+                emit_u8(compiler, idx)
+            } else {
+                compile_expr(compiler, k)
+            };
+            if get(v, "type") == "Ident" {
+                emit_load_ref(compiler, get(v, "name"))
+            } else {
+                compile_expr(compiler, v)
+            };
+            i = i + 1
+        };
+        emit_op(compiler, OP_NEW_MAP);
+        emit_u8(compiler, n);
+        return
+    };
+    if t == "SetLit" {
+        let items = get(expr, "items");
+        let i = 0;
+        let n = count(items);
+        while i < n {
+            compile_expr(compiler, items[i]);
+            i = i + 1
+        };
+        emit_op(compiler, OP_NEW_SET);
+        emit_u8(compiler, n);
+        return
+    };
+    if t == "Lambda" {
+        let r = compile_function(compiler, nil, get(expr, "params"), get(expr, "body"));
+        emit_closure(compiler, r[0], r[1]);
+        return
+    };
+    if t == "Pipe" {
+        let lhs = get(expr, "lhs");
+        let rhs = get(expr, "rhs");
+        if get(rhs, "type") == "Call" {
+            compile_expr(compiler, get(rhs, "callee"));
+            compile_call_arg(compiler, lhs);
+            let args = get(rhs, "args");
+            let i = 0;
+            let n = count(args);
+            while i < n {
+                compile_call_arg(compiler, args[i]);
+                i = i + 1
+            };
+            emit_op(compiler, OP_CALL);
+            emit_u8(compiler, n + 1)
+        } else {
+            compile_expr(compiler, rhs);
+            compile_call_arg(compiler, lhs);
+            emit_op(compiler, OP_CALL);
+            emit_u8(compiler, 1)
+        };
+        return
+    };
+    if t == "While" {
+        compile_while(compiler, get(expr, "cond"), get(expr, "body"));
+        return
+    };
+    if t == "Loop" {
+        compile_loop(compiler, get(expr, "body"));
+        return
+    };
+    if t == "For" {
+        compile_for(compiler, get(expr, "var"), get(expr, "iter"), get(expr, "body"));
+        return
+    };
+    if t == "Return" {
+        let v = get(expr, "value");
+        if v != nil {
+            compile_expr(compiler, v)
+        } else {
+            emit_op(compiler, OP_NIL)
+        };
+        emit_op(compiler, OP_RETURN);
+        return
+    };
+    if t == "Break" {
+        let v = get(expr, "value");
+        if v != nil {
+            compile_expr(compiler, v)
+        } else {
+            emit_op(compiler, OP_NIL)
+        };
+        emit_op(compiler, OP_BREAK);
+        emit_u16(compiler, 1);
+        emit_op(compiler, OP_NIL);  // unreachable
+        return
+    };
+    if t == "Continue" {
+        emit_op(compiler, OP_CONTINUE);
+        emit_u16(compiler, 0);
+        emit_op(compiler, OP_NIL);  // unreachable
+        return
+    };
+    if t == "Raise" {
+        compile_expr(compiler, get(expr, "expr"));
+        emit_op(compiler, OP_RAISE);
+        return
+    };
+    if t == "Match" {
+        compile_match(compiler, expr);
+        return
+    };
+    if t == "Try" {
+        compile_try(compiler, expr);
+        return
+    };
+    if t == "SharedExpr" {
+        compile_expr(compiler, get(expr, "expr"));
+        emit_op(compiler, OP_SHARED_EXPR);
+        return
+    };
+    if t == "ActorSend" or t == "ActorRequest" {
+        // Actor operations are not supported in the self-hosted VM
+        // (no scheduler, no actor runtime). Fail loudly so callers
+        // see the limitation instead of silently emitting Nil.
+        raise "compile error: '" + t + "' is not supported by the self-hosted VM"
+    };
+    // Unknown expr: emit Nil placeholder.
+    emit_op(compiler, OP_NIL)
+}
+
+// ---------- match compilation ----------
+// Layout (mirrors src/compiler/mod.rs::compile_match):
+//   <scrutinee>
+//   StoreLocal __match_scrutinee
+//   for each arm:
+//     LoadLocal __match_scrutinee
+//     Match <pat_idx>            // pops scrutinee copy, pushes bool + binds
+//     JumpIfFalse -> arm_end
+//     [guard?] <guard>; JumpIfFalse -> guard_fail; PopN n_bindings
+//     <body>
+//     PopLocalKeep n_bindings
+//     Jump -> end
+//     [guard_fail:] PopN n_bindings
+//   arm_end: (next arm starts here)
+//   Nil                         // no arm matched
+//   end: PopLocalKeep 1         // drop scrutinee, keep result
+
+fn compile_match(compiler, expr) {
+    let scrutinee = get(expr, "scrutinee");
+    compile_expr(compiler, scrutinee);
+    let scrutinee_slot = declare_local(compiler, "__match_scrutinee");
+    emit_op(compiler, OP_STORE_LOCAL);
+    emit_u8(compiler, scrutinee_slot);
+
+    let arms = get(expr, "arms");
+    let n_arms = count(arms);
+    let end_jumps = [];
+    let i = 0;
+    while i < n_arms {
+        let arm = arms[i];
+        // LoadLocal __match_scrutinee
+        emit_op(compiler, OP_LOAD_LOCAL);
+        emit_u8(compiler, scrutinee_slot);
+
+        // Match(pattern)
+        let pat = get(arm, "pattern");
+        let pat_idx = add_pattern(compiler, pat);
+        let n_bindings = pattern_binding_count(pat);
+        emit_op(compiler, OP_MATCH);
+        emit_u8(compiler, pat_idx);
+
+        // JumpIfFalse arm_end
+        let match_fail_jump = emit_jump(compiler, OP_JUMP_IF_FALSE);
+
+        // Declare bindings as locals (slots are allocated by OP_MATCH at runtime)
+        let binding_names = pattern_binding_names(pat);
+        let nb = count(binding_names);
+        let bi = 0;
+        while bi < nb {
+            declare_local(compiler, binding_names[bi]);
+            bi = bi + 1
+        };
+
+        // Guard
+        let guard = get(arm, "guard");
+        if guard != nil {
+            compile_expr(compiler, guard);
+            let guard_fail_jump = emit_jump(compiler, OP_JUMP_IF_FALSE);
+            // Body (guard passed)
+            compile_expr(compiler, get(arm, "body"));
+            emit_op(compiler, OP_POP_LOCAL_KEEP);
+            emit_u8(compiler, n_bindings);
+            let end_jump = emit_jump(compiler, OP_JUMP);
+            end_jumps = push(end_jumps, end_jump);
+            // Guard failed: pop bindings
+            patch_jump(compiler, guard_fail_jump);
+            emit_op(compiler, OP_POP_N);
+            emit_u8(compiler, n_bindings)
+        } else {
+            // Body (no guard)
+            compile_expr(compiler, get(arm, "body"));
+            emit_op(compiler, OP_POP_LOCAL_KEEP);
+            emit_u8(compiler, n_bindings);
+            let end_jump = emit_jump(compiler, OP_JUMP);
+            end_jumps = push(end_jumps, end_jump)
+        };
+
+        // Pop binding locals from compiler tracking.
+        let pj = 0;
+        while pj < nb {
+            pop_local(compiler);
+            pj = pj + 1
+        };
+
+        // arm_end (match fail jump target — next arm starts here)
+        patch_jump(compiler, match_fail_jump);
+
+        i = i + 1
+    };
+
+    // No arm matched: push nil.
+    emit_op(compiler, OP_NIL);
+
+    // match_end: patch all end jumps to here.
+    let ne = count(end_jumps);
+    let ei = 0;
+    while ei < ne {
+        patch_jump(compiler, end_jumps[ei]);
+        ei = ei + 1
+    };
+
+    // Pop scrutinee local, keep match result.
+    emit_op(compiler, OP_POP_LOCAL_KEEP);
+    emit_u8(compiler, 1);
+    pop_local(compiler)
+}
+
+// ---------- try compilation ----------
+// Layout (mirrors src/compiler/mod.rs Expr::Try):
+//   PushTry(rescue_pc=?, ensure_pc=?)
+//   <body>
+//   PopTry
+//   Jump -> ENS_or_AFTER
+// RES:
+//   [for each typed rescue:] RescueMatch type_idx; JumpIfFalse -> next; ClearPending; Closure; Swap; Call 1; Jump -> ENS_or_AFTER
+//   [catch-all:] ClearPending; [bind?] Closure; Swap; Call 1  /  [no bind] Pop; Closure; Call 0; Jump -> ENS_or_AFTER
+//   [no catch-all, no ensure:] Raise   // re-raise
+//   [no catch-all, ensure:] Pop; Jump -> ENS
+// ENS_or_AFTER:
+//   [ensure?] <ensure>; Pop; EnsureExit
+
+fn compile_try(compiler, expr) {
+    let body = get(expr, "body");
+    let rescues = get(expr, "rescues");
+    let ensure_body = get(expr, "ensure");
+
+    emit_op(compiler, OP_PUSH_TRY);
+    let rescue_patch = cur_code_len(compiler);
+    emit_u16(compiler, 0);
+    let ensure_patch = cur_code_len(compiler);
+    emit_u16(compiler, 0);
+
+    compile_expr(compiler, body);
+
+    // Normal exit path.
+    emit_op(compiler, OP_POP_TRY);
+    let jump_over_rescue = emit_jump(compiler, OP_JUMP);
+
+    // RES: rescue dispatcher.
+    let rescue_addr = cur_code_len(compiler);
+    patch_u16_now(compiler, rescue_patch, rescue_addr);
+
+    let n_rescues = count(rescues);
+    let has_catch_all = false;
+    let ri = 0;
+    let rescue_body_exit_jumps = [];
+    let next_clause_jump = nil;
+    while ri < n_rescues {
+        let resc = rescues[ri];
+        // Patch previous JumpIfFalse to here (if any).
+        if next_clause_jump != nil {
+            patch_jump(compiler, next_clause_jump)
+        };
+        let type_name = get(resc, "type_name");
+        let is_catch_all = type_name == nil;
+        let next_clause_jump_local = nil;
+        if not is_catch_all {
+            let type_idx = emit_const(compiler, type_name);
+            emit_op(compiler, OP_RESCUE_MATCH);
+            emit_u8(compiler, type_idx);
+            next_clause_jump_local = emit_jump(compiler, OP_JUMP_IF_FALSE)
+        };
+        // Matched: clear pending exception.
+        emit_op(compiler, OP_CLEAR_PENDING);
+
+        // Compile rescue body as a closure. Bind name (if any) becomes sole param.
+        let bind = get(resc, "bind");
+        let params = [];
+        if bind != nil {
+            params = push(params, { "name": bind })
+        };
+        let r = compile_function(compiler, "<rescue>", params, get(resc, "body"));
+        emit_closure(compiler, r[0], r[1]);
+
+        if bind != nil {
+            // exc on top. Push closure, swap, call with 1 arg.
+            emit_op(compiler, OP_SWAP);
+            emit_op(compiler, OP_CALL);
+            emit_u8(compiler, 1)
+        } else {
+            // No bind: discard exc, call closure with 0 args.
+            // Stack before: [..., exc, closure]. Swap -> [..., closure, exc]; Pop -> [..., closure]; Call 0.
+            emit_op(compiler, OP_SWAP);
+            emit_op(compiler, OP_POP);
+            emit_op(compiler, OP_CALL);
+            emit_u8(compiler, 0)
+        };
+        let exit_j = emit_jump(compiler, OP_JUMP);
+        rescue_body_exit_jumps = push(rescue_body_exit_jumps, exit_j);
+
+        // Update loop variable for next iteration's JumpIfFalse patching.
+        next_clause_jump = next_clause_jump_local;
+        ri = ri + 1
+    };
+    // Patch the last JumpIfFalse (if any) to here.
+    if next_clause_jump != nil {
+        patch_jump(compiler, next_clause_jump)
+    };
+    // After all clauses: if no catch-all, exc is still on stack.
+    let has_catch_all_local = false;
+    // Detect catch-all (type_name == nil) by scanning rescues.
+    let ha = 0;
+    while ha < n_rescues {
+        if get(rescues[ha], "type_name") == nil {
+            has_catch_all_local = true;
+            break
+        };
+        ha = ha + 1
+    };
+    if not has_catch_all_local {
+        if ensure_body != nil {
+            emit_op(compiler, OP_POP);
+            let j = emit_jump(compiler, OP_JUMP);
+            rescue_body_exit_jumps = push(rescue_body_exit_jumps, j)
+        } else {
+            // No ensure: re-raise immediately (exc on stack).
+            emit_op(compiler, OP_RAISE)
+        }
+    };
+
+    // ENS_or_AFTER.
+    let ens_addr = cur_code_len(compiler);
+    patch_jump(compiler, jump_over_rescue);
+    let nj = count(rescue_body_exit_jumps);
+    let ji = 0;
+    while ji < nj {
+        patch_jump(compiler, rescue_body_exit_jumps[ji]);
+        ji = ji + 1
+    };
+    if ensure_body != nil {
+        patch_u16_now(compiler, ensure_patch, ens_addr);
+        compile_expr(compiler, ensure_body);
+        emit_op(compiler, OP_POP);
+        emit_op(compiler, OP_ENSURE_EXIT)
+    }
+}
+
+// ---------- pattern helpers ----------
+
+fn add_pattern(compiler, pat) {
+    let chunk = cur_chunk(compiler);
+    let n = count(chunk.patterns);
+    // Reuse if identical pattern already stored.
+    let i = 0;
+    while i < n {
+        if patterns_equal(chunk.patterns[i], pat) {
+            return i
+        };
+        i = i + 1
+    };
+    chunk.patterns = push(chunk.patterns, pat);
+    n
+}
+
+// Structural equality on pattern AST maps.
+fn patterns_equal(a, b) {
+    pattern_key(a) == pattern_key(b)
+}
+
+// Build a stable string key from a pattern for equality comparison.
+fn pattern_key(p) {
+    let t = get(p, "type");
+    if t == "Wildcard" { return "W" };
+    if t == "Bind" { return "B:" + get(p, "name") };
+    if t == "Lit" {
+        let lt = get(p, "lit_type");
+        if lt == "Nil" { return "L:Nil" };
+        if lt == "Bool" { return "L:Bool:" + to_str(get(p, "value")) };
+        if lt == "Int" { return "L:Int:" + to_str(get(p, "value")) };
+        if lt == "Decimal" { return "L:Dec:" + to_str(get(p, "value")) };
+        if lt == "Str" { return "L:Str" };  // ignore parts for simplicity
+        return "L:?"
+    };
+    if t == "Variant" {
+        let s = "V:" + get(p, "name") + "(";
+        let args = get(p, "args");
+        let n = count(args);
+        let i = 0;
+        while i < n {
+            s = s + pattern_key(args[i]);
+            if i + 1 < n { s = s + "," };
+            i = i + 1
+        };
+        return s + ")"
+    };
+    if t == "Struct" {
+        let s = "S:";
+        let fields = get(p, "fields");
+        let n = count(fields);
+        let i = 0;
+        while i < n {
+            s = s + get(fields[i], "name") + ":" + pattern_key(get(fields[i], "pattern"));
+            if i + 1 < n { s = s + "," };
+            i = i + 1
+        };
+        return s
+    };
+    if t == "Vec" {
+        let s = "Vec:[";
+        let pats = get(p, "pats");
+        let n = count(pats);
+        let i = 0;
+        while i < n {
+            s = s + pattern_key(pats[i]);
+            if i + 1 < n { s = s + "," };
+            i = i + 1
+        };
+        return s + "]"
+    };
+    if t == "Or" {
+        let s = "O:\{";
+        let pats = get(p, "pats");
+        let n = count(pats);
+        let i = 0;
+        while i < n {
+            s = s + pattern_key(pats[i]);
+            if i + 1 < n { s = s + "|" };
+            i = i + 1
+        };
+        return s + "}"
+    };
+    if t == "Guard" {
+        return "G:" + pattern_key(get(p, "pattern"))
+    };
+    "?"
+}
+
+fn pattern_binding_count(pat) {
+    count(pattern_binding_names(pat))
+}
+
+fn pattern_binding_names(pat) {
+    collect_binding_names(pat, [])
+}
+
+fn collect_binding_names(pat, names) {
+    let t = get(pat, "type");
+    if t == "Wildcard" { return names };
+    if t == "Lit" { return names };
+    if t == "Bind" {
+        return push(names, get(pat, "name"))
+    };
+    if t == "Variant" {
+        let args = get(pat, "args");
+        let n = count(args);
+        let i = 0;
+        let acc = names;
+        while i < n {
+            acc = collect_binding_names(args[i], acc);
+            i = i + 1
+        };
+        return acc
+    };
+    if t == "Struct" {
+        let fields = get(pat, "fields");
+        let n = count(fields);
+        let i = 0;
+        let acc = names;
+        while i < n {
+            acc = collect_binding_names(get(fields[i], "pattern"), acc);
+            i = i + 1
+        };
+        return acc
+    };
+    if t == "Vec" {
+        let pats = get(pat, "pats");
+        let n = count(pats);
+        let i = 0;
+        let acc = names;
+        while i < n {
+            acc = collect_binding_names(pats[i], acc);
+            i = i + 1
+        };
+        return acc
+    };
+    if t == "Or" {
+        let pats = get(pat, "pats");
+        if count(pats) > 0 {
+            return collect_binding_names(pats[0], names)
+        };
+        return names
+    };
+    if t == "Guard" {
+        return collect_binding_names(get(pat, "pattern"), names)
+    };
+    names
+}
+
+fn compile_str(compiler, expr) {
+    // Simple string: {"type": "Str", "value": "..."}
+    let v = get(expr, "value");
+    if v != nil {
+        let idx = emit_const(compiler, v);
+        emit_op(compiler, OP_CONST);
+        emit_u8(compiler, idx);
+        return
+    };
+    // Interpolated: {"type": "Str", "parts": [...]}
+    let parts = get(expr, "parts");
+    let n = count(parts);
+    let first = true;
+    let i = 0;
+    while i < n {
+        let p = parts[i];
+        let pt = get(p, "type");
+        if pt == "Literal" {
+            let text = get(p, "text");
+            if text != "" {
+                let idx = emit_const(compiler, text);
+                emit_op(compiler, OP_CONST);
+                emit_u8(compiler, idx);
+                if not first {
+                    emit_op(compiler, OP_ADD)
+                };
+                first = false
+            }
+        } else {
+            // Expr part: call to_str(value)
+            let f_idx = emit_const(compiler, "to_str");
+            emit_op(compiler, OP_LOAD_GLOBAL);
+            emit_u8(compiler, f_idx);
+            compile_expr(compiler, get(p, "expr"));
+            emit_op(compiler, OP_CALL);
+            emit_u8(compiler, 1);
+            if not first {
+                emit_op(compiler, OP_ADD)
+            };
+            first = false
+        };
+        i = i + 1
+    };
+    if first {
+        // All parts were empty literals.
+        let idx = emit_const(compiler, "");
+        emit_op(compiler, OP_CONST);
+        emit_u8(compiler, idx)
+    }
+}
+
+fn compile_binop(compiler, op, lhs, rhs) {
+    if op == "and" {
+        compile_expr(compiler, lhs);
+        emit_op(compiler, OP_DUP);
+        let jump = emit_jump(compiler, OP_JUMP_IF_FALSE);
+        emit_op(compiler, OP_POP);
+        compile_expr(compiler, rhs);
+        patch_jump(compiler, jump);
+        return
+    };
+    if op == "or" {
+        compile_expr(compiler, lhs);
+        emit_op(compiler, OP_DUP);
+        let jump = emit_jump(compiler, OP_JUMP_IF_TRUE);
+        emit_op(compiler, OP_POP);
+        compile_expr(compiler, rhs);
+        patch_jump(compiler, jump);
+        return
+    };
+    compile_expr(compiler, lhs);
+    compile_expr(compiler, rhs);
+    emit_binop_simple(compiler, op)
+}
+
+fn emit_binop_simple(compiler, op) {
+    if op == "+" { emit_op(compiler, OP_ADD) }
+    else if op == "-" { emit_op(compiler, OP_SUB) }
+    else if op == "*" { emit_op(compiler, OP_MUL) }
+    else if op == "/" { emit_op(compiler, OP_DIV) }
+    else if op == "%" { emit_op(compiler, OP_MOD) }
+    else if op == "==" { emit_op(compiler, OP_EQ) }
+    else if op == "!=" { emit_op(compiler, OP_NEQ) }
+    else if op == "<" { emit_op(compiler, OP_LT) }
+    else if op == ">" { emit_op(compiler, OP_GT) }
+    else if op == "<=" { emit_op(compiler, OP_LTE) }
+    else if op == ">=" { emit_op(compiler, OP_GTE) }
+}
+
+fn compile_call(compiler, callee, args) {
+    // Mirrors Rust compiler Expr::Call: if callee is an Ident registered as
+    // a struct or variant, emit Construct* instead of LoadGlobal+Call.
+    if get(callee, "type") == "Ident" {
+        let name = get(callee, "name");
+        // Variant constructor (arity > 0).
+        if has_key(compiler.variants, name) {
+            let arity = compiler.variants[name];
+            if arity > 0 {
+                let i = 0;
+                let n = count(args);
+                while i < n {
+                    compile_expr(compiler, args[i]);
+                    i = i + 1
+                };
+                let name_idx = emit_const(compiler, name);
+                emit_op(compiler, OP_CONSTRUCT_VARIANT);
+                emit_u8(compiler, name_idx);
+                emit_u8(compiler, n);
+                return
+            }
+        };
+        // Struct constructor: Name({ ... }).
+        if has_key(compiler.structs, name) {
+            let i = 0;
+            let n = count(args);
+            while i < n {
+                compile_expr(compiler, args[i]);
+                i = i + 1
+            };
+            let name_idx = emit_const(compiler, name);
+            emit_op(compiler, OP_CONSTRUCT_STRUCT);
+            emit_u8(compiler, name_idx);
+            emit_u8(compiler, n);
+            return
+        }
+    };
+    // Default: load callee, push args, call.
+    compile_expr(compiler, callee);
+    let i = 0;
+    let n = count(args);
+    while i < n {
+        compile_call_arg(compiler, args[i]);
+        i = i + 1
+    };
+    emit_op(compiler, OP_CALL);
+    emit_u8(compiler, n)
+}
+
+fn compile_assign(compiler, target, value) {
+    let t = get(target, "type");
+    if t == "Ident" {
+        compile_expr(compiler, value);
+        emit_store(compiler, get(target, "name"));
+        emit_op(compiler, OP_NIL);
+        return
+    };
+    if t == "Index" {
+        // obj[idx] = value ≡ obj = assoc(obj, idx, value)
+        let obj = get(target, "target");
+        let idx = get(target, "index");
+        compile_expr(compiler, value);
+        compile_expr(compiler, obj);
+        compile_expr(compiler, idx);
+        emit_op(compiler, OP_INDEX_ASSIGN);
+        if get(obj, "type") == "Ident" {
+            emit_store(compiler, get(obj, "name"))
+        };
+        emit_op(compiler, OP_NIL);
+        return
+    };
+    if t == "Field" {
+        let obj = get(target, "target");
+        compile_expr(compiler, value);
+        compile_expr(compiler, obj);
+        let name_idx = emit_const(compiler, get(target, "name"));
+        emit_op(compiler, OP_FIELD_ASSIGN);
+        emit_u8(compiler, name_idx);
+        emit_op(compiler, OP_NIL);
+        return
+    };
+    // Unsupported target: emit Nil.
+    emit_op(compiler, OP_NIL)
+}
+
+fn compile_compound_assign(compiler, op, target, value) {
+    if get(target, "type") == "Ident" {
+        let name = get(target, "name");
+        emit_load(compiler, name);
+        compile_expr(compiler, value);
+        emit_binop_simple(compiler, op);
+        emit_store(compiler, name);
+        emit_op(compiler, OP_NIL)
+    } else {
+        emit_op(compiler, OP_NIL)
+    }
+}
+
+fn compile_while(compiler, cond, body) {
+    // PushLoop(continue, break)
+    emit_op(compiler, OP_PUSH_LOOP);
+    let continue_patch = cur_code_len(compiler);
+    emit_u16(compiler, 0);
+    let break_patch = cur_code_len(compiler);
+    emit_u16(compiler, 0);
+    let loop_start = cur_code_len(compiler);
+    patch_u16_now(compiler, continue_patch, loop_start);
+    compile_expr(compiler, cond);
+    let exit_jump = emit_jump(compiler, OP_JUMP_IF_FALSE);
+    compile_expr(compiler, body);
+    emit_op(compiler, OP_POP);
+    emit_op(compiler, OP_LOOP);
+    emit_u16(compiler, loop_start);
+    // normal_handler: PopLoop, Nil, Jump -> after
+    patch_jump(compiler, exit_jump);
+    emit_op(compiler, OP_POP_LOOP);
+    emit_op(compiler, OP_NIL);
+    let jump_over_break = emit_jump(compiler, OP_JUMP);
+    // break_handler: PopLoop
+    let break_addr = cur_code_len(compiler);
+    patch_u16_now(compiler, break_patch, break_addr);
+    emit_op(compiler, OP_POP_LOOP);
+    patch_jump(compiler, jump_over_break)
+}
+
+fn compile_loop(compiler, body) {
+    emit_op(compiler, OP_PUSH_LOOP);
+    let continue_patch = cur_code_len(compiler);
+    emit_u16(compiler, 0);
+    let break_patch = cur_code_len(compiler);
+    emit_u16(compiler, 0);
+    let loop_start = cur_code_len(compiler);
+    patch_u16_now(compiler, continue_patch, loop_start);
+    compile_expr(compiler, body);
+    emit_op(compiler, OP_POP);
+    emit_op(compiler, OP_LOOP);
+    emit_u16(compiler, loop_start);
+    let break_addr = cur_code_len(compiler);
+    patch_u16_now(compiler, break_patch, break_addr);
+    emit_op(compiler, OP_POP_LOOP)
+}
+
+fn compile_for(compiler, var, iter, body) {
+    // Layout (matches src/compiler/mod.rs Expr::For):
+    //   begin_scope (for scope)
+    //     StoreLocal __for_iter = iter_to_vec(iter)
+    //     StoreLocal __for_i=0, __for_n=count(__for_iter)
+    //     PushLoop(continue=inc_step, break=break_handler)
+    //     loop_start:
+    //       cond (i < n); JumpIfFalse -> normal_handler
+    //       let var = get(__for_iter, i)
+    //       begin_scope; body; Pop; end_scope; PopN inner_n
+    //       PopN 1 (pop var); pop_local(var)
+    //     inc_step:
+    //       i = i + 1; Loop -> loop_start
+    //     normal_handler: PopLoop; Nil; Jump -> after
+    //     break_handler:  PopLoop; Pop (discard break value); Nil
+    //     after:
+    //   end_scope; PopN outer_n (pop __for_iter, __for_i, __for_n)
+    begin_scope(compiler);
+    // __for_iter = iter_to_vec(iter)
+    let itv_idx = emit_const(compiler, "iter_to_vec");
+    emit_op(compiler, OP_LOAD_GLOBAL);
+    emit_u8(compiler, itv_idx);
+    compile_expr(compiler, iter);
+    emit_op(compiler, OP_CALL);
+    emit_u8(compiler, 1);
+    let iter_slot = declare_local(compiler, "__for_iter");
+    emit_op(compiler, OP_STORE_LOCAL);
+    emit_u8(compiler, iter_slot);
+    // __for_i = 0
+    let zero_idx = emit_const(compiler, 0);
+    emit_op(compiler, OP_CONST);
+    emit_u8(compiler, zero_idx);
+    let i_slot = declare_local(compiler, "__for_i");
+    emit_op(compiler, OP_STORE_LOCAL);
+    emit_u8(compiler, i_slot);
+    // __for_n = count(__for_iter)
+    let count_idx = emit_const(compiler, "count");
+    emit_op(compiler, OP_LOAD_GLOBAL);
+    emit_u8(compiler, count_idx);
+    emit_op(compiler, OP_LOAD_LOCAL);
+    emit_u8(compiler, iter_slot);
+    emit_op(compiler, OP_CALL);
+    emit_u8(compiler, 1);
+    let n_slot = declare_local(compiler, "__for_n");
+    emit_op(compiler, OP_STORE_LOCAL);
+    emit_u8(compiler, n_slot);
+    // PushLoop outside the loop body (runs once). continue points to
+    // inc_step (set later), break points to break_handler.
+    emit_op(compiler, OP_PUSH_LOOP);
+    let continue_patch = cur_code_len(compiler);
+    emit_u16(compiler, 0);
+    let break_patch = cur_code_len(compiler);
+    emit_u16(compiler, 0);
+    let loop_start = cur_code_len(compiler);
+    // cond: __for_i < __for_n
+    emit_op(compiler, OP_LOAD_LOCAL);
+    emit_u8(compiler, i_slot);
+    emit_op(compiler, OP_LOAD_LOCAL);
+    emit_u8(compiler, n_slot);
+    emit_op(compiler, OP_LT);
+    let exit_jump = emit_jump(compiler, OP_JUMP_IF_FALSE);
+    // body setup: let var = get(__for_iter, __for_i)
+    let get_idx = emit_const(compiler, "get");
+    emit_op(compiler, OP_LOAD_GLOBAL);
+    emit_u8(compiler, get_idx);
+    emit_op(compiler, OP_LOAD_LOCAL);
+    emit_u8(compiler, iter_slot);
+    emit_op(compiler, OP_LOAD_LOCAL);
+    emit_u8(compiler, i_slot);
+    emit_op(compiler, OP_CALL);
+    emit_u8(compiler, 2);
+    let var_slot = declare_local(compiler, var);
+    emit_op(compiler, OP_STORE_LOCAL);
+    emit_u8(compiler, var_slot);
+    // body
+    begin_scope(compiler);
+    compile_expr(compiler, body);
+    emit_op(compiler, OP_POP);  // pop body value
+    let inner_n = end_scope(compiler);
+    if inner_n > 0 {
+        emit_op(compiler, OP_POP_N);
+        emit_u8(compiler, inner_n)
+    };
+    // Pop the var slot before the next iteration, and remove it from
+    // the compiler's locals table so the for-scope end_scope doesn't
+    // double-count it.
+    emit_op(compiler, OP_POP_N);
+    emit_u8(compiler, 1);
+    pop_local(compiler);
+    // inc_step: __for_i = __for_i + 1. continue_addr points here.
+    let inc_target = cur_code_len(compiler);
+    patch_u16_now(compiler, continue_patch, inc_target);
+    emit_op(compiler, OP_LOAD_LOCAL);
+    emit_u8(compiler, i_slot);
+    let one_idx = emit_const(compiler, 1);
+    emit_op(compiler, OP_CONST);
+    emit_u8(compiler, one_idx);
+    emit_op(compiler, OP_ADD);
+    emit_op(compiler, OP_ASSIGN_LOCAL);
+    emit_u8(compiler, i_slot);
+    emit_op(compiler, OP_LOOP);
+    emit_u16(compiler, loop_start);
+    // normal_handler: PopLoop; Nil; Jump -> after
+    patch_jump(compiler, exit_jump);
+    emit_op(compiler, OP_POP_LOOP);
+    emit_op(compiler, OP_NIL);
+    let jump_over_break = emit_jump(compiler, OP_JUMP);
+    // break_handler: PopLoop; Pop (discard break value); Nil
+    let break_addr = cur_code_len(compiler);
+    patch_u16_now(compiler, break_patch, break_addr);
+    emit_op(compiler, OP_POP_LOOP);
+    emit_op(compiler, OP_POP);
+    emit_op(compiler, OP_NIL);
+    // after:
+    patch_jump(compiler, jump_over_break);
+    // Pop for-scope locals (__for_iter, __for_i, __for_n).
+    let outer_n = end_scope(compiler);
+    if outer_n > 0 {
+        emit_op(compiler, OP_POP_N);
+        emit_u8(compiler, outer_n)
+    }
+}
+
+// ---------- dump helper ----------
+
+fn dump_chunk(chunk, indent) {
+    let pad = "";
+    let i = 0;
+    while i < indent { pad = pad + "  "; i = i + 1 };
+    println(pad + "chunk name=" + to_str(chunk.name) + " arity=" + to_str(chunk.arity) + " upvalues=" + to_str(chunk.upvalue_count));
+    println(pad + "  code (" + to_str(count(chunk.code)) + " bytes):");
+    let j = 0;
+    let n = count(chunk.code);
+    while j < n {
+        print(pad + "    [" + to_str(j) + "] " + to_str(chunk.code[j]));
+        // group 4 bytes per line for readability
+        if (j + 1) % 4 == 0 { println("") };
+        j = j + 1
+    };
+    println("");
+    println(pad + "  consts (" + to_str(count(chunk.consts)) + "):");
+    let k = 0;
+    let nc = count(chunk.consts);
+    while k < nc {
+        println(pad + "    [" + to_str(k) + "] " + to_str(chunk.consts[k]));
+        k = k + 1
+    };
+    let ns = count(chunk.sub_chunks);
+    if ns > 0 {
+        println(pad + "  sub_chunks (" + to_str(ns) + "):");
+        let s = 0;
+        while s < ns {
+            dump_chunk(chunk.sub_chunks[s], indent + 2);
+            s = s + 1
+        }
+    }
+}

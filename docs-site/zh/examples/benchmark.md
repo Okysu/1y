@@ -104,6 +104,10 @@ HTTP accept loop 是 top-level 代码：其 `await accept_async` 不在任何协
 
 ## 后续工作
 
-- VM 支持 `for`、`break`/`continue`、字符串插值、`try`/`transact`（见 [字节码 VM](../philosophy/bytecode-vm) —— "VM 尚未支持的部分"）
 - VM 的尾调用优化，以支持更深递归
 - 多线程 VM（当前单线程；tree-walker 的 `parallel` 模块尚未 VM 化）
+- 字节类型与字节缓冲（自托管 VM 当前用 `Vec<Int>` 表示字节码）
+
+> **已完成**：用 1y 自举实现 1y VM —— 见 [字节码 VM](../philosophy/bytecode-vm#自举)
+> 与 `bootstrap/selfvm.1y`。`1y selfvm <file.1y>` 现在能跑完整地用 1y
+> 实现的 lex → parse → compile → VM 流水线。

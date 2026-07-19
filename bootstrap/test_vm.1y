@@ -1,0 +1,301 @@
+// ============================================================
+// test_vm.1y — verify 1y VM execution results
+//
+// Compiles source snippets, runs them in the 1y VM, and checks
+// either the return value or the resulting global state.
+// ============================================================
+
+import lexer;
+import parser;
+import compiler;
+import vm;
+
+let lex = lexer.lex;
+let parse = parser.parse;
+let compile_program = compiler.compile_program;
+let run_chunk = vm.run_chunk;
+let new_vm = vm.new_vm;
+
+// ---------- assertion helpers ----------
+
+let pass_count = 0;
+let fail_count = 0;
+
+fn assert_eq(actual, expected, msg) {
+    if actual == expected {
+        pass_count = pass_count + 1
+    } else {
+        fail_count = fail_count + 1;
+        println("FAIL: " + msg + " — expected " + to_str(expected) + ", got " + to_str(actual))
+    }
+}
+
+fn compile_and_run(src) {
+    let toks = lex(src);
+    let prog = parse(toks);
+    let chunk = compile_program(prog);
+    let vm_inst = new_vm();
+    run_chunk(vm_inst, chunk)
+}
+
+fn compile_run_and_get_global(src, name) {
+    let toks = lex(src);
+    let prog = parse(toks);
+    let chunk = compile_program(prog);
+    let vm_inst = new_vm();
+    run_chunk(vm_inst, chunk);
+    get(vm_inst.globals, name)
+}
+
+// ---------- tests ----------
+
+fn test_simple_arithmetic() {
+    // `let x = 1 + 2 * 3` → x should be 7
+    let x = compile_run_and_get_global("let x = 1 + 2 * 3", "x");
+    assert_eq(x, 7, "simple_arithmetic: 1 + 2 * 3 = 7")
+}
+
+fn test_let_global() {
+    let x = compile_run_and_get_global("let x = 42", "x");
+    assert_eq(x, 42, "let_global: x = 42")
+}
+
+fn test_function_def_and_call() {
+    // `fn add(a, b) { a + b }; let result = add(1, 2)` → result = 3
+    let src = "fn add(a, b) \{ a + b \}; let result = add(1, 2)";
+    let result = compile_run_and_get_global(src, "result");
+    assert_eq(result, 3, "function_call: add(1, 2) = 3")
+}
+
+fn test_nested_let_in_function() {
+    // `fn f(a) { let b = a + 1; b * 2 }; let r = f(10)` → r = 22
+    let src = "fn f(a) \{ let b = a + 1; b * 2 \}; let r = f(10)";
+    let r = compile_run_and_get_global(src, "r");
+    assert_eq(r, 22, "nested_let: f(10) = 22")
+}
+
+fn test_return_value() {
+    // `fn f() { return 42 }; let r = f()` → r = 42
+    let src = "fn f() \{ return 42 \}; let r = f()";
+    let r = compile_run_and_get_global(src, "r");
+    assert_eq(r, 42, "return_value: f() = 42")
+}
+
+fn test_if_expr_true() {
+    // `fn f() { if true { 1 } else { 2 } }; let r = f()` → r = 1
+    let src = "fn f() \{ if true \{ 1 \} else \{ 2 \} \}; let r = f()";
+    let r = compile_run_and_get_global(src, "r");
+    assert_eq(r, 1, "if_true: f() = 1")
+}
+
+fn test_if_expr_false() {
+    // `fn f() { if false { 1 } else { 2 } }; let r = f()` → r = 2
+    let src = "fn f() \{ if false \{ 1 \} else \{ 2 \} \}; let r = f()";
+    let r = compile_run_and_get_global(src, "r");
+    assert_eq(r, 2, "if_false: f() = 2")
+}
+
+fn test_comparison() {
+    // `fn f(a, b) { a < b }; let r = f(3, 5)` → r = true
+    let src = "fn f(a, b) \{ a < b \}; let r = f(3, 5)";
+    let r = compile_run_and_get_global(src, "r");
+    assert_eq(r, true, "comparison: 3 < 5 = true")
+}
+
+fn test_vec_literal() {
+    // `let v = [1, 2, 3]` → v should be [1, 2, 3]
+    let v = compile_run_and_get_global("let v = [1, 2, 3]", "v");
+    assert_eq(count(v), 3, "vec_literal: count=3");
+    assert_eq(v[0], 1, "vec_literal: v[0]=1");
+    assert_eq(v[1], 2, "vec_literal: v[1]=2");
+    assert_eq(v[2], 3, "vec_literal: v[2]=3")
+}
+
+fn test_map_literal() {
+    // `let m = { "a": 1, "b": 2 }` → m["a"]=1, m["b"]=2
+    let m = compile_run_and_get_global("let m = \{ \"a\": 1, \"b\": 2 \}", "m");
+    assert_eq(get(m, "a"), 1, "map_literal: m[a]=1");
+    assert_eq(get(m, "b"), 2, "map_literal: m[b]=2")
+}
+
+fn test_index_access() {
+    // `let v = [10, 20, 30]; let x = v[1]` → x = 20
+    let x = compile_run_and_get_global("let v = [10, 20, 30]; let x = v[1]", "x");
+    assert_eq(x, 20, "index_access: v[1]=20")
+}
+
+fn test_field_access() {
+    // `let m = { "name": "alice" }; let n = m.name` → n = "alice"
+    let n = compile_run_and_get_global("let m = \{ \"name\": \"alice\" \}; let n = m.name", "n");
+    assert_eq(n, "alice", "field_access: m.name=alice")
+}
+
+fn test_global_reassignment() {
+    // `let x = 1; x = 42` → x = 42
+    let x = compile_run_and_get_global("let x = 1; x = 42", "x");
+    assert_eq(x, 42, "global_reassign: x=42")
+}
+
+fn test_local_reassignment() {
+    // `fn f() { let x = 1; x = 99; x }; let r = f()` → r = 99
+    let src = "fn f() \{ let x = 1; x = 99; x \}; let r = f()";
+    let r = compile_run_and_get_global(src, "r");
+    assert_eq(r, 99, "local_reassign: r=99")
+}
+
+fn test_closure_upvalue() {
+    // `fn make_counter() { let count = 0; fn inc() { count = count + 1; count }; inc }`
+    // Counter closure captures `count` via upvalue.
+    // `let c = make_counter(); let r = c()` → r = 1
+    let src = "fn make_counter() \{ let count = 0; fn inc() \{ count = count + 1; count \}; inc \}; let c = make_counter(); let r = c()";
+    let r = compile_run_and_get_global(src, "r");
+    assert_eq(r, 1, "closure_upvalue: c()=1")
+}
+
+fn test_while_loop_with_break() {
+    // `fn f() { let i = 0; let sum = 0; while true { if i >= 3 { break }; sum = sum + i; i = i + 1 }; sum }`
+    // → sum = 0 + 1 + 2 = 3
+    let src = "fn f() \{ let i = 0; let sum = 0; while true \{ if i >= 3 \{ break \}; sum = sum + i; i = i + 1 \}; sum \}; let r = f()";
+    let r = compile_run_and_get_global(src, "r");
+    assert_eq(r, 3, "while_break: sum=3")
+}
+
+fn test_nested_function_calls() {
+    // `fn add(a, b) { a + b }; fn mul(a, b) { a * b }; let r = mul(add(1, 2), add(3, 4))`
+    // → r = 3 * 7 = 21
+    let src = "fn add(a, b) \{ a + b \}; fn mul(a, b) \{ a * b \}; let r = mul(add(1, 2), add(3, 4))";
+    let r = compile_run_and_get_global(src, "r");
+    assert_eq(r, 21, "nested_calls: mul(add(1,2), add(3,4))=21")
+}
+
+fn test_method_call() {
+    // `fn first(v) { v[0] }; let v = [10, 20, 30]; let r = v.first()`
+    // Method call `v.first()` dispatches to global `first(v)`.
+    // → r = 10
+    let src = "fn first(v) \{ v[0] \}; let v = [10, 20, 30]; let r = v.first()";
+    let r = compile_run_and_get_global(src, "r");
+    assert_eq(r, 10, "method_call: v.first()=10")
+}
+
+fn test_method_call_with_arg() {
+    // `fn add_n(v, n) { v + n }; let r = 5.add_n(3)`
+    // Method call `5.add_n(3)` dispatches to global `add_n(5, 3)`.
+    // → r = 8
+    let src = "fn add_n(v, n) \{ v + n \}; let r = 5.add_n(3)";
+    let r = compile_run_and_get_global(src, "r");
+    assert_eq(r, 8, "method_call_with_arg: 5.add_n(3)=8")
+}
+
+// ---------- match tests ----------
+
+fn test_match_wildcard() {
+    let src = "let r = match 5 \{ _ => 42 \}";
+    let r = compile_run_and_get_global(src, "r");
+    assert_eq(r, 42, "match_wildcard: match 5 \{ _ => 42 \} = 42")
+}
+
+fn test_match_bind() {
+    let src = "let r = match 5 \{ x => x + 1 \}";
+    let r = compile_run_and_get_global(src, "r");
+    assert_eq(r, 6, "match_bind: match 5 \{ x => x+1 \} = 6")
+}
+
+fn test_match_lit_multi_arm() {
+    let src = "let r = match 3 \{ 1 => 10, 2 => 20, 3 => 30, _ => 0 \}";
+    let r = compile_run_and_get_global(src, "r");
+    assert_eq(r, 30, "match_lit: match 3 \{ 1=>10, 2=>20, 3=>30, _=>0 \} = 30")
+}
+
+fn test_match_or_pattern() {
+    let src = "let r = match 2 \{ 1 | 2 => 100, _ => 0 \}";
+    let r = compile_run_and_get_global(src, "r");
+    assert_eq(r, 100, "match_or: match 2 \{ 1|2=>100, _=>0 \} = 100")
+}
+
+fn test_match_bool() {
+    let src = "let r = match true \{ true => 1, false => 0 \}";
+    let r = compile_run_and_get_global(src, "r");
+    assert_eq(r, 1, "match_bool: match true \{ true=>1, false=>0 \} = 1")
+}
+
+// ---------- try tests ----------
+
+fn test_try_raise_rescue() {
+    let src = "let r = try \{ raise 42 \} rescue \{ 99 \}";
+    let r = compile_run_and_get_global(src, "r");
+    assert_eq(r, 99, "try_raise_rescue: try \{ raise 42 \} rescue \{ 99 \} = 99")
+}
+
+fn test_try_rescue_bind() {
+    let src = "let r = try \{ raise 42 \} rescue as e \{ e + 1 \}";
+    let r = compile_run_and_get_global(src, "r");
+    assert_eq(r, 43, "try_rescue_bind: try \{ raise 42 \} rescue as e \{ e+1 \} = 43")
+}
+
+fn test_try_no_exception() {
+    let src = "let r = try \{ 1 + 2 \} rescue \{ 99 \}";
+    let r = compile_run_and_get_global(src, "r");
+    assert_eq(r, 3, "try_no_exc: try \{ 1+2 \} rescue \{ 99 \} = 3")
+}
+
+// ---------- struct tests ----------
+
+fn test_struct_construct_and_field() {
+    // type Point = { x: Int, y: Int }; let p = Point({ x: 1, y: 2 }); p.x
+    let src = "type Point = \{ x: Int, y: Int \}; let p = Point(\{ x: 1, y: 2 \}); let r = p.x";
+    let r = compile_run_and_get_global(src, "r");
+    assert_eq(r, 1, "struct_field: Point(\{x:1,y:2\}).x = 1")
+}
+
+fn test_struct_match_pattern() {
+    // match Point({x:1,y:2}) { Point { x: a, y: b } => a + b, _ => 0 }
+    let src = "type Point = \{ x: Int, y: Int \}; let p = Point(\{ x: 1, y: 2 \}); let r = match p \{ Point \{ x: a, y: b \} => a + b, _ => 0 \}";
+    let r = compile_run_and_get_global(src, "r");
+    assert_eq(r, 3, "struct_match: Point \{ x:a, y:b \} => a+b = 3")
+}
+
+fn test_variant_match_pattern() {
+    // Variant value as map literal: { "__variant__": "Some", "args": [42] }
+    // match some { Some(v) => v + 1, _ => 0 }
+    let src = "let some = \{ \"__variant__\": \"Some\", \"args\": [42] \}; let r = match some \{ Some(v) => v + 1, _ => 0 \}";
+    let r = compile_run_and_get_global(src, "r");
+    assert_eq(r, 43, "variant_match: Some(v) => v+1 = 43")
+}
+
+// ---------- run ----------
+
+test_simple_arithmetic();
+test_let_global();
+test_function_def_and_call();
+test_nested_let_in_function();
+test_return_value();
+test_if_expr_true();
+test_if_expr_false();
+test_comparison();
+test_vec_literal();
+test_map_literal();
+test_index_access();
+test_field_access();
+test_global_reassignment();
+test_local_reassignment();
+test_closure_upvalue();
+test_while_loop_with_break();
+test_nested_function_calls();
+test_method_call();
+test_method_call_with_arg();
+test_match_wildcard();
+test_match_bind();
+test_match_lit_multi_arm();
+test_match_or_pattern();
+test_match_bool();
+test_try_raise_rescue();
+test_try_rescue_bind();
+test_try_no_exception();
+test_struct_construct_and_field();
+test_struct_match_pattern();
+test_variant_match_pattern();
+
+println("");
+println("=========================================");
+println("test_vm: " + to_str(pass_count) + " passed, " + to_str(fail_count) + " failed");
+println("=========================================");

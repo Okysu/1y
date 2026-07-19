@@ -1731,6 +1731,16 @@ impl VmCtx {
         let frame = self.frames.pop().expect("frame to return from");
         // Close any open upvalues pointing into this frame's stack region.
         self.close_upvalues_above(frame.stack_base);
+        // Drop any loop/exception/transact handlers that belonged to this
+        // frame (or any inner frame). After popping `frame`, `frames.len()`
+        // is the depth of the caller; any handler whose `frame_depth` is
+        // greater than that belongs to a frame we just left, so it must be
+        // removed — otherwise a later `break`/`continue`/`raise` in the
+        // caller could match a stale handler and mis-dispatch.
+        let caller_depth = self.frames.len();
+        self.loop_handlers.retain(|h| h.frame_depth <= caller_depth);
+        self.exception_handlers.retain(|h| h.frame_depth <= caller_depth);
+        self.transact_handlers.retain(|h| h.frame_depth <= caller_depth);
         // Truncate the stack back to the frame's base, then push the return value.
         self.stack.truncate(frame.stack_base);
         self.stack.push(ret);
@@ -2165,8 +2175,26 @@ impl VmCtx {
         // Run only the module's frame — stop when it returns. Do NOT keep
         // stepping while `frames` is non-empty, because the calling frame
         // (script or another module) is still on the stack.
+        //
+        // Control-flow signals (Break/Continue/Retry/UserException/Return/Reply)
+        // produced inside the module must be handled HERE, with
+        // `propagate_depth = frame_count`, so that e.g. a `break` inside the
+        // module's `loop { ... }` is caught by the module's own loop handler
+        // instead of escaping up to the caller's `handle_signal` (which could
+        // find a stale loop handler from the module and "continue" execution
+        // in the module frame after load_module has already returned Err).
         while self.frames.len() > frame_count {
-            self.step(vm)?;
+            match self.step(vm) {
+                Ok(()) => {}
+                Err(e) => match self.handle_signal(e, frame_count)? {
+                    SignalOutcome::Continue => {}
+                    SignalOutcome::Done(_) => {
+                        // Return/Reply reached the module's script frame —
+                        // treat as module completion (mirrors run_chunk).
+                        break;
+                    }
+                },
+            }
         }
         // pop the nil/last-expr value left by the module's Return
         let _ = self.stack.pop();

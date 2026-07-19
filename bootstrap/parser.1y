@@ -1,0 +1,1141 @@
+// ============================================================
+// 1y self-hosting Stage 2 (b): parser written in 1y.
+//
+// Consumes a Vec<Token> (from lexer.1y) and produces a Program AST
+// matching the encoding in src/ast/to_value.rs:
+//   { "type": "Program", "stmts": [...] }
+//
+// Supported (phase 2 minimal):
+//   stmt    : Let, FuncDef, TypeDef, Expr, Semi
+//   expr    : Int, Decimal, Str, Bool, Nil, Ident, BinOp, UnaryOp,
+//             Assign, CompoundAssign, Pipe, Call, Index, Field,
+//             Paren, Block, If, Lambda, VecLit, MapLit, While
+//   pattern : Wildcard, Bind, Lit (partial)
+//   type    : Name (partial)
+// ============================================================
+
+import lexer;
+
+// Local alias so the rest of the file can call `lex(...)` directly.
+let lex = lexer.lex;
+
+// ---------- token cursor ----------
+
+// Parser state: shared map with
+//   toks, n, i, errors
+fn parse(toks) {
+    let st = shared {
+        "toks": toks,
+        "n": count(toks),
+        "i": 0,
+        "errors": []
+    };
+    let stmts = parse_stmt_list(st, true);
+    { "type": "Program", "stmts": stmts }
+}
+
+fn parse_errors(st) {
+    st.errors
+}
+
+fn peek(st) {
+    get(st.toks, st.i)
+}
+
+fn peek_kind(st) {
+    let t = peek(st);
+    if is_map(t) { get(t, "kind") } else { "Eof" }
+}
+
+fn peek_kw(st) {
+    let t = peek(st);
+    if is_map(t) {
+        let k = get(t, "kind");
+        if k == "KW" { get(t, "value") } else { "" }
+    } else {
+        ""
+    }
+}
+
+fn bump(st) {
+    let t = get(st.toks, st.i);
+    if st.i + 1 < st.n {
+        st.i = st.i + 1
+    };
+    t
+}
+
+fn at_kind(st, k) {
+    peek_kind(st) == k
+}
+
+fn at_kw(st, w) {
+    peek_kw(st) == w
+}
+
+fn at_punct(st, k) {
+    peek_kind(st) == k
+}
+
+fn expect_kind(st, k) {
+    if peek_kind(st) == k {
+        bump(st)
+    } else {
+        st.errors = push(st.errors, "expected " + k + " but got " + peek_kind(st))
+    }
+}
+
+fn expect_kw(st, w) {
+    if at_kw(st, w) {
+        bump(st)
+    } else {
+        st.errors = push(st.errors, "expected keyword " + w + " but got " + peek_kw(st))
+    }
+}
+
+// ---------- statements ----------
+
+fn parse_stmt_list(st, top_level) {
+    let stmts = [];
+    loop {
+        let k = peek_kind(st);
+        if k == "Eof" { break };
+        if k == "RBrace" {
+            if top_level {
+                st.errors = push(st.errors, "unexpected } at top level")
+            } else {
+                break
+            };
+            st.i = st.i + 1
+        };
+        let s = parse_stmt(st);
+        if s != nil {
+            stmts = push(stmts, s)
+        }
+    };
+    stmts
+}
+
+fn peek_at_kind(st, offset) {
+    let idx = st.i + offset;
+    if idx < st.n {
+        let t = get(st.toks, idx);
+        if is_map(t) { get(t, "kind") } else { "Eof" }
+    } else {
+        "Eof"
+    }
+}
+
+fn parse_stmt(st) {
+    let k = peek_kind(st);
+    let w = peek_kw(st);
+    if k == "KW" {
+        if w == "let" { return parse_let(st) };
+        // `fn name(...)` → FuncDef; `fn(...)` → lambda expr stmt.
+        if w == "fn" {
+            if peek_at_kind(st, 1) == "Ident" {
+                return parse_fn_stmt(st)
+            }
+        };
+        // `shared name = ...` or `shared name: T = ...` → SharedDecl;
+        // otherwise `shared expr` (e.g. `let x = shared 0;`) → expr stmt.
+        if w == "shared" {
+            if peek_at_kind(st, 1) == "Ident" {
+                let k2 = peek_at_kind(st, 2);
+                if k2 == "Assign" or k2 == "Colon" {
+                    return parse_shared_decl(st)
+                }
+            }
+        };
+        if w == "type" { return parse_type_def(st) };
+        if w == "import" { return parse_import(st) };
+        // actor body items
+        if w == "state" { return parse_state_decl(st) };
+        if w == "on" { return parse_on_clause(st) };
+        // `actor Name { ... }` → ActorDef
+        if w == "actor" { return parse_actor_def(st) }
+    };
+    // expression statement
+    let e = parse_expr(st, 0);
+    if at_kind(st, "Semicolon") {
+        bump(st);
+        return { "type": "Semi", "expr": e }
+    };
+    { "type": "Expr", "expr": e }
+}
+
+fn parse_let(st) {
+    bump(st); // 'let'
+    let name_tok = bump(st);
+    let name = get(name_tok, "value");
+    // optional type annotation `: Type`
+    if at_kind(st, "Colon") {
+        bump(st);
+        parse_type_annot(st);
+    };
+    expect_kind(st, "Assign");
+    let value = parse_expr(st, 0);
+    if at_kind(st, "Semicolon") { bump(st) };
+    { "type": "Let", "name": name, "value": value }
+}
+
+fn parse_shared_decl(st) {
+    bump(st); // 'shared'
+    let name_tok = bump(st);
+    let name = get(name_tok, "value");
+    // optional type annotation `: Type` (consumed, not emitted)
+    if at_kind(st, "Colon") {
+        bump(st);
+        parse_type_annot(st)
+    };
+    expect_kind(st, "Assign");
+    let value = parse_expr(st, 0);
+    if at_kind(st, "Semicolon") { bump(st) };
+    { "type": "SharedDecl", "name": name, "value": value }
+}
+
+fn parse_fn_stmt(st) {
+    bump(st); // 'fn'
+    let name_tok = bump(st);
+    let name = get(name_tok, "value");
+    let params = parse_params(st);
+    let body = parse_expr(st, 0);
+    if at_kind(st, "Semicolon") { bump(st) };
+    { "type": "FuncDef", "name": name, "params": params, "body": body }
+}
+
+// `state name = expr` or `state name: Type = expr` — actor state binding.
+fn parse_state_decl(st) {
+    bump(st); // 'state'
+    let name_tok = bump(st);
+    let name = get(name_tok, "value");
+    // optional `: Type` (consumed, not emitted)
+    if at_kind(st, "Colon") {
+        bump(st);
+        parse_type_annot(st)
+    };
+    expect_kind(st, "Assign");
+    let value = parse_expr(st, 0);
+    if at_kind(st, "Semicolon") { bump(st) };
+    { "type": "StateDecl", "name": name, "value": value }
+}
+
+// `on name(params) body` — actor message handler.
+fn parse_on_clause(st) {
+    bump(st); // 'on'
+    let name_tok = bump(st);
+    let name = get(name_tok, "value");
+    let params = parse_params(st);
+    let body = parse_expr(st, 0);
+    if at_kind(st, "Semicolon") { bump(st) };
+    { "type": "OnClause", "name": name, "params": params, "body": body }
+}
+
+// `actor Name { body... }` — actor definition.
+fn parse_actor_def(st) {
+    bump(st); // 'actor'
+    let name_tok = bump(st);
+    let name = get(name_tok, "value");
+    expect_kind(st, "LBrace");
+    let body = [];
+    while not at_kind(st, "RBrace") {
+        let s = parse_stmt(st);
+        body = push(body, s)
+    };
+    expect_kind(st, "RBrace");
+    if at_kind(st, "Semicolon") { bump(st) };
+    { "type": "ActorDef", "name": name, "body": body }
+}
+
+fn parse_params(st) {
+    expect_kind(st, "LParen");
+    let params = [];
+    if not at_kind(st, "RParen") {
+        loop {
+            let ptok = bump(st);
+            let pname = get(ptok, "value");
+            let annot = nil;
+            if at_kind(st, "Colon") {
+                bump(st);
+                annot = parse_type_annot(st)
+            };
+            params = push(params, { "name": pname, "annot": annot });
+            if at_kind(st, "Comma") { bump(st) } else { break }
+        }
+    };
+    expect_kind(st, "RParen");
+    params
+}
+
+fn parse_type_def(st) {
+    bump(st); // 'type'
+    let name_tok = bump(st);
+    let name = get(name_tok, "value");
+    let type_params = [];
+    if at_kind(st, "Lt") {
+        bump(st);
+        loop {
+            if at_kind(st, "Gt") { break };
+            let ptok = bump(st);
+            type_params = push(type_params, get(ptok, "value"));
+            if at_kind(st, "Comma") { bump(st) }
+        };
+        bump(st); // '>'
+    };
+    expect_kind(st, "Assign");
+    expect_kind(st, "LBrace");
+    let fields = [];
+    loop {
+        if at_kind(st, "RBrace") { break };
+        let fn_tok = bump(st);
+        let fname = get(fn_tok, "value");
+        expect_kind(st, "Colon");
+        let annot = parse_type_annot(st);
+        fields = push(fields, { "name": fname, "annot": annot });
+        if at_kind(st, "Comma") { bump(st) }
+    };
+    bump(st); // '}'
+    if at_kind(st, "Semicolon") { bump(st) };
+    { "type": "TypeDef", "name": name, "type_params": type_params, "fields": fields }
+}
+
+fn parse_import(st) {
+    bump(st); // 'import'
+    let path_tok = bump(st);
+    let path = get(path_tok, "value");
+    let alias = nil;
+    let is_lazy = false;
+    if at_kw(st, "as") {
+        bump(st);
+        let atok = bump(st);
+        alias = get(atok, "value")
+    };
+    if at_kind(st, "Semicolon") { bump(st) };
+    { "type": "Import", "path": path, "alias": alias, "lazy": is_lazy }
+}
+
+fn parse_type_annot(st) {
+    // minimal: Name or Generic<...> or (a, b) -> c
+    if at_kind(st, "LParen") {
+        bump(st);
+        let ps = [];
+        loop {
+            if at_kind(st, "RParen") { break };
+            ps = push(ps, parse_type_annot(st));
+            if at_kind(st, "Comma") { bump(st) }
+        };
+        bump(st); // ')'
+        if at_kind(st, "Arrow") {
+            bump(st);
+            let ret = parse_type_annot(st);
+            return { "type": "TypeFn", "params": ps, "ret": ret }
+        };
+        return { "type": "TypeName", "name": "()" }
+    };
+    let nt = bump(st);
+    let name = get(nt, "value");
+    if at_kind(st, "Lt") {
+        bump(st);
+        let args = [];
+        loop {
+            if at_kind(st, "Gt") { break };
+            args = push(args, parse_type_annot(st));
+            if at_kind(st, "Comma") { bump(st) }
+        };
+        bump(st); // '>'
+        return { "type": "TypeGeneric", "name": name, "args": args }
+    };
+    { "type": "TypeName", "name": name }
+}
+
+// ---------- blocks ----------
+
+fn parse_block(st) {
+    expect_kind(st, "LBrace");
+    let stmts = [];
+    let tail = nil;
+    loop {
+        let k = peek_kind(st);
+        if k == "RBrace" or k == "Eof" { break };
+        let s = parse_stmt(st);
+        // tail position: if last stmt is an Expr (not Semi), it's the tail
+        if at_kind(st, "RBrace") {
+            if get(s, "type") == "Expr" {
+                tail = get(s, "expr")
+            } else {
+                stmts = push(stmts, s)
+            }
+        } else {
+            stmts = push(stmts, s)
+        }
+    };
+    expect_kind(st, "RBrace");
+    { "type": "Block", "stmts": stmts, "tail": tail }
+}
+
+// ---------- expressions (Pratt) ----------
+
+// infix op table: kind -> [lbp, rbp, op_name]
+fn infix_op(st) {
+    let k = peek_kind(st);
+    let w = peek_kw(st);
+    if k == "Pipe" { return [1, 2, "Pipe"] };
+    if k == "Bang" { return [3, 4, "ActorSend"] };
+    if k == "Question" { return [3, 4, "ActorRequest"] };
+    if w == "or" or k == "Or" { return [5, 6, "or"] };
+    if w == "and" or k == "And" { return [7, 8, "and"] };
+    if k == "Eq" { return [9, 10, "=="] };
+    if k == "Neq" { return [9, 10, "!="] };
+    if k == "Lt" { return [9, 10, "<"] };
+    if k == "Gt" { return [9, 10, ">"] };
+    if k == "Lte" { return [9, 10, "<="] };
+    if k == "Gte" { return [9, 10, ">="] };
+    if k == "Plus" { return [11, 12, "+"] };
+    if k == "Minus" { return [11, 12, "-"] };
+    if k == "Star" { return [13, 14, "*"] };
+    if k == "Slash" { return [13, 14, "/"] };
+    if k == "Percent" { return [13, 14, "%"] };
+    nil
+}
+
+fn parse_expr(st, min_bp) {
+    let lhs = parse_prefix(st);
+    loop {
+        // assignment (lowest, right-assoc)
+        if min_bp == 0 and at_kind(st, "Assign") {
+            bump(st);
+            let rhs = parse_expr(st, 0);
+            lhs = { "type": "Assign", "target": lhs, "value": rhs };
+            continue
+        };
+        if min_bp == 0 {
+            let cop = compound_op(st);
+            if cop != "" {
+                bump(st);
+                let rhs = parse_expr(st, 0);
+                lhs = { "type": "CompoundAssign", "op": cop, "target": lhs, "value": rhs };
+                continue
+            }
+        };
+        let info = infix_op(st);
+        if info == nil { break };
+        let lbp = info[0];
+        let rbp = info[1];
+        let op = info[2];
+        if lbp < min_bp { break };
+        bump(st);
+        let rhs = parse_expr(st, rbp);
+        if op == "Pipe" {
+            lhs = { "type": "Pipe", "lhs": lhs, "rhs": rhs }
+        } else if op == "ActorSend" {
+            lhs = { "type": "ActorSend", "actor": lhs, "msg": rhs }
+        } else if op == "ActorRequest" {
+            lhs = { "type": "ActorRequest", "actor": lhs, "msg": rhs }
+        } else {
+            lhs = { "type": "BinOp", "op": op, "lhs": lhs, "rhs": rhs }
+        }
+    };
+    lhs
+}
+
+fn compound_op(st) {
+    let k = peek_kind(st);
+    if k == "PlusAssign" { "+" }
+    else if k == "MinusAssign" { "-" }
+    else if k == "StarAssign" { "*" }
+    else if k == "SlashAssign" { "/" }
+    else if k == "PercentAssign" { "%" }
+    else { "" }
+}
+
+fn parse_prefix(st) {
+    let k = peek_kind(st);
+    let w = peek_kw(st);
+    if k == "Minus" {
+        bump(st);
+        let operand = parse_expr(st, 15);
+        return { "type": "UnaryOp", "op": "-", "expr": operand }
+    };
+    if w == "not" {
+        bump(st);
+        let operand = parse_expr(st, 15);
+        return { "type": "UnaryOp", "op": "not", "expr": operand }
+    };
+    parse_postfix(st)
+}
+
+fn parse_postfix(st) {
+    let lhs = parse_primary(st);
+    loop {
+        let k = peek_kind(st);
+        if k == "LParen" {
+            bump(st);
+            let args = parse_args(st);
+            expect_kind(st, "RParen");
+            lhs = { "type": "Call", "callee": lhs, "args": args }
+        } else if k == "LBracket" {
+            bump(st);
+            let idx = parse_expr(st, 0);
+            expect_kind(st, "RBracket");
+            lhs = { "type": "Index", "target": lhs, "index": idx }
+        } else if k == "Dot" {
+            bump(st);
+            let nt = bump(st);
+            let name = get(nt, "value");
+            if at_kind(st, "LParen") {
+                bump(st);
+                let args = parse_args(st);
+                expect_kind(st, "RParen");
+                lhs = { "type": "MethodCall", "receiver": lhs, "method": name, "args": args }
+            } else {
+                lhs = { "type": "Field", "target": lhs, "name": name }
+            }
+        } else {
+            break
+        }
+    };
+    lhs
+}
+
+fn parse_args(st) {
+    let args = [];
+    if not at_kind(st, "RParen") {
+        loop {
+            args = push(args, parse_expr(st, 0));
+            if at_kind(st, "Comma") { bump(st) } else { break }
+        }
+    };
+    args
+}
+
+fn parse_primary(st) {
+    let k = peek_kind(st);
+    let w = peek_kw(st);
+    if k == "Int" {
+        let t = bump(st);
+        return { "type": "Int", "value": get(t, "value") }
+    };
+    if k == "Decimal" {
+        let t = bump(st);
+        // lexer stores the raw text; ast_of encodes a Decimal value.
+        let dv = eval(get(t, "value"));
+        return { "type": "Decimal", "value": dv }
+    };
+    if k == "Str" {
+        let t = bump(st);
+        return str_token_to_ast(t)
+    };
+    if k == "Ident" {
+        let t = bump(st);
+        return { "type": "Ident", "name": get(t, "value") }
+    };
+    if w == "true" {
+        bump(st);
+        return { "type": "Bool", "value": true }
+    };
+    if w == "false" {
+        bump(st);
+        return { "type": "Bool", "value": false }
+    };
+    if w == "nil" {
+        bump(st);
+        return { "type": "Nil" }
+    };
+    if w == "if" { return parse_if(st) };
+    if w == "while" { return parse_while(st) };
+    if w == "loop" { return parse_loop(st) };
+    if w == "for" { return parse_for(st) };
+    if w == "fn" { return parse_lambda(st) };
+    if w == "return" {
+        bump(st);
+        let v = nil;
+        if not (at_kind(st, "Semicolon") or at_kind(st, "RBrace") or at_kind(st, "Eof")) {
+            v = parse_expr(st, 0)
+        };
+        return { "type": "Return", "value": v }
+    };
+    if w == "break" {
+        bump(st);
+        let v = nil;
+        if not (at_kind(st, "Semicolon") or at_kind(st, "RBrace") or at_kind(st, "Eof")) {
+            v = parse_expr(st, 0)
+        };
+        return { "type": "Break", "value": v }
+    };
+    if w == "continue" {
+        bump(st);
+        return { "type": "Continue" }
+    };
+    if w == "raise" {
+        bump(st);
+        let e = parse_expr(st, 0);
+        return { "type": "Raise", "expr": e }
+    };
+    if w == "match" { return parse_match(st) };
+    if w == "try" { return parse_try(st) };
+    if w == "shared" {
+        bump(st);
+        let e = parse_expr(st, 0);
+        return { "type": "SharedExpr", "expr": e }
+    };
+    if w == "transact" {
+        bump(st);
+        let body = parse_expr(st, 0);
+        return { "type": "Transact", "body": body }
+    };
+    if w == "retry" {
+        bump(st);
+        return { "type": "Retry" }
+    };
+    if w == "yield" {
+        bump(st);
+        return { "type": "Yield" }
+    };
+    if w == "await" {
+        bump(st);
+        let e = parse_expr(st, 0);
+        return { "type": "Await", "expr": e }
+    };
+    if w == "reply" {
+        bump(st);
+        let e = parse_expr(st, 0);
+        return { "type": "Reply", "value": e }
+    };
+    if w == "spawn" {
+        bump(st);
+        if not at_kind(st, "Ident") {
+            panic("expected actor name after `spawn`")
+        };
+        let name_tok = bump(st);
+        let name = get(name_tok, "value");
+        expect_kind(st, "LParen");
+        let args = parse_args(st);
+        expect_kind(st, "RParen");
+        return { "type": "Spawn", "name": name, "args": args }
+    };
+    if k == "LParen" {
+        bump(st);
+        if at_kind(st, "RParen") {
+            // unit `()` — encode as Paren(Nil)
+            bump(st);
+            return { "type": "Paren", "expr": { "type": "Nil" } }
+        };
+        let e = parse_expr(st, 0);
+        expect_kind(st, "RParen");
+        return { "type": "Paren", "expr": e }
+    };
+    if k == "LBrace" {
+        return parse_brace_expr(st)
+    };
+    if k == "LBracket" {
+        return parse_vec_lit(st)
+    };
+    if k == "HashBrace" {
+        return parse_set_lit(st)
+    };
+    if k == "Underscore" {
+        bump(st);
+        return { "type": "Ident", "name": "_" }
+    };
+    if k == "Bang" {
+        // shouldn't reach here in prefix position; recover
+        bump(st);
+        return { "type": "Ident", "name": "_" }
+    };
+    // unexpected — emit a placeholder and advance
+    st.errors = push(st.errors, "unexpected token in primary: " + k);
+    bump(st);
+    { "type": "Nil" }
+}
+
+fn parse_lambda(st) {
+    bump(st); // 'fn'
+    let params = parse_params(st);
+    // optional `-> Type` return type annotation (consume but don't emit)
+    if at_kind(st, "Arrow") {
+        bump(st);
+        parse_type_annot(st)
+    };
+    let body = parse_expr(st, 0);
+    { "type": "Lambda", "params": params, "body": body }
+}
+
+fn str_token_to_ast(t) {
+    let parts = get(t, "parts");
+    let n = count(parts);
+    if n == 1 {
+        let p0 = parts[0];
+        if get(p0, "type") == "Literal" {
+            return { "type": "Str", "value": get(p0, "text") }
+        }
+    };
+    // re-encode parts: lexer uses {"type": "Literal", "text": ...} / {"type": "Expr", "raw": ...}
+    // ast_of uses {"type": "Literal", "text": ...} / {"type": "Expr", "expr": <parsed>}
+    let out = [];
+    let i = 0;
+    while i < n {
+        let p = parts[i];
+        if get(p, "type") == "Literal" {
+            out = push(out, { "type": "Literal", "text": get(p, "text") })
+        } else {
+            // Expr with raw source — parse it
+            let raw = get(p, "raw");
+            let raw_toks = lex(raw);
+            let raw_st = shared { "toks": raw_toks, "n": count(raw_toks), "i": 0, "errors": [] };
+            let e = parse_expr(raw_st, 0);
+            out = push(out, { "type": "Expr", "expr": e })
+        };
+        i = i + 1
+    };
+    { "type": "Str", "parts": out }
+}
+
+fn parse_if(st) {
+    bump(st); // 'if'
+    let cond = parse_expr(st, 0);
+    let then = parse_expr(st, 0);
+    let else_ = nil;
+    if at_kw(st, "else") {
+        bump(st);
+        if at_kw(st, "if") {
+            else_ = parse_if(st)
+        } else {
+            else_ = parse_expr(st, 0)
+        }
+    };
+    { "type": "If", "cond": cond, "then": then, "else": else_ }
+}
+
+fn parse_while(st) {
+    bump(st);
+    let cond = parse_expr(st, 0);
+    let body = parse_expr(st, 0);
+    { "type": "While", "cond": cond, "body": body }
+}
+
+// ---------- match / try / patterns ----------
+
+fn parse_match(st) {
+    bump(st); // 'match'
+    let scrutinee = parse_expr(st, 0);
+    expect_kind(st, "LBrace");
+    let arms = [];
+    while not (at_kind(st, "RBrace") or at_kind(st, "Eof")) {
+        let pat = parse_pattern(st);
+        let guard = nil;
+        if at_kw(st, "if") {
+            bump(st);
+            guard = parse_expr(st, 0)
+        };
+        expect_kind(st, "FatArrow");
+        let body = parse_expr(st, 0);
+        arms = push(arms, { "pattern": pat, "guard": guard, "body": body });
+        if at_kind(st, "Comma") {
+            bump(st)
+        } else {
+            if at_kind(st, "RBrace") or at_kind(st, "Eof") { break }
+        }
+    };
+    expect_kind(st, "RBrace");
+    { "type": "Match", "scrutinee": scrutinee, "arms": arms }
+}
+
+fn parse_try(st) {
+    bump(st); // 'try'
+    let body = parse_expr(st, 0);
+    let rescues = [];
+    while at_kw(st, "rescue") {
+        bump(st);
+        // optional type name (Ident)
+        let type_name = nil;
+        if at_kind(st, "Ident") {
+            let tn = bump(st);
+            type_name = get(tn, "value")
+        };
+        // optional `as name`
+        let bind = nil;
+        if at_kw(st, "as") {
+            bump(st);
+            let bn = bump(st);
+            bind = get(bn, "value")
+        };
+        let rbody = parse_expr(st, 0);
+        rescues = push(rescues, { "type_name": type_name, "bind": bind, "body": rbody })
+    };
+    let ensure_body = nil;
+    if at_kw(st, "ensure") {
+        bump(st);
+        ensure_body = parse_expr(st, 0)
+    };
+    { "type": "Try", "body": body, "rescues": rescues, "ensure": ensure_body }
+}
+
+fn parse_pattern(st) {
+    let first = parse_pattern_atomic(st);
+    // or-pattern: pat | pat | ...
+    // (lexer emits 'Pipe2' for single `|`)
+    if at_kind(st, "Pipe2") {
+        let alts = [first];
+        while at_kind(st, "Pipe2") {
+            bump(st);
+            alts = push(alts, parse_pattern_atomic(st))
+        };
+        return { "type": "Or", "pats": alts }
+    };
+    first
+}
+
+fn parse_pattern_atomic(st) {
+    let k = peek_kind(st);
+    let w = peek_kw(st);
+    if k == "Underscore" {
+        bump(st);
+        return { "type": "Wildcard" }
+    };
+    if k == "Int" {
+        let t = bump(st);
+        return { "type": "Lit", "lit_type": "Int", "value": get(t, "value") }
+    };
+    if k == "Decimal" {
+        let t = bump(st);
+        return { "type": "Lit", "lit_type": "Decimal", "value": eval(get(t, "value")) }
+    };
+    if k == "Str" {
+        let t = bump(st);
+        return { "type": "Lit", "lit_type": "Str", "parts": get(t, "parts") }
+    };
+    if w == "true" {
+        bump(st);
+        return { "type": "Lit", "lit_type": "Bool", "value": true }
+    };
+    if w == "false" {
+        bump(st);
+        return { "type": "Lit", "lit_type": "Bool", "value": false }
+    };
+    if w == "nil" {
+        bump(st);
+        return { "type": "Lit", "lit_type": "Nil" }
+    };
+    if k == "Ident" {
+        let t = bump(st);
+        let name = get(t, "value");
+        // Check first char: uppercase => Variant or Struct; lowercase => Bind
+        // (1y has no is_uppercase/char_code builtin — use a string compare)
+        let first_char = char_at(name, 0);
+        let is_upper = first_char == "A" or first_char == "B" or first_char == "C"
+            or first_char == "D" or first_char == "E" or first_char == "F"
+            or first_char == "G" or first_char == "H" or first_char == "I"
+            or first_char == "J" or first_char == "K" or first_char == "L"
+            or first_char == "M" or first_char == "N" or first_char == "O"
+            or first_char == "P" or first_char == "Q" or first_char == "R"
+            or first_char == "S" or first_char == "T" or first_char == "U"
+            or first_char == "V" or first_char == "W" or first_char == "X"
+            or first_char == "Y" or first_char == "Z";
+        if is_upper {
+            // Struct pattern: Name { ... }
+            if at_kind(st, "LBrace") {
+                bump(st);
+                let fields = [];
+                let rest = false;
+                while not at_kind(st, "RBrace") {
+                    if at_kind(st, "DotDot") {
+                        bump(st);
+                        rest = true;
+                        break
+                    };
+                    let ft = bump(st);
+                    let fname = get(ft, "value");
+                    let fpat = nil;
+                    if at_kind(st, "Colon") {
+                        bump(st);
+                        fpat = parse_pattern(st)
+                    } else {
+                        // shorthand: { x } => bind x
+                        fpat = { "type": "Bind", "name": fname }
+                    };
+                    fields = push(fields, { "name": fname, "pattern": fpat });
+                    if at_kind(st, "Comma") { bump(st) } else { break }
+                };
+                expect_kind(st, "RBrace");
+                return { "type": "Struct", "fields": fields, "rest": rest }
+            };
+            // Variant pattern: Name or Name(args)
+            let args = [];
+            if at_kind(st, "LParen") {
+                bump(st);
+                while not at_kind(st, "RParen") {
+                    args = push(args, parse_pattern(st));
+                    if at_kind(st, "Comma") { bump(st) } else { break }
+                };
+                expect_kind(st, "RParen")
+            };
+            return { "type": "Variant", "name": name, "args": args }
+        };
+        // Lowercase ident: bind
+        return { "type": "Bind", "name": name }
+    };
+    if k == "LBracket" {
+        bump(st);
+        let pats = [];
+        let rest = false;
+        while not at_kind(st, "RBracket") {
+            if at_kind(st, "DotDot") {
+                bump(st);
+                rest = true;
+                // optional bind name
+                if at_kind(st, "Ident") { bump(st) };
+                break
+            };
+            pats = push(pats, parse_pattern(st));
+            if at_kind(st, "Comma") { bump(st) } else { break }
+        };
+        expect_kind(st, "RBracket");
+        return { "type": "Vec", "pats": pats, "rest": rest }
+    };
+    if k == "LBrace" {
+        // Struct pattern without leading Name
+        bump(st);
+        let fields = [];
+        let rest = false;
+        while not at_kind(st, "RBrace") {
+            if at_kind(st, "DotDot") {
+                bump(st);
+                rest = true;
+                break
+            };
+            let ft = bump(st);
+            let fname = get(ft, "value");
+            let fpat = nil;
+            if at_kind(st, "Colon") {
+                bump(st);
+                fpat = parse_pattern(st)
+            } else {
+                fpat = { "type": "Bind", "name": fname }
+            };
+            fields = push(fields, { "name": fname, "pattern": fpat });
+            if at_kind(st, "Comma") { bump(st) } else { break }
+        };
+        expect_kind(st, "RBrace");
+        return { "type": "Struct", "fields": fields, "rest": rest }
+    };
+    // Negative number literal pattern: -N
+    if k == "Minus" {
+        bump(st);
+        let nk = peek_kind(st);
+        if nk == "Int" {
+            let t = bump(st);
+            return { "type": "Lit", "lit_type": "Int", "value": -get(t, "value") }
+        };
+        if nk == "Decimal" {
+            let t = bump(st);
+            return { "type": "Lit", "lit_type": "Decimal", "value": -eval(get(t, "value")) }
+        }
+    };
+    { "type": "Wildcard" }
+}
+
+fn parse_loop(st) {
+    bump(st);
+    let body = parse_expr(st, 0);
+    { "type": "Loop", "body": body }
+}
+
+fn parse_for(st) {
+    bump(st);
+    let vt = bump(st);
+    let var = get(vt, "value");
+    expect_kw(st, "in");
+    let iter = parse_expr(st, 0);
+    let body = parse_expr(st, 0);
+    { "type": "For", "var": var, "iter": iter, "body": body }
+}
+
+fn parse_vec_lit(st) {
+    bump(st); // '['
+    let items = [];
+    loop {
+        if at_kind(st, "RBracket") { break };
+        items = push(items, parse_expr(st, 0));
+        if at_kind(st, "Comma") { bump(st) }
+    };
+    bump(st); // ']'
+    { "type": "VecLit", "items": items }
+}
+
+fn parse_set_lit(st) {
+    bump(st); // '#{'
+    let items = [];
+    if not at_kind(st, "RBrace") {
+        loop {
+            items = push(items, parse_expr(st, 0));
+            if at_kind(st, "Comma") { bump(st) } else { break }
+        }
+    };
+    bump(st); // '}'
+    { "type": "SetLit", "items": items }
+}
+
+// Parse `{ ... }` which is either a block or a map literal, decided by
+// lookahead (mirrors Rust's parse_brace_expr):
+//   `{}`                 → empty MapLit
+//   `{ key: val, ... }`  → MapLit
+//   otherwise            → Block
+fn parse_brace_expr(st) {
+    expect_kind(st, "LBrace");
+    // empty map literal: `{}`
+    if at_kind(st, "RBrace") {
+        bump(st);
+        return { "type": "MapLit", "entries": [] }
+    };
+    // declarations can't start a map, so a leading decl keyword ⇒ block
+    // (mirrors Rust's `is_decl_start` check in parse_brace_expr)
+    if is_decl_start(peek_kw(st)) {
+        return finish_block(st)
+    };
+    // parse first expression (potential first map key)
+    let first = parse_expr(st, 0);
+    if at_kind(st, "Colon") {
+        // map literal
+        bump(st); // ':'
+        let v = parse_expr(st, 0);
+        let entries = [[first, v]];
+        while at_kind(st, "Comma") {
+            bump(st);
+            if at_kind(st, "RBrace") { break }; // trailing comma
+            let k = parse_expr(st, 0);
+            expect_kind(st, "Colon");
+            let val = parse_expr(st, 0);
+            entries = push(entries, [k, val])
+        };
+        expect_kind(st, "RBrace");
+        return { "type": "MapLit", "entries": entries }
+    };
+    // block: `first` is either a Semi stmt or the tail
+    let stmts = [];
+    let tail = nil;
+    if at_kind(st, "Semicolon") {
+        bump(st);
+        stmts = push(stmts, { "type": "Semi", "expr": first });
+        // continue parsing more stmts until '}' or tail
+        loop {
+            if at_kind(st, "RBrace") or at_kind(st, "Eof") { break };
+            let s = parse_stmt(st);
+            if s == nil { continue };
+            if get(s, "type") == "Expr" {
+                // expression without trailing `;` ⇒ tail
+                tail = get(s, "expr");
+                break
+            };
+            stmts = push(stmts, s)
+        }
+    } else if at_kind(st, "RBrace") {
+        tail = first
+    } else {
+        // not `;` and not `}`: treat first as tail to recover
+        tail = first
+    };
+    expect_kind(st, "RBrace");
+    { "type": "Block", "stmts": stmts, "tail": tail }
+}
+
+// Return true if `kw` is a declaration keyword that can start a block
+// but not a map literal. Mirrors Rust's `is_decl_start`.
+fn is_decl_start(kw) {
+    kw == "let" or kw == "fn" or kw == "shared" or kw == "type"
+        or kw == "enum" or kw == "struct" or kw == "actor" or kw == "import"
+}
+
+// Parse the remaining statements of a block after `{`. Returns Block AST.
+fn finish_block(st) {
+    let stmts = [];
+    let tail = nil;
+    loop {
+        let k = peek_kind(st);
+        if k == "RBrace" or k == "Eof" { break };
+        let s = parse_stmt(st);
+        if s == nil { continue };
+        if get(s, "type") == "Expr" {
+            // expression without trailing `;` ⇒ tail
+            tail = get(s, "expr");
+            break
+        };
+        stmts = push(stmts, s)
+    };
+    expect_kind(st, "RBrace");
+    { "type": "Block", "stmts": stmts, "tail": tail }
+}
+
+// ---------- self-test ----------
+
+fn dump_ast(node, indent) {
+    let pad = "";
+    let i = 0;
+    while i < indent { pad = pad + "  "; i = i + 1 };
+    if is_map(node) {
+        let t = get(node, "type");
+        if t == "Program" {
+            println(pad + "Program");
+            let stmts = get(node, "stmts");
+            let j = 0;
+            while j < count(stmts) {
+                dump_ast(stmts[j], indent + 1);
+                j = j + 1
+            }
+        } else if t == "Let" {
+            println(pad + "Let " + get(node, "name"));
+            dump_ast(get(node, "value"), indent + 1)
+        } else if t == "FuncDef" {
+            println(pad + "FuncDef " + get(node, "name"));
+            dump_ast(get(node, "body"), indent + 1)
+        } else if t == "Expr" {
+            println(pad + "Expr");
+            dump_ast(get(node, "expr"), indent + 1)
+        } else if t == "Semi" {
+            println(pad + "Semi");
+            dump_ast(get(node, "expr"), indent + 1)
+        } else if t == "BinOp" {
+            println(pad + "BinOp " + get(node, "op"));
+            dump_ast(get(node, "lhs"), indent + 1);
+            dump_ast(get(node, "rhs"), indent + 1)
+        } else if t == "Int" {
+            println(pad + "Int " + to_str(get(node, "value")))
+        } else if t == "Decimal" {
+            println(pad + "Decimal " + get(node, "value"))
+        } else if t == "Str" {
+            println(pad + "Str " + to_str(get(node, "value")))
+        } else if t == "Ident" {
+            println(pad + "Ident " + get(node, "name"))
+        } else if t == "Call" {
+            println(pad + "Call");
+            dump_ast(get(node, "callee"), indent + 1);
+            let args = get(node, "args");
+            let j = 0;
+            while j < count(args) {
+                dump_ast(args[j], indent + 1);
+                j = j + 1
+            }
+        } else if t == "Block" {
+            println(pad + "Block");
+            let stmts = get(node, "stmts");
+            let j = 0;
+            while j < count(stmts) {
+                dump_ast(stmts[j], indent + 1);
+                j = j + 1
+            };
+            let tail = get(node, "tail");
+            if tail != nil { dump_ast(tail, indent + 1) }
+        } else if t == "If" {
+            println(pad + "If");
+            dump_ast(get(node, "cond"), indent + 1);
+            dump_ast(get(node, "then"), indent + 1);
+            let else_ = get(node, "else");
+            if else_ != nil { dump_ast(else_, indent + 1) }
+        } else {
+            println(pad + t)
+        }
+    } else {
+        println(pad + to_str(node))
+    }
+}
+
+// self-test demo removed (import would execute it)

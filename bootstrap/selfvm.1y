@@ -1,0 +1,46 @@
+// ============================================================
+// selfvm.1y — Stage 5 entry point: run a .1y file via the
+// 1y self-hosted VM (lexer.1y + parser.1y + compiler.1y + vm.1y).
+//
+// Usage:
+//   1y selfvm <target.1y>           (preferred — sets 1Y_SELFVM_TARGET)
+//   1y run bootstrap/selfvm.1y <target.1y>  (legacy — uses env.args())
+//
+// This script is itself executed by the Rust tree-walker. It loads
+// the self-hosted toolchain via `import`, reads the target file, and
+// invokes `vm.run_source(src)` — exercising the entire 1y pipeline
+// (lex → parse → compile → VM-execute) written in 1y.
+// ============================================================
+
+import io;
+import env;
+import lexer;
+import parser;
+import compiler;
+import vm;
+
+// Resolve target path: prefer 1Y_SELFVM_TARGET env var (set by
+// `1y selfvm`), fall back to argv[2] (when invoked via `1y run`).
+let target = env.get("1Y_SELFVM_TARGET");
+if target == nil {
+    let argv = env.args();
+    // argv[0] = "run" (or "selfvm"), argv[1] = script path, argv[2] = <target>
+    if count(argv) >= 3 {
+        target = argv[2]
+    }
+};
+
+if target == nil {
+    println("usage: 1y selfvm <target.1y>")
+} else {
+    if not io.exists(target) {
+        println("error: file not found: " + target)
+    } else {
+        let src = io.read_to_string(target);
+        let result = vm.run_source(src);
+        // Only print the result if it's not nil (mirrors Rust VM behavior).
+        if result != nil {
+            println("selfvm result: " + to_str(result))
+        }
+    }
+}

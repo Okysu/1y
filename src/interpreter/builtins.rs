@@ -39,6 +39,7 @@ pub fn register(env: &EnvRef) {
         ("is_vec", NativeFn { name: "is_vec", func: bi_is_vec }),
         ("is_map", NativeFn { name: "is_map", func: bi_is_map }),
         ("is_set", NativeFn { name: "is_set", func: bi_is_set }),
+        ("set", NativeFn { name: "set", func: bi_set }),
         ("is_number", NativeFn { name: "is_number", func: bi_is_number }),
         ("is_func", NativeFn { name: "is_func", func: bi_is_func }),
         ("is_closure", NativeFn { name: "is_closure", func: bi_is_closure }),
@@ -109,6 +110,9 @@ pub fn register(env: &EnvRef) {
         ("task_ready", NativeFn { name: "task_ready", func: bi_task_ready }),
         // --- concurrency (Phase C3: actor introspection) ---
         ("pid_of", NativeFn { name: "pid_of", func: bi_pid_of }),
+        // --- time (for benchmarking/timing) ---
+        ("now_ms", NativeFn { name: "now_ms", func: bi_now_ms }),
+        ("now_ns", NativeFn { name: "now_ns", func: bi_now_ns }),
     ];
     for (name, nf) in entries {
         env.borrow_mut().define(*name, Value::Native(std::rc::Rc::new(nf.clone())));
@@ -298,6 +302,28 @@ fn bi_is_map(args: &[Value]) -> Result<Value, InterpreterError> {
 }
 fn bi_is_set(args: &[Value]) -> Result<Value, InterpreterError> {
     Ok(Value::Bool(matches!(one_arg(args, "is_set")?, Value::Set(_))))
+}
+/// `set(vec)` → Set constructed from the items in `vec`.
+///
+/// Used by the 1y self-hosted VM's OP_NEW_SET handler to construct a proper
+/// `Value::Set` (1y has no Set literal constructor available at runtime —
+/// only `#{...}` syntax, which compiles to OP_NEW_SET). Duplicates are
+/// collapsed by the Set's dedup semantics.
+fn bi_set(args: &[Value]) -> Result<Value, InterpreterError> {
+    let v = one_arg(args, "set")?;
+    match v {
+        Value::Vec(items) => {
+            let set: im::HashSet<Value> = items.iter().cloned().collect();
+            Ok(Value::Set(set))
+        }
+        Value::Set(s) => Ok(Value::Set(s)),
+        _ => Err(InterpreterError::TypeError {
+            expected: "Vec or Set",
+            got: v.type_name(),
+            op: "set".into(),
+            span: None,
+        }),
+    }
 }
 fn bi_is_number(args: &[Value]) -> Result<Value, InterpreterError> {
     Ok(Value::Bool(one_arg(args, "is_number")?.is_number()))
@@ -1260,4 +1286,39 @@ fn bi_pid_of(args: &[Value]) -> Result<Value, InterpreterError> {
             span: None,
         }),
     }
+}
+
+// ---------------------------------------------------------------------------
+// time
+// ---------------------------------------------------------------------------
+
+/// `now_ms()` — current wall-clock time in milliseconds since UNIX epoch.
+/// Returns Int. Useful for benchmarking/timing in 1y code.
+///
+/// Example:
+///   let t0 = now_ms();
+///   ...work...
+///   let elapsed = now_ms() - t0;
+fn bi_now_ms(_args: &[Value]) -> Result<Value, InterpreterError> {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| InterpreterError::RuntimeError {
+            msg: format!("now_ms: system clock error: {}", e),
+            span: None,
+        })?
+        .as_millis();
+    Ok(Value::Int(num_bigint::BigInt::from(ms)))
+}
+
+/// `now_ns()` — current wall-clock time in nanoseconds since UNIX epoch.
+/// Returns Int. Higher resolution than `now_ms`, useful for micro-benchmarks.
+fn bi_now_ns(_args: &[Value]) -> Result<Value, InterpreterError> {
+    let ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| InterpreterError::RuntimeError {
+            msg: format!("now_ns: system clock error: {}", e),
+            span: None,
+        })?
+        .as_nanos();
+    Ok(Value::Int(num_bigint::BigInt::from(ns)))
 }

@@ -1,0 +1,12 @@
+// fib.1y — recursive fibonacci
+fn fib(n) {
+    if n < 2 {
+        n
+    } else {
+        fib(n - 1) + fib(n - 2)
+    }
+}
+
+let r = fib(10);
+println("fib(10) = " + to_str(r));
+r

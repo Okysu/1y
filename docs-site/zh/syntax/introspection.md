@@ -257,15 +257,18 @@ try {
 
 ## 自举路径
 
-这套能力是 1y 自举的根基。规划中的 5 阶段自举路径：
+这套能力曾是 1y 自举的根基，而自举现在**已全部完成**。5 阶段路径：
 
-1. ✅ **tree-walker in 1y**（`bootstrap/interp.1y`）——用 1y 子集实现 1y 子集的 tree-walker，证明自解释可行。
-2. ⏳ **parser in 1y** —— 手写递归下降 parser，输出 `Vec` / `Map` 形式的 AST（即 `ast_of` 的返回结构）。
-3. ⏳ **字节码编译器 in 1y** —— 把 AST 编译成 `Vec<Int>` 字节流。
-4. ⏳ **VM 解释循环 in 1y** —— `match` 分发操作码。
-5. ⏳ **替换 Rust VM** —— 用 1y 实现的 VM 跑所有现有测试。
+1. ✅ **tree-walker in 1y**（`bootstrap/interp.1y`）—— 用 1y 子集实现 1y 子集的 tree-walker，证明自解释可行。
+2. ✅ **parser in 1y**（`bootstrap/parser.1y`）—— 手写递归下降 parser，输出 `Vec` / `Map` 形式的 AST（即 `ast_of` 的返回结构）。
+3. ✅ **字节码编译器 in 1y**（`bootstrap/compiler.1y`）—— 把 AST 编译成 `Vec<Int>` 字节流。
+4. ✅ **VM 解释循环 in 1y**（`bootstrap/vm.1y`）—— `match` 分发操作码。
+5. ✅ **自托管端到端运行器**（`bootstrap/selfvm.1y`）—— `1y selfvm <file.1y>` 完整地用 1y 实现的组件完成 lex → parse → compile → VM 执行。
 
-阶段 1 已完成；阶段 2-5 待办。详见 [字节码虚拟机](../philosophy/bytecode-vm)。
+5 个阶段全部完成。用 `1y selfvm <file.1y>` 运行自托管工具链，用
+`1y selfvm bootstrap/test_parser.1y`、`1y selfvm bootstrap/test_compiler.1y`、
+`1y selfvm bootstrap/test_vm.1y` 跑自托管测试套件。详见
+[字节码虚拟机](../philosophy/bytecode-vm)。
 
 ## 参考
 

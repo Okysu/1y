@@ -88,6 +88,26 @@ fn two_args(args: &[Value], name: &str, span: Span) -> Result<(Value, Value), In
     Ok((args[0].clone(), args[1].clone()))
 }
 
+/// Returns true if `v` is a Map marked `__shared_cell__: true`.
+///
+/// The 1y self-hosted VM (bootstrap/vm.1y) represents SharedRef cells as
+/// `shared { "value": <inner>, "__shared_cell__": true, ... }`. When such a
+/// cell is passed to a native builtin (e.g. via `assoc(vm.globals, name, cell)`),
+/// it must NOT be auto-dereferenced — the cell itself is the value being
+/// stored, and stripping it would break write-through semantics.
+///
+/// Tree-walker-created SharedRefs (from `shared x = ...`) wrap `x` directly
+/// (without the `__shared_cell__` marker), so they are still auto-dereferenced
+/// as before.
+fn is_vm_shared_cell(v: &Value) -> bool {
+    match v {
+        Value::Map(m) => {
+            matches!(m.get(&Value::str("__shared_cell__")), Some(Value::Bool(true)))
+        }
+        _ => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Interpreter
 // ---------------------------------------------------------------------------
@@ -1944,11 +1964,32 @@ impl Interpreter {
                 // passed (because the call site passed a bare identifier
                 // bound to a shared cell), dereference it here so builtins
                 // like `push`, `count`, `get` etc. see the inner value.
+                //
+                // EXCEPTION: `assoc` and `push` must store SharedRef cells
+                // unchanged. The 1y self-hosted VM represents its SharedRef
+                // cells as `shared { "value": <inner>, "__shared_cell__": true }`
+                // and stores them in `vm.globals`/`vm.stack` via
+                // `assoc`/`push`. Auto-dereferencing here would strip the
+                // SharedRef, breaking write-through semantics. For these
+                // two builtins, skip auto-deref of any arg whose inner is
+                // a VM cell (Map marked `__shared_cell__: true`).
+                let preserve_vm_cells = nf.name == "assoc" || nf.name == "push";
                 let args: Vec<Value> = args
                     .into_iter()
-                    .map(|a| match &a {
-                        Value::Shared(sref) => sref.borrow().value.clone(),
-                        _ => a,
+                    .map(|a| {
+                        let is_vm_cell = match &a {
+                            Value::Shared(sref) => {
+                                preserve_vm_cells && is_vm_shared_cell(&sref.borrow().value)
+                            }
+                            _ => false,
+                        };
+                        if is_vm_cell {
+                            a
+                        } else if let Value::Shared(sref) = a {
+                            sref.borrow().value.clone()
+                        } else {
+                            a
+                        }
                     })
                     .collect();
                 // Higher-order builtins need to call user closures, which

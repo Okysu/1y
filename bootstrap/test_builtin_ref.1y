@@ -1,0 +1,5 @@
+// Test if builtins can be referenced as values
+let f = count;
+println(to_str(f));
+let v = [1, 2, 3];
+println(to_str(f(v)))

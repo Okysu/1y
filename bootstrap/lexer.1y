@@ -1,0 +1,478 @@
+// ============================================================
+// 1y self-hosting Stage 2 (a): lexer written in 1y.
+//
+// Produces a Vec<Token> where each token is a Map:
+//   { "kind": "Int", "value": 42 }
+//   { "kind": "Decimal", "value": "3.14" }     // raw text
+//   { "kind": "Str", "parts": [...] }           // parts: Literal/Expr
+//   { "kind": "Ident", "value": "x" }
+//   { "kind": "KW", "value": "let" }
+//   { "kind": "LParen" } ... { "kind": "Eof" }
+//
+// Matches src/lexer/* semantics closely enough for stage-2 parsing:
+//   - line `//` and nested block `/* ... */` comments
+//   - numeric separators `1_000_000`, decimals `3.14` / `1e10`
+//   - string interpolation `"...{expr}..."` (raw source captured)
+//   - all 40+ keywords and punctuators
+// ============================================================
+
+// ---------- character classes ----------
+
+fn cp(c) {
+    codepoint_at(c, 0)
+}
+
+fn is_space(c) {
+    c == " " or c == "\t" or c == "\n" or c == "\r"
+}
+
+fn is_digit(c) {
+    let k = cp(c);
+    k >= 48 and k <= 57
+}
+
+fn is_hex_digit(c) {
+    let k = cp(c);
+    (k >= 48 and k <= 57) or (k >= 97 and k <= 102) or (k >= 65 and k <= 70)
+}
+
+fn is_alpha(c) {
+    let k = cp(c);
+    (k >= 97 and k <= 122) or (k >= 65 and k <= 90)
+}
+
+fn is_ident_start(c) {
+    is_alpha(c) or c == "_"
+}
+
+fn is_ident_continue(c) {
+    is_alpha(c) or is_digit(c) or c == "_"
+}
+
+// ---------- keyword table ----------
+
+fn is_keyword(w) {
+    // Use a flat keyword table to avoid deep AST nesting from `or` chains
+    // (which previously caused stack overflow during compilation).
+    let table = ["let", "fn", "if", "else", "match", "while", "for", "in",
+                 "break", "continue", "loop", "enum", "type", "struct",
+                 "actor", "state", "on", "spawn", "reply", "yield", "await",
+                 "shared", "transact", "retry", "import", "lazy", "as",
+                 "raise", "try", "rescue", "ensure", "return", "true",
+                 "false", "nil", "and", "or", "not"];
+    let i = 0;
+    let n = count(table);
+    while i < n {
+        if table[i] == w { return true };
+        i = i + 1
+    };
+    false
+}
+
+// ---------- main lexer ----------
+
+// Lexer state: shared map with
+//   src, n (char count via `count`), i (cursor), out (tokens Vec), errors (Vec)
+//   Note: use `count(src)` not `byte_len(src)` — char_at indexes by char,
+//   not by byte, so multi-byte UTF-8 source (e.g. em-dash) would crash
+//   if n is the byte length.
+fn lex(src) {
+    let st = shared {
+        "src": src,
+        "n": count(src),
+        "i": 0,
+        "out": [],
+        "errors": []
+    };
+    loop {
+        skip_ws_and_comments(st);
+        if st.i >= st.n { break };
+        let c = char_at(st.src, st.i);
+        if is_digit(c) {
+            lex_number(st);
+        } else if c == "\"" {
+            lex_string(st);
+        } else if is_ident_start(c) {
+            lex_ident(st);
+        } else {
+            lex_punct(st);
+        }
+    };
+    st.out = push(st.out, { "kind": "Eof" });
+    st.out
+}
+
+fn lex_errors(st) {
+    st.errors
+}
+
+// ---------- whitespace / comments ----------
+
+fn skip_ws_and_comments(st) {
+    loop {
+        if st.i >= st.n { break };
+        let c = char_at(st.src, st.i);
+        if is_space(c) {
+            st.i = st.i + 1;
+        } else if c == "/" and st.i + 1 < st.n and char_at(st.src, st.i + 1) == "/" {
+            st.i = st.i + 2;
+            while st.i < st.n and char_at(st.src, st.i) != "\n" {
+                st.i = st.i + 1;
+            };
+        } else if c == "/" and st.i + 1 < st.n and char_at(st.src, st.i + 1) == "*" {
+            st.i = st.i + 2;
+            let depth = 1;
+            while st.i < st.n and depth > 0 {
+                let cur = char_at(st.src, st.i);
+                if cur == "/" and st.i + 1 < st.n and char_at(st.src, st.i + 1) == "*" {
+                    depth = depth + 1;
+                    st.i = st.i + 2;
+                } else if cur == "*" and st.i + 1 < st.n and char_at(st.src, st.i + 1) == "/" {
+                    depth = depth - 1;
+                    st.i = st.i + 2;
+                } else {
+                    st.i = st.i + 1;
+                }
+            };
+        } else {
+            break
+        }
+    }
+}
+
+// ---------- identifiers / keywords ----------
+
+fn lex_ident(st) {
+    let start = st.i;
+    while st.i < st.n and is_ident_continue(char_at(st.src, st.i)) {
+        st.i = st.i + 1;
+    };
+    let word = substring(st.src, start, st.i);
+    if word == "_" {
+        st.out = push(st.out, { "kind": "Underscore" });
+    } else if is_keyword(word) {
+        st.out = push(st.out, { "kind": "KW", "value": word });
+    } else {
+        st.out = push(st.out, { "kind": "Ident", "value": word });
+    }
+}
+
+// ---------- numbers ----------
+
+fn lex_number(st) {
+    let int_part = "";
+    while st.i < st.n {
+        let c = char_at(st.src, st.i);
+        if is_digit(c) {
+            int_part = int_part + c;
+            st.i = st.i + 1;
+        } else if c == "_" and st.i + 1 < st.n and is_digit(char_at(st.src, st.i + 1)) {
+            st.i = st.i + 1;
+        } else {
+            break
+        }
+    };
+
+    // decimal: digit '.' digit
+    if st.i + 1 < st.n and char_at(st.src, st.i) == "." and is_digit(char_at(st.src, st.i + 1)) {
+        st.i = st.i + 1;
+        let frac = "";
+        while st.i < st.n {
+            let c = char_at(st.src, st.i);
+            if is_digit(c) {
+                frac = frac + c;
+                st.i = st.i + 1;
+            } else if c == "_" and st.i + 1 < st.n and is_digit(char_at(st.src, st.i + 1)) {
+                st.i = st.i + 1;
+            } else {
+                break
+            }
+        };
+        let text = int_part + "." + frac;
+        let text2 = text + maybe_exponent(st);
+        st.out = push(st.out, { "kind": "Decimal", "value": text2 });
+        return
+    };
+
+    // integer with exponent -> Decimal
+    if st.i < st.n and (char_at(st.src, st.i) == "e" or char_at(st.src, st.i) == "E") {
+        let exp = maybe_exponent(st);
+        if exp != "" {
+            let text = int_part + exp;
+            st.out = push(st.out, { "kind": "Decimal", "value": text });
+            return
+        }
+    };
+
+    st.out = push(st.out, { "kind": "Int", "value": parse_int(int_part) });
+}
+
+fn maybe_exponent(st) {
+    let saved = st.i;
+    let buf = char_at(st.src, st.i);
+    st.i = st.i + 1;
+    if st.i < st.n {
+        let c = char_at(st.src, st.i);
+        if c == "+" or c == "-" {
+            buf = buf + c;
+            st.i = st.i + 1;
+        }
+    };
+    let digits = "";
+    while st.i < st.n and is_digit(char_at(st.src, st.i)) {
+        digits = digits + char_at(st.src, st.i);
+        st.i = st.i + 1;
+    };
+    if digits == "" {
+        st.i = saved;
+        return ""
+    };
+    buf + digits
+}
+
+fn parse_int(s) {
+    let result = 0;
+    let i = 0;
+    let n = len(s);
+    while i < n {
+        let c = char_at(s, i);
+        if c != "_" {
+            let d = codepoint_at(c, 0) - 48;
+            result = result * 10 + d;
+        };
+        i = i + 1;
+    };
+    result
+}
+
+// ---------- strings ----------
+
+fn lex_string(st) {
+    st.i = st.i + 1;
+    let parts = [];
+    let cur = "";
+    loop {
+        if st.i >= st.n {
+            st.errors = push(st.errors, "unterminated string literal");
+            break
+        };
+        let c = char_at(st.src, st.i);
+        if c == "\"" {
+            st.i = st.i + 1;
+            break
+        };
+        if c == "\\" {
+            st.i = st.i + 1;
+            if st.i >= st.n { break };
+            let e = char_at(st.src, st.i);
+            if e == "n" { cur = cur + "\n" }
+            else if e == "t" { cur = cur + "\t" }
+            else if e == "r" { cur = cur + "\r" }
+            else if e == "0" { cur = cur + "\0" }
+            else if e == "\\" { cur = cur + "\\" }
+            else if e == "\"" { cur = cur + "\"" }
+            else if e == "'" { cur = cur + "'" }
+            else if e == "\{" { cur = cur + "\{" }
+            else if e == "}" { cur = cur + "}" }
+            else if e == "u" {
+                st.i = st.i + 1;
+                if st.i < st.n and char_at(st.src, st.i) == "\{" {
+                    st.i = st.i + 1;
+                    let hex = "";
+                    while st.i < st.n and char_at(st.src, st.i) != "}" {
+                        hex = hex + char_at(st.src, st.i);
+                        st.i = st.i + 1;
+                    };
+                    if st.i < st.n { st.i = st.i + 1 };
+                    cur = cur + unicode_to_char(hex);
+                };
+                continue
+            } else {
+                cur = cur + e
+            };
+            st.i = st.i + 1;
+        } else if c == "\{" {
+            if cur != "" {
+                parts = push(parts, { "type": "Literal", "text": cur });
+                cur = "";
+            };
+            st.i = st.i + 1;
+            let raw = collect_interpolation(st);
+            parts = push(parts, { "type": "Expr", "raw": raw });
+        } else {
+            cur = cur + c;
+            st.i = st.i + 1;
+        }
+    };
+    if cur != "" {
+        parts = push(parts, { "type": "Literal", "text": cur });
+    };
+    if count(parts) == 0 {
+        parts = push(parts, { "type": "Literal", "text": "" });
+    };
+    st.out = push(st.out, { "kind": "Str", "parts": parts });
+}
+
+fn collect_interpolation(st) {
+    let depth = 1;
+    let raw = "";
+    while st.i < st.n {
+        let c = char_at(st.src, st.i);
+        if c == "\"" {
+            raw = raw + "\"";
+            st.i = st.i + 1;
+            while st.i < st.n {
+                let nc = char_at(st.src, st.i);
+                raw = raw + nc;
+                st.i = st.i + 1;
+                if nc == "\\" and st.i < st.n {
+                    raw = raw + char_at(st.src, st.i);
+                    st.i = st.i + 1;
+                } else if nc == "\"" {
+                    break
+                }
+            };
+        } else if c == "\{" {
+            depth = depth + 1;
+            raw = raw + "\{";
+            st.i = st.i + 1;
+        } else if c == "}" {
+            depth = depth - 1;
+            st.i = st.i + 1;
+            if depth == 0 { break };
+            raw = raw + "}";
+        } else {
+            raw = raw + c;
+            st.i = st.i + 1;
+        }
+    };
+    if depth != 0 {
+        st.errors = push(st.errors, "unterminated interpolation");
+    };
+    raw
+}
+
+fn unicode_to_char(hex) {
+    let n = len(hex);
+    let cp = 0;
+    let i = 0;
+    while i < n {
+        let c = char_at(hex, i);
+        let d = if is_digit(c) {
+            codepoint_at(c, 0) - 48
+        } else if is_hex_digit(c) {
+            let k = codepoint_at(c, 0);
+            if k >= 97 and k <= 102 { k - 87 } else { k - 55 }
+        } else {
+            0
+        };
+        cp = cp * 16 + d;
+        i = i + 1;
+    };
+    if cp >= 32 and cp < 127 {
+        chr_basic(cp)
+    } else {
+        "?"
+    }
+}
+
+fn chr_basic(cp) {
+    let table = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz\{|}~";
+    substring(table, cp - 32, cp - 31)
+}
+
+// ---------- punctuation ----------
+
+fn lex_punct(st) {
+    let c = char_at(st.src, st.i);
+    let n = st.n;
+    let i = st.i;
+    if i + 1 < n {
+        let two = c + char_at(st.src, i + 1);
+        let kind = two_char_kind(two);
+        if kind != "" {
+            st.out = push(st.out, { "kind": kind });
+            st.i = st.i + 2;
+            return
+        }
+    };
+    let kind = single_char_kind(c);
+    if kind != "" {
+        st.out = push(st.out, { "kind": kind });
+        st.i = st.i + 1;
+        return
+    };
+    st.errors = push(st.errors, "unexpected character: " + c);
+    st.i = st.i + 1
+}
+
+fn two_char_kind(two) {
+    if two == "::" { "DoubleColon" }
+    else if two == ".." { "DotDot" }
+    else if two == "->" { "Arrow" }
+    else if two == "=>" { "FatArrow" }
+    else if two == "|>" { "Pipe" }
+    else if two == "==" { "Eq" }
+    else if two == "!=" { "Neq" }
+    else if two == "<=" { "Lte" }
+    else if two == ">=" { "Gte" }
+    else if two == "+=" { "PlusAssign" }
+    else if two == "-=" { "MinusAssign" }
+    else if two == "*=" { "StarAssign" }
+    else if two == "/=" { "SlashAssign" }
+    else if two == "%=" { "PercentAssign" }
+    else if two == "&&" { "And" }
+    else if two == "||" { "Or" }
+    else if two == "#\{" { "HashBrace" }
+    else { "" }
+}
+
+fn single_char_kind(c) {
+    if c == "(" { "LParen" }
+    else if c == ")" { "RParen" }
+    else if c == "\{" { "LBrace" }
+    else if c == "}" { "RBrace" }
+    else if c == "[" { "LBracket" }
+    else if c == "]" { "RBracket" }
+    else if c == "," { "Comma" }
+    else if c == ":" { "Colon" }
+    else if c == ";" { "Semicolon" }
+    else if c == "." { "Dot" }
+    else if c == "!" { "Bang" }
+    else if c == "?" { "Question" }
+    else if c == "=" { "Assign" }
+    else if c == "<" { "Lt" }
+    else if c == ">" { "Gt" }
+    else if c == "+" { "Plus" }
+    else if c == "-" { "Minus" }
+    else if c == "*" { "Star" }
+    else if c == "/" { "Slash" }
+    else if c == "%" { "Percent" }
+    else if c == "|" { "Pipe2" }
+    else { "" }
+}
+
+// ---------- self-test ----------
+
+fn dump_tokens(toks) {
+    let i = 0;
+    let n = count(toks);
+    while i < n {
+        let t = toks[i];
+        let k = t.kind;
+        if k == "Int" {
+            println(k + " " + to_str(t.value))
+        } else if k == "Decimal" {
+            println(k + " " + t.value)
+        } else if k == "Str" {
+            println(k + " " + to_str(t.parts))
+        } else if k == "Ident" or k == "KW" {
+            println(k + " " + t.value)
+        } else {
+            println(k)
+        };
+        i = i + 1;
+    }
+}
+
+// self-test demo removed (import would execute it)

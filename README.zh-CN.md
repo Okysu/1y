@@ -4,11 +4,12 @@
 
 > 一门用 Rust 实现的流式、并发、函数式编程语言。
 
-`1y`（读作 "one-why"）拥有**两套执行后端**——树遍历解释器和基于栈的字节码
-虚拟机——融合了持久化数据结构、模式匹配、Actor 并发模型、软件事务内存
-（STM）、Zig 风格的无色异步以及实用的模块系统，全部由任意精度算术支撑。
-同时还内置**运行时反射**（`ast_of`、`eval`、类型谓词），为正在进行的自举
-工作奠定基础。
+`1y`（读作 "one-why"）拥有**两套执行后端**——基于栈的字节码虚拟机（默认）
+和树遍历解释器——融合了持久化数据结构、模式匹配、Actor 并发模型、软件
+事务内存（STM）、Zig 风格的无色异步以及实用的模块系统，全部由任意精度
+算术支撑。同时还内置**运行时反射**（`ast_of`、`eval`、类型谓词），并且
+**已完全自举**：字节码 VM、编译器、parser、lexer 均在 `bootstrap/` 下用
+1y 自身实现。
 
 ---
 
@@ -135,23 +136,41 @@ variant_name(v);             // "Bad"
 | `examples/phase4.5.1y` | 加密（SHA/HMAC/base64）、TLS 客户端、FFI 桩 |
 | `examples/phase4.6.1y` | 真实 FFI：加载共享库、调用原生函数 |
 | `examples/bench.1y` | 基准测试套件：fib、阶乘、循环、集合、JSON |
-| `bootstrap/interp.1y` | **自举阶段 1**：用 1y 写的 1y tree-walker |
-| `bootstrap/test_eval.1y` | `eval` / `ast_of` / 反射函数测试集 |
+| `bootstrap/lexer.1y` | **自举**：用 1y 写的 1y 词法分析器 |
+| `bootstrap/parser.1y` | **自举**：递归下降 parser → AST |
+| `bootstrap/compiler.1y` | **自举**：AST → 字节码编译器 |
+| `bootstrap/vm.1y` | **自举**：字节码 VM 解释循环 |
+| `bootstrap/selfvm.1y` | **自举**：端到端运行器（lex → parse → compile → VM） |
+| `bootstrap/test_parser.1y` | Parser 测试集（对比 1y 输出与 Rust `ast_of`） |
+| `bootstrap/test_compiler.1y` | 字节码编译器测试集 |
+| `bootstrap/test_vm.1y` | VM 测试集（算术、闭包、match/try 等） |
 
 ---
 
-## 自举路线图
+## 自举
 
-1y 的最终目标是托管自身的实现。反射内置函数（`ast_of`、`eval`、类型谓词）
-是这项工作的基础。规划中的 5 阶段路径：
+1y 已经托管自身的实现。反射内置函数（`ast_of`、`eval`、类型谓词）让这
+成为可能——1y 工具链现在用 1y 自身实现，位于 [`bootstrap/`](./bootstrap/)
+下。5 阶段路径**已全部完成**：
 
 1. **✅ tree-walker in 1y** — [`bootstrap/interp.1y`](./bootstrap/interp.1y)
-   用 1y 子集实现了 1y 子集的 tree-walker。阶段 1 已完成，能跑现有测试。
-2. **⏳ parser in 1y** — 手写递归下降 parser，输出 `Vec` / `Map` 形式的
-   AST（即 `ast_of` 的返回结构）。
-3. **⏳ 字节码编译器 in 1y** — 把 AST 编译成 `Vec<Int>` 字节流。
-4. **⏳ VM 解释循环 in 1y** — `match` 分发操作码。
-5. **⏳ 替换 Rust VM** — 用 1y 实现的 VM 跑所有现有测试。
+   用 1y 子集实现了 1y 子集的 tree-walker。
+2. **✅ parser in 1y** — [`bootstrap/parser.1y`](./bootstrap/parser.1y) 是
+   手写递归下降 parser，输出 `Vec` / `Map` 形式的 AST（即 `ast_of` 的返回结构）。
+3. **✅ 字节码编译器 in 1y** — [`bootstrap/compiler.1y`](./bootstrap/compiler.1y)
+   把 AST 编译成 `Vec<Int>` 字节流。
+4. **✅ VM 解释循环 in 1y** — [`bootstrap/vm.1y`](./bootstrap/vm.1y) 是
+   `match` 分发操作码的字节码 VM。
+5. **✅ 自托管 VM** — [`bootstrap/selfvm.1y`](./bootstrap/selfvm.1y) 串起
+   上述组件：`1y selfvm <file.1y>` 完整地用 1y 实现的组件完成 lex → parse →
+   compile → VM 执行。
+
+运行自托管 VM：
+
+```bash
+1y selfvm examples/phase1.1y     # 1y 运行 1y 实现的 VM
+1y selfvm bootstrap/test_vm.1y   # 自托管 VM 测试集
+```
 
 详见文档站 [反射与动态求值](https://okysu.github.io/1y/zh/syntax/introspection)。
 
@@ -217,7 +236,7 @@ npm run build          # 静态站点输出到 docs-site/.vitepress/dist
 │   └── lib.rs          # 库 API
 ├── tests/              # 集成测试（502 个测试）
 ├── examples/           # 示例程序
-├── bootstrap/          # 自举工作（阶段 1：interp.1y）
+├── bootstrap/          # 自举工具链（lexer/parser/compiler/vm 用 1y 实现）
 ├── editor/             # VSCode 扩展
 ├── docs-site/          # VitePress 文档
 ├── docs/               # 语言指南、标准库参考、架构文档

@@ -1,53 +1,73 @@
 # `1y` Architecture
 
-This document describes the internal architecture of the `1y` interpreter
-implementation as of Phase C (BEAM-style actor model + colorless async + yin).
+This document describes the internal architecture of the `1y` implementation
+as of Phase C (BEAM-style actor model + colorless async + yin) plus the
+completed bytecode VM and self-bootstrapping effort.
 
 ## Overview
 
-`1y` is a tree-walking interpreter. Source text flows through:
+`1y` has **two execution backends**. The default backend (`1y <file>`) is a
+stack-based bytecode VM; the legacy backend (`1y run <file>`) is a
+tree-walking interpreter kept for debugging and comparison. Both share the
+same lexer, parser, and standard library. Source text flows through:
 
 ```
 source string
     │
     ▼
-┌─────────┐     ┌──────────┐     ┌──────────────┐
-│  Lexer  │ ──▶ │  Parser  │ ──▶ │ Interpreter  │ ──▶ Value
-└─────────┘     └──────────┘     └──────────────┘
-   token.rs       mod.rs            mod.rs
+┌─────────┐     ┌──────────┐     ┌──────────────────┐
+│  Lexer  │ ──▶ │  Parser  │ ──▶ │   Compiler       │ ──▶ Chunk ──▶ VM   (default)
+└─────────┘     └──────────┘     │  (AST → bytecode) │
+   token.rs       mod.rs         └──────────────────┘
+                       │
+                       ▼
+                 ┌──────────────┐
+                 │ Interpreter  │ ──▶ Value          (1y run, legacy)
+                 └──────────────┘
+                    mod.rs
 ```
 
-There is no bytecode or JIT: the AST is walked directly. Persistent data
-structures (from the `im` crate) make functional updates cheap.
+The VM is the default because it moves call frames to the heap (`Vec<Frame>`),
+so deep recursion (e.g. `fib_memo(100000)`) no longer overflows the Rust
+stack. Persistent data structures (from the `im` crate) make functional
+updates cheap in both backends.
 
 ## Crate Layout
 
 ```
 src/
 ├── lib.rs              # Public API re-exports
-├── main.rs             # CLI entry point (`1y run`, `1y parse`, etc.)
+├── main.rs             # CLI entry point (`1y`, `1y run`, `1y selfvm`, `1y parse`, etc.)
 ├── error.rs            # SourceError, ErrorReport
 ├── printer.rs          # AST pretty-printer
 ├── ast/
 │   ├── mod.rs          # AST node definitions
-│   └── span.rs         # Source positions
+│   ├── span.rs         # Source positions
+│   └── to_value.rs     # AST → Value (the implementation of `ast_of`)
 ├── lexer/
 │   ├── mod.rs          # Tokenizer
 │   └── token.rs        # Token, TokenKind, Keyword
 ├── parser/
 │   └── mod.rs          # Recursive-descent parser
-├── runtime/            # Phase C: BEAM-style actor runtime
+├── compiler/
+│   └── mod.rs          # AST → bytecode Chunk compiler (default backend)
+├── vm/                 # Stack-based bytecode VM (default backend)
+│   ├── mod.rs          # Vm + VmCtx entry
+│   ├── vm.rs           # Dispatch loop, call frames, upvalues, signals
+│   ├── chunk.rs        # OpCode, Chunk, LineTable
+│   └── closure.rs      # Closure + Upvalue
+├── runtime/            # Phase C: BEAM-style actor runtime (shared by both backends)
 │   ├── mod.rs          # Module declarations
 │   ├── scheduler.rs    # Stackful-coroutine scheduler (colorless async)
 │   ├── registry.rs     # Global ActorPid → channel routing table
 │   └── worker.rs       # WorkerPool: N-thread shared job queue
-└── interpreter/
+└── interpreter/        # Legacy tree-walking backend (`1y run`)
     ├── mod.rs          # Evaluator + module system + actor runtime + STM
     ├── env.rs          # Environment (scope chain)
     ├── error.rs        # InterpreterError
     ├── ops.rs          # Value operations (arithmetic, collection ops)
-    ├── builtins.rs     # Global built-in functions
-    └── stdlib/         # Standard library modules
+    ├── builtins.rs     # Global built-in functions (shared with VM)
+    └── stdlib/         # Standard library modules (shared with VM)
         ├── mod.rs      # Module registry
         ├── env.rs      # Environment variables
         ├── io.rs       # File I/O
@@ -58,16 +78,40 @@ src/
         ├── socket.rs   # TCP networking (read_async, non-blocking I/O)
         ├── crypto.rs   # Hashing, HMAC, CSPRNG
         ├── tls.rs      # TLS client (rustls)
-        └── ffi.rs      # Dynamic library loading
+        ├── ffi.rs      # Dynamic library loading
+        ├── bytes.rs    # Byte buffer helpers
+        └── parallel.rs # Multi-threaded parallel call/spawn/map
 ```
 
-User-facing libraries live in `lib/`:
+User-facing libraries live in `lib/` (also mirrored under `examples/lib/`):
 
 ```
 lib/
 ├── http.1y             # Self-hosted HTTP/1.1 server (Actor + colorless async)
 └── yin.1y              # Gin-inspired web framework built on lib.http
 ```
+
+The `bootstrap/` directory contains the self-hosting implementation — a
+complete 1y toolchain (lexer, parser, bytecode compiler, VM) written in 1y
+itself, mirroring the Rust implementation in `src/`:
+
+```
+bootstrap/
+├── lexer.1y            # Hand-written tokenizer (mirrors src/lexer/)
+├── parser.1y           # Recursive-descent parser (mirrors src/parser/)
+├── compiler.1y         # Bytecode compiler (mirrors src/compiler/)
+├── vm.1y               # Bytecode VM interpreter (mirrors src/vm/)
+├── selfvm.1y           # End-to-end runner: lex → parse → compile → VM-execute
+├── test_parser.1y      # 88 parser tests (compares 1y output vs Rust ast_of)
+├── test_compiler.1y    # 76 bytecode compiler tests
+├── test_vm.1y          # 34 VM tests (arithmetic, closures, match/try, etc.)
+└── test_shared_selfvm.1y  # 8 SharedRef write-through tests
+```
+
+The self-hosting VM is accessible via `1y selfvm <file.1y>`. By default,
+`1y run <file.1y>` uses the Rust VM (faster). The 1y VM is a tree-walker
+executing bytecode, so it is slower than the Rust VM but proves the
+language can self-host.
 
 ## Key Types
 
@@ -332,20 +376,21 @@ Tests live in `tests/`:
 | File | Tests | Coverage |
 |------|-------|----------|
 | `lexer_test.rs` | 28 | Lexer |
-| `parser_test.rs` | 42 | Parser |
+| `parser_test.rs` | 49 | Parser |
 | `roundtrip_test.rs` | 6 | Parse→print→parse roundtrip |
-| `interpreter_test.rs` | 73 | Core evaluator + SendValue + C3 |
+| `interpreter_test.rs` | 77 | Core evaluator + SendValue + C3 |
 | `higher_order_test.rs` | 40 | map/filter/fold/etc. |
-| `loops_test.rs` | 31 | while/loop/break |
-| `math_test.rs` | 42 | min/max/floor/sqrt/etc. |
+| `loops_test.rs` | 42 | while/loop/break |
+| `math_test.rs` | 31 | min/max/floor/sqrt/etc. |
 | `string_test.rs` | 42 | len/split/join/etc. |
 | `actor_test.rs` | 26 | Actor runtime |
 | `transact_test.rs` | 24 | STM |
 | `module_test.rs` | 17 | Module system |
-| `stdlib_test.rs` | 49 | Standard library |
-| `http_test.rs` | 17 | lib/http.1y |
+| `stdlib_test.rs` | 73 | Standard library |
+| `http_test.rs` | 14 | lib/http.1y |
 | `yin_test.rs` | 19 | lib/yin.1y (routes, groups, middleware) |
 | `parallel_test.rs` | 7 | parallel module (multi-threading) |
+| `src/lib.rs` (unit tests) | 7 | Library internals |
 | **Total** | **502** | |
 
 Coverage is not yet measured by `cargo-tarpaulin` on all platforms (Windows
@@ -445,19 +490,52 @@ let results = parallel.map("heavy_compute", [[1000], [2000], [3000], [4000]]);
   EnumDef, Import). Side-effect statements (Let, Expr) are skipped, so workers
   don't re-run main-program logic.
 
-## Future: Bytecode VM
+## Bytecode VM
 
-The current tree-walking interpreter is the primary performance bottleneck.
-Each `1y` statement traverses the AST at runtime, incurring dispatch overhead
-per node. A bytecode VM would compile the AST to a flat instruction sequence
-once, then execute via a compact dispatch loop — typically 10-100x faster.
+The bytecode VM (default backend, `1y <file>`) addresses the tree-walker's
+performance and stack-overflow issues. The compiler walks the AST once per
+function and emits a `Chunk` (see [`src/compiler/mod.rs`](../src/compiler/mod.rs));
+the VM executes it in a dispatch loop in `VmCtx::step` (see
+[`src/vm/vm.rs`](../src/vm/vm.rs)).
 
-This is a long-term goal requiring:
-- Bytecode instruction set design (opcodes for each AST node type)
-- Compiler pass (AST → bytecode)
-- Stack-based VM execution loop
-- Integration with existing features (actors, STM, colorless async, modules)
+Key properties:
+- **Heap-allocated call frames** — `Vec<Frame>` instead of Rust recursion, so
+  `fib_memo(100000)` runs without stack growth.
+- **Flat dispatch loop** — opcodes are decoded in a tight `match`, with no
+  AST traversal at runtime.
+- **Instruction reuse** — compiled closures share their `Chunk`, so a
+  function defined once is cheap to call many times.
+- **Lua-style upvalues** — open upvalues point into stack slots; closed
+  upvalues move the value to the heap. Escaping upvalues are eagerly closed
+  on actor send.
+- **Unified signal handling** — `Break` / `Continue` / `Retry` /
+  `UserException` / `Reply` / `Return` all flow through
+  `handle_signal(err, frame_depth)`, with `frame_depth`-precise handler
+  matching on `ExceptionHandler` / `TransactHandler` / `LoopHandler` stacks.
+- **Feature parity with the tree-walker** — control flow, pattern matching,
+  closures, exceptions, STM, actors, colorless async, modules, reflection/
+  `eval`. See [Bytecode VM](../docs-site/en/philosophy/bytecode-vm.md) for
+  the full opcode table.
 
-The current architecture (AST nodes in `ast/mod.rs`, evaluator in
-`interpreter/mod.rs`) is structured to allow a bytecode compiler to be added
-as a separate pass without rewriting the type system or runtime.
+The legacy tree-walker (`1y run <file>`) is kept as a reference
+implementation for debugging and comparison.
+
+## Self-Bootstrapping
+
+1y is fully self-bootstrapping: the bytecode VM, compiler, parser, and
+lexer are themselves implemented in 1y under [`bootstrap/`](../bootstrap/).
+The 5-phase path is complete:
+
+1. ✅ tree-walker in 1y (`bootstrap/interp.1y`)
+2. ✅ parser in 1y (`bootstrap/parser.1y`)
+3. ✅ bytecode compiler in 1y (`bootstrap/compiler.1y`)
+4. ✅ VM interpreter loop in 1y (`bootstrap/vm.1y`)
+5. ✅ self-hosted end-to-end runner (`bootstrap/selfvm.1y` —
+   `1y selfvm <file.1y>` lexes, parses, compiles, and executes 1y source
+   using only 1y-implemented components)
+
+The 1y-implemented VM is itself a tree-walker over bytecode (it runs on the
+Rust tree-walker), so it is slower than the Rust VM — but it proves the
+language can self-host. Run the self-hosted test suites via
+`1y selfvm bootstrap/test_parser.1y`, `1y selfvm bootstrap/test_compiler.1y`,
+and `1y selfvm bootstrap/test_vm.1y`.

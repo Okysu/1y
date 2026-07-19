@@ -1,0 +1,177 @@
+// Test: compare 1y parser output against Rust ast_of builtin.
+
+import lexer;
+let lex = lexer.lex;
+import parser;
+let parse = parser.parse;
+
+// Deep equality check for two AST values.
+fn ast_eq(a, b) {
+    if is_map(a) and is_map(b) {
+        let ka = keys(a);
+        let kb = keys(b);
+        if count(ka) != count(kb) { return false };
+        let i = 0;
+        while i < count(ka) {
+            let k = ka[i];
+            if not has_key(b, k) { return false };
+            if not ast_eq(get(a, k), get(b, k)) { return false };
+            i = i + 1
+        };
+        return true
+    };
+    if is_vec(a) and is_vec(b) {
+        if count(a) != count(b) { return false };
+        let i = 0;
+        while i < count(a) {
+            if not ast_eq(a[i], b[i]) { return false };
+            i = i + 1
+        };
+        return true
+    };
+    a == b
+}
+
+// Compare and report.
+fn check(label, src) {
+    let rust_ast = ast_of(src);
+    let toks = lex(src);
+    let my_ast = parse(toks);
+    let ok = ast_eq(rust_ast, my_ast);
+    if ok {
+        println("PASS: " + label)
+    } else {
+        println("FAIL: " + label);
+        println("  src: " + src);
+        println("  rust: " + to_str(rust_ast));
+        println("  mine: " + to_str(my_ast))
+    }
+}
+
+// ---------- test cases ----------
+
+check("let with arith", "let x = 1 + 2 * 3;");
+check("let simple", "let x = 42;");
+check("let decimal", "let x = 3.14;");
+check("let string", "let x = \"hello\";");
+check("let bool", "let x = true;");
+check("let nil", "let x = nil;");
+check("ident ref", "x;");
+check("assignment", "x = 5;");
+check("binop chain", "let x = 1 + 2 - 3;");
+check("paren expr", "let x = (1 + 2) * 3;");
+check("call", "let x = f(1, 2);");
+check("field access", "let x = a.b.c;");
+check("method call", "let x = a.b(1, 2);");
+check("index", "let x = a[0];");
+check("vec lit", "let x = [1, 2, 3];");
+check("set lit", "let x = #\{1, 2, 3};");
+check("map lit", "let x = \{\"a\": 1};");
+check("empty map", "let x = \{\};");
+check("if expr", "let x = if c \{ 1 \} else \{ 2 \};");
+check("while", "while c \{ x \};");
+check("loop", "loop \{ x \};");
+check("fn def", "fn f(a, b) \{ a + b \};");
+check("block", "let x = \{ 1 \};");
+check("unary minus", "let x = -5;");
+check("not", "let x = not y;");
+check("pipe", "let x = a |> b;");
+check("lambda fn", "let f = fn(x) \{ x + 1 \};");
+check("lambda fn multi", "let f = fn(a, b) \{ a + b \};");
+check("string parts", "let x = \"a\{b}c\";");
+check("return", "return 42;");
+check("break", "break;");
+check("continue", "continue;");
+check("import", "import foo;");
+check("import as", "import foo as bar;");
+
+// comparison operators
+check("eq", "let x = 1 == 2;");
+check("neq", "let x = 1 != 2;");
+check("lt", "let x = 1 < 2;");
+check("gt", "let x = 1 > 2;");
+check("lte", "let x = 1 <= 2;");
+check("gte", "let x = 1 >= 2;");
+
+// logical operators
+check("and", "let x = a and b;");
+check("or", "let x = a or b;");
+
+// compound assignment
+check("plus assign", "x += 1;");
+check("minus assign", "x -= 1;");
+check("star assign", "x *= 2;");
+check("slash assign", "x /= 2;");
+check("percent assign", "x %= 3;");
+
+// type annotation on let (consumed, not emitted)
+check("let annot", "let x: Int = 5;");
+
+// shared decl
+check("shared decl", "shared counter = 0;");
+check("shared annot", "shared counter: Int = 0;");
+
+// type def
+check("type def", "type Point = \{ x: Int, y: Int \};");
+check("type def generic", "type Box<T> = \{ value: T \};");
+
+// for loop
+check("for", "for x in items \{ x \};");
+
+// actor send / request
+check("actor send", "c ! msg;");
+check("actor request", "c ? msg;");
+
+// method call with no args
+check("method no args", "a.b();");
+
+// multi-entry map
+check("map multi", "let x = \{\"a\": 1, \"b\": 2, \"c\": 3};");
+
+// nested calls
+check("nested calls", "let x = f(g(h(1)));");
+
+// multi-stmt block with tail
+check("block stmts tail", "let x = \{ 1; 2; 3 \};");
+check("block semi only", "let x = \{ 1; 2; \};");
+
+// nested if/else
+check("if else if", "let x = if a \{ 1 \} else if b \{ 2 \} else \{ 3 \};");
+
+// complex precedence
+check("precedence", "let x = 1 + 2 * 3 - 4 / 2 % 3;");
+check("paren precedence", "let x = (1 + 2) * (3 - 4);");
+
+// chained method/field
+check("chain", "let x = a.b.c.d.e;");
+check("chain mix", "let x = a.b(1).c[2].d;");
+
+// edge cases
+check("empty fn body", "fn f() \{\};");
+check("nested blocks", "let x = \{ \{ 1 \} \};");
+check("negative decimal", "let x = -3.14;");
+check("multi top level", "let a = 1; let b = 2; a + b");
+check("decimal exponent", "let x = 1.5e3;");
+check("assign to field", "a.b = 1;");
+check("assign to index", "a[0] = 1;");
+check("empty vec", "let x = [];");
+check("empty set", "let x = #\{\};");
+check("lambda no params", "let f = fn() \{ 1 \};");
+check("lambda in call", "let x = map(items, fn(x) \{ x + 1 \});");
+check("deeply nested", "let x = ((((1))));");
+check("string empty", "let x = \"\";");
+check("if no else", "let x = if c \{ 1 \};");
+
+// --- actor / transact / async syntax ---
+check("shared expr", "let x = shared 0;");
+check("transact expr", "let x = transact \{ 1 + 2 \};");
+check("retry", "retry;");
+check("yield", "yield;");
+check("await", "let x = await foo;");
+check("reply", "reply 42;");
+check("spawn expr", "let c = spawn Counter(0);");
+check("actor def", "actor Counter \{ state n = 0; on inc() \{ n + 1 \} \};");
+check("actor with fn", "actor Foo \{ state n = 0; fn get() \{ n \} \};");
+
+println("");
+println("--- done ---");

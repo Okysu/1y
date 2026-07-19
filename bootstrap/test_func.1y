@@ -1,0 +1,24 @@
+// Test strings, vec, map, closures
+let s = "hello" + " " + "world";
+let v = [1, 2, 3, 4, 5];
+let sum = 0;
+let i = 0;
+while i < count(v) {
+    sum = sum + v[i];
+    i = i + 1
+};
+
+fn make_adder(n) {
+    fn(x) { x + n }
+}
+
+let add5 = make_adder(5);
+let r = add5(10);
+
+// Return a map of results
+let result = {
+    "str": s,
+    "sum": sum,
+    "closure": r
+};
+result

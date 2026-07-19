@@ -1,0 +1,1578 @@
+// ============================================================
+// 1y self-hosting Stage 4: VM interpreter loop written in 1y.
+//
+// Consumes a Chunk (from compiler.1y) and executes its bytecode.
+// Mirrors the structure of src/vm/vm.rs:
+//   - stack: Vec<Value>  (operand stack + locals, unified)
+//   - frames: Vec<Frame> (call frames; last = current)
+//   - loop_handlers: Vec<LoopHandler> (for break/continue)
+//   - globals: Map<name, Value>
+//
+// Each Frame = { "closure": {chunk, upvalues}, "ip": Int, "stack_base": Int }
+//
+// Signal handling: step() returns a status map:
+//   { "status": "ok" }                      — opcode executed, continue
+//   { "status": "return", "value": v }      — OP_RETURN_SIGNAL
+//   { "status": "break", "value": v }       — OP_BREAK
+//   { "status": "continue" }                — OP_CONTINUE
+//   { "status": "error", "msg": "..." }     — runtime error
+//
+// Supported opcodes (phase 4 minimal):
+//   NIL, TRUE, FALSE, CONST, LOAD_LOCAL, STORE_LOCAL, LOAD_GLOBAL,
+//   DEFINE_GLOBAL, POP, POP_N, POP_LOCAL_KEEP, DUP, ADD, SUB, MUL,
+//   DIV, MOD, NEG, NOT, EQ, NEQ, LT, GT, LTE, GTE, JUMP, JUMP_IF_FALSE,
+//   JUMP_IF_TRUE, LOOP, PUSH_LOOP, POP_LOOP, CLOSURE, CALL, RETURN,
+//   RETURN_SIGNAL, BREAK, CONTINUE
+// ============================================================
+
+import lexer;
+import parser;
+import compiler;
+
+let lex = lexer.lex;
+let parse = parser.parse;
+let compile_program = compiler.compile_program;
+
+// ---------- OpCode constants (mirror compiler.1y) ----------
+
+let OP_NIL = 0;
+let OP_TRUE = 1;
+let OP_FALSE = 2;
+let OP_CONST = 3;
+let OP_LOAD_LOCAL = 4;
+let OP_STORE_LOCAL = 5;
+let OP_LOAD_UPVALUE = 6;
+let OP_STORE_UPVALUE = 7;
+let OP_LOAD_GLOBAL = 8;
+let OP_STORE_GLOBAL = 9;
+let OP_DEFINE_GLOBAL = 10;
+let OP_LOAD_LOCAL_REF = 11;
+let OP_LOAD_UPVALUE_REF = 12;
+let OP_LOAD_GLOBAL_REF = 13;
+let OP_POP = 14;
+let OP_POP_N = 15;
+let OP_POP_LOCAL_KEEP = 16;
+let OP_DUP = 17;
+let OP_NEW_VEC = 18;
+let OP_NEW_MAP = 19;
+let OP_NEW_SET = 20;
+let OP_ADD = 21;
+let OP_SUB = 22;
+let OP_MUL = 23;
+let OP_DIV = 24;
+let OP_MOD = 25;
+let OP_NEG = 26;
+let OP_NOT = 27;
+let OP_EQ = 28;
+let OP_NEQ = 29;
+let OP_LT = 30;
+let OP_GT = 31;
+let OP_LTE = 32;
+let OP_GTE = 33;
+let OP_JUMP = 34;
+let OP_JUMP_IF_FALSE = 35;
+let OP_JUMP_IF_TRUE = 36;
+let OP_LOOP = 37;
+let OP_CLOSURE = 38;
+let OP_CALL = 39;
+let OP_METHOD_CALL = 40;
+let OP_RETURN = 43;
+let OP_ASSIGN_LOCAL = 44;
+let OP_ASSIGN_UPVALUE = 45;
+let OP_ASSIGN_GLOBAL = 46;
+let OP_INDEX = 47;
+let OP_INDEX_ASSIGN = 48;
+let OP_FIELD = 49;
+let OP_FIELD_ASSIGN = 50;
+let OP_RETURN_SIGNAL = 54;
+let OP_BREAK = 52;
+let OP_CONTINUE = 53;
+let OP_SHARED_EXPR = 62;
+let OP_PUSH_LOOP = 76;
+let OP_POP_LOOP = 77;
+let OP_SWAP = 74;
+let OP_ROT3 = 75;
+let OP_MATCH = 51;
+let OP_RAISE = 56;
+let OP_PUSH_TRY = 57;
+let OP_POP_TRY = 58;
+let OP_RESCUE_MATCH = 59;
+let OP_ENSURE_EXIT = 60;
+let OP_CLEAR_PENDING = 61;
+let OP_CONSTRUCT_VARIANT = 41;
+let OP_CONSTRUCT_STRUCT = 42;
+let OP_IMPORT = 73;
+
+// ---------- Vec helpers (1y has no pop/truncate builtins) ----------
+
+// Return a new Vec equal to `v` without its last element.
+fn pop_last(v) {
+    let n = count(v);
+    let out = [];
+    let i = 0;
+    while i < n - 1 {
+        out = push(out, v[i]);
+        i = i + 1
+    };
+    out
+}
+
+// Return a new Vec with only the first `new_len` elements.
+fn truncate_vec(v, new_len) {
+    let out = [];
+    let i = 0;
+    while i < new_len {
+        out = push(out, v[i]);
+        i = i + 1
+    };
+    out
+}
+
+// ---------- VM state ----------
+
+fn register_builtins(vm) {
+    vm.globals = assoc(vm.globals, "count", count);
+    vm.globals = assoc(vm.globals, "push", push);
+    vm.globals = assoc(vm.globals, "assoc", assoc);
+    vm.globals = assoc(vm.globals, "get", get);
+    vm.globals = assoc(vm.globals, "has_key", has_key);
+    vm.globals = assoc(vm.globals, "to_str", to_str);
+    vm.globals = assoc(vm.globals, "is_map", is_map);
+    vm.globals = assoc(vm.globals, "is_func", is_func);
+    vm.globals = assoc(vm.globals, "is_set", is_set);
+    vm.globals = assoc(vm.globals, "set", set);
+    vm.globals = assoc(vm.globals, "println", println);
+    vm.globals = assoc(vm.globals, "print", print);
+    vm.globals = assoc(vm.globals, "now_ms", now_ms);
+    vm.globals = assoc(vm.globals, "now_ns", now_ns)
+}
+
+// Note: new_vm returns the SharedRef directly via `shared { ... }`.
+// Do NOT use `let vm = shared {...}; vm` — returning a bare Ident
+// bound to a SharedRef auto-derefs it (Expr::Ident read semantics),
+// causing the caller to receive the inner Map (passed by value)
+// instead of the SharedRef (passed by reference). That breaks
+// write-through in vm_push et al.
+fn new_vm() {
+    shared {
+        "stack": [],
+        "frames": [],
+        "globals": shared {
+            "count": count,
+            "push": push,
+            "assoc": assoc,
+            "get": get,
+            "has_key": has_key,
+            "to_str": to_str,
+            "is_map": is_map,
+            "is_func": is_func,
+            "is_set": is_set,
+            "set": set,
+            "println": println,
+            "print": print,
+            "now_ms": now_ms,
+            "now_ns": now_ns
+        },
+        "loop_handlers": [],
+        "exception_handlers": [],
+        "pending_exception": nil,
+        "has_pending_exception": false,
+        "open_upvalues": [],
+        "upvalues": {},
+        "next_upvalue_id": 0,
+        "module_loader": nil,
+        "modules_cache": {}
+    }
+}
+
+// ---------- Frame helpers ----------
+// Frame = { "closure": closure, "ip_box": shared{val}, "stack_base": Int }
+// ip is wrapped in a shared box because 1y SharedRef doesn't support
+// write-through for Int fields directly (only for nested shared maps).
+
+fn new_frame(closure, ip, stack_base) {
+    shared {
+        "closure": closure,
+        "ip_box": shared { "val": ip },
+        "stack_base": stack_base
+    }
+}
+
+fn vm_cur_frame(vm) {
+    let n = count(vm.frames);
+    vm.frames[n - 1]
+}
+
+fn vm_cur_closure(vm) {
+    vm_cur_frame(vm).closure
+}
+
+fn vm_cur_chunk(vm) {
+    vm_cur_closure(vm).chunk
+}
+
+fn get_ip(vm) {
+    vm_cur_frame(vm).ip_box.val
+}
+
+fn set_ip(vm, val) {
+    let box = vm_cur_frame(vm).ip_box;
+    box.val = val
+}
+
+// ---------- Stack helpers ----------
+
+fn vm_push(vm, v) {
+    vm.stack = push(vm.stack, v)
+}
+
+fn vm_pop(vm) {
+    let n = count(vm.stack);
+    // Hold the value in a 1-element Vec and return via Index expression.
+    // Returning `v` (bare ident) would auto-deref Value::Shared cells,
+    // stripping the SharedRef — breaking write-through for OP_DEFINE_GLOBAL
+    // and OP_STORE_LOCAL when the value is a shared cell.
+    let holder = [vm.stack[n - 1]];
+    vm.stack = pop_last(vm.stack);
+    holder[0]
+}
+
+fn vm_peek(vm) {
+    let n = count(vm.stack);
+    vm.stack[n - 1]
+}
+
+fn vm_truncate(vm, new_len) {
+    vm.stack = truncate_vec(vm.stack, new_len)
+}
+
+// Set stack[idx] = v, extending with nil if idx is beyond current length.
+// (Mirrors Rust VM's set_local: slots may not be pre-allocated.)
+fn vm_stack_set(vm, idx, v) {
+    let n = count(vm.stack);
+    if idx < n {
+        vm.stack = assoc(vm.stack, idx, v)
+    } else {
+        // Extend with nil up to idx, then push v.
+        let i = n;
+        let stack = vm.stack;
+        while i < idx {
+            stack = push(stack, nil);
+            i = i + 1
+        };
+        stack = push(stack, v);
+        vm.stack = stack
+    }
+}
+
+// ---------- Bytecode reader ----------
+// NOTE: fetch_u8/fetch_u16 take `chunk` and `ip_box` directly (not `vm`)
+// to avoid repeated Map lookups via vm_cur_chunk/vm_cur_frame on every
+// operand fetch. Step caches these once per opcode.
+
+fn fetch_u8(chunk, ip_box) {
+    let ip_val = ip_box.val;
+    let v = chunk.code[ip_val];
+    ip_box.val = ip_val + 1;
+    v
+}
+
+fn fetch_u16(chunk, ip_box) {
+    let lo = fetch_u8(chunk, ip_box);
+    let hi = fetch_u8(chunk, ip_box);
+    lo + hi * 256
+}
+
+// ---------- SharedRef helpers ----------
+// A SharedRef cell is represented as a shared map with field
+// "__shared_cell__": true and "value": <inner value>.
+// OP_LOAD_LOCAL/UPVALUE/GLOBAL auto-deref such cells (return .value);
+// OP_ASSIGN_LOCAL/UPVALUE/GLOBAL write-through (set .value) if the
+// current slot holds a shared cell. OP_LOAD_*_REF return the cell
+// itself (no deref) so callees can write-through.
+
+fn is_shared_cell(v) {
+    if not is_map(v) { return false };
+    if not has_key(v, "__shared_cell__") { return false };
+    v.__shared_cell__ == true
+}
+
+fn vm_deref(v) {
+    let is_cell = is_shared_cell(v);
+    if is_cell {
+        get(v, "value")
+    } else {
+        v
+    }
+}
+
+// ---------- Truthiness ----------
+
+fn is_truthy(v) {
+    if v == nil { false }
+    else if v == false { false }
+    else { true }
+}
+
+// ---------- Upvalues ----------
+// Upvalue state is stored in a flat map `vm.upvalues` to bypass 1y's
+// NativeFn SharedRef auto-deref (which would break sharing if we stored
+// shared maps inside Vecs). Each upvalue has an integer ID; its state
+// lives at fields `<id>_is_open`, `<id>_stack_idx`, `<id>_value`.
+// Closures and `open_upvalues` store Vec<Int> of IDs, not shared refs.
+// Writes go through `vm.upvalues = assoc(vm.upvalues, key, val)` which
+// re-binds the `upvalues` field of the shared `vm` map (write-through).
+
+fn alloc_upvalue(uvm, is_open, stack_idx, value) {
+    let id = uvm.next_upvalue_id;
+    uvm.next_upvalue_id = id + 1;
+    let id_str = to_str(id);
+    uvm.upvalues = assoc(uvm.upvalues, id_str + "_is_open", is_open);
+    uvm.upvalues = assoc(uvm.upvalues, id_str + "_stack_idx", stack_idx);
+    uvm.upvalues = assoc(uvm.upvalues, id_str + "_value", value);
+    id
+}
+
+// Read an upvalue's current value by ID.
+fn upvalue_read(uvm, id) {
+    let id_str = to_str(id);
+    let is_open = uvm.upvalues[id_str + "_is_open"];
+    if is_open {
+        let stack_idx = uvm.upvalues[id_str + "_stack_idx"];
+        uvm.stack[stack_idx]
+    } else {
+        uvm.upvalues[id_str + "_value"]
+    }
+}
+
+// Write to an upvalue by ID.
+fn upvalue_write(uvm, id, v) {
+    let id_str = to_str(id);
+    let is_open = uvm.upvalues[id_str + "_is_open"];
+    if is_open {
+        let stack_idx = uvm.upvalues[id_str + "_stack_idx"];
+        vm_stack_set(uvm, stack_idx, v)
+    } else {
+        uvm.upvalues = assoc(uvm.upvalues, id_str + "_value", v)
+    }
+}
+
+// Close all open upvalues with stack_idx >= floor.
+// "Closing" means: copy the current stack value into the value field,
+// set is_open=false. IDs remain in open_upvalues (cheap, and matches
+// the fact that closed upvalues are still referenced by closures).
+fn close_upvalues_above(uvm, floor) {
+    let handlers = uvm.open_upvalues;
+    let n = count(handlers);
+    let i = 0;
+    while i < n {
+        let id = handlers[i];
+        let id_str = to_str(id);
+        let is_open = uvm.upvalues[id_str + "_is_open"];
+        if is_open {
+            let stack_idx = uvm.upvalues[id_str + "_stack_idx"];
+            if stack_idx >= floor {
+                let v = uvm.stack[stack_idx];
+                uvm.upvalues = assoc(uvm.upvalues, id_str + "_value", v);
+                uvm.upvalues = assoc(uvm.upvalues, id_str + "_is_open", false)
+            }
+        };
+        i = i + 1
+    }
+}
+
+// ---------- Return from frame ----------
+
+fn return_from_frame(vm, ret) {
+    let f = vm_cur_frame(vm);
+    let base = f.stack_base;
+    // Close open upvalues pointing into this frame's stack region.
+    close_upvalues_above(vm, base);
+    // Drop loop handlers belonging to this frame (frame_depth > caller_depth).
+    let caller_depth = count(vm.frames) - 1;
+    let handlers = vm.loop_handlers;
+    let n = count(handlers);
+    let kept = [];
+    let i = 0;
+    while i < n {
+        if handlers[i].frame_depth <= caller_depth {
+            kept = push(kept, handlers[i])
+        };
+        i = i + 1
+    };
+    vm.loop_handlers = kept;
+    // Drop exception handlers belonging to this frame.
+    let ehandlers = vm.exception_handlers;
+    let en = count(ehandlers);
+    let ekept = [];
+    let ei = 0;
+    while ei < en {
+        if ehandlers[ei].frame_depth <= caller_depth {
+            ekept = push(ekept, ehandlers[ei])
+        };
+        ei = ei + 1
+    };
+    vm.exception_handlers = ekept;
+    vm.frames = pop_last(vm.frames);
+    // truncate stack to base, then push return value
+    vm_truncate(vm, base);
+    vm_push(vm, ret)
+}
+
+// ---------- Signal handling ----------
+
+// Handle break: find loop handler for current frame, jump to break_addr.
+// Returns true if handled, false if no matching handler (error).
+fn handle_break(vm, value) {
+    let cur_depth = count(vm.frames);
+    let handlers = vm.loop_handlers;
+    let n = count(handlers);
+    // find last handler with frame_depth == cur_depth
+    let idx = -1;
+    let i = n - 1;
+    while i >= 0 {
+        if handlers[i].frame_depth == cur_depth {
+            idx = i;
+            break
+        };
+        i = i - 1
+    };
+    if idx < 0 {
+        return { "status": "error", "msg": "break outside of loop" }
+    };
+    let h = handlers[idx];
+    // truncate stack to handler's stack_depth
+    vm_truncate(vm, h.stack_depth);
+    vm_push(vm, value);
+    // jump to break_addr
+    set_ip(vm, h.break_addr);
+    // pop the handler (break exits the loop)
+    vm.loop_handlers = pop_last(vm.loop_handlers);
+    nil
+}
+
+// Handle continue: find loop handler, jump to continue_addr.
+fn handle_continue(vm) {
+    let cur_depth = count(vm.frames);
+    let handlers = vm.loop_handlers;
+    let n = count(handlers);
+    let idx = -1;
+    let i = n - 1;
+    while i >= 0 {
+        if handlers[i].frame_depth == cur_depth {
+            idx = i;
+            break
+        };
+        i = i - 1
+    };
+    if idx < 0 {
+        return { "status": "error", "msg": "continue outside of loop" }
+    };
+    let h = handlers[idx];
+    vm_truncate(vm, h.stack_depth);
+    set_ip(vm, h.continue_addr);
+    nil
+}
+
+// ---------- Pattern matching ----------
+// Pattern AST (from parser.1y):
+//   { "type": "Wildcard" }
+//   { "type": "Bind", "name": <str> }
+//   { "type": "Lit", "lit_type": "Int"|"Decimal"|"Bool"|"Nil"|"Str", "value": <v>, "parts": [...] }
+//   { "type": "Variant", "name": <str>, "args": [pat, ...] }
+//   { "type": "Struct", "fields": [{ "name": <str>, "pattern": pat }, ...], "rest": bool }
+//   { "type": "Vec", "pats": [pat, ...], "rest": bool }
+//   { "type": "Or", "pats": [pat, ...] }
+//   { "type": "Guard", "pattern": pat, "guard": expr }
+//
+// match_rec returns nil if no match, or a Vec of bindings if matched.
+// (Avoids SharedRef write-through issues by using return values.)
+
+// Append `sub` (Vec) to `acc` (Vec), returning a new Vec.
+fn vec_append(acc, sub) {
+    let out = acc;
+    let i = 0;
+    let n = count(sub);
+    while i < n {
+        out = push(out, sub[i]);
+        i = i + 1
+    };
+    out
+}
+
+fn match_rec(pat, value) {
+    let t = get(pat, "type");
+    if t == "Wildcard" { return [] };
+    if t == "Bind" { return [value] };
+    if t == "Lit" {
+        let lt = get(pat, "lit_type");
+        if lt == "Nil" {
+            if value == nil { return [] } else { return nil }
+        };
+        if lt == "Bool" {
+            if value == get(pat, "value") { return [] } else { return nil }
+        };
+        if lt == "Int" {
+            if value == get(pat, "value") { return [] } else { return nil }
+        };
+        if lt == "Decimal" {
+            if value == get(pat, "value") { return [] } else { return nil }
+        };
+        if lt == "Str" {
+            let parts = get(pat, "parts");
+            let s = "";
+            let i = 0;
+            let n = count(parts);
+            while i < n {
+                let p = parts[i];
+                if has_key(p, "text") {
+                    s = s + get(p, "text")
+                } else {
+                    return nil
+                };
+                i = i + 1
+            };
+            if value == s { return [] } else { return nil }
+        };
+        return nil
+    };
+    if t == "Vec" {
+        if is_map(value) { return nil };
+        let pats = get(pat, "pats");
+        let rest = get(pat, "rest");
+        let np = count(pats);
+        let nv = count(value);
+        if rest {
+            if nv < np { return nil }
+        } else {
+            if nv != np { return nil }
+        };
+        let all = [];
+        let i = 0;
+        while i < np {
+            let sub = match_rec(pats[i], value[i]);
+            if sub == nil { return nil };
+            all = vec_append(all, sub);
+            i = i + 1
+        };
+        return all
+    };
+    if t == "Or" {
+        let pats = get(pat, "pats");
+        let n = count(pats);
+        let i = 0;
+        while i < n {
+            let sub = match_rec(pats[i], value);
+            if sub != nil { return sub };
+            i = i + 1
+        };
+        return nil
+    };
+    if t == "Variant" {
+        if not is_map(value) { return nil };
+        if not has_key(value, "__variant__") { return nil };
+        if value.__variant__ != get(pat, "name") { return nil };
+        let pats = get(pat, "args");
+        let vargs = get(value, "args");
+        let np = count(pats);
+        let nv = count(vargs);
+        if np != nv { return nil };
+        let all = [];
+        let i = 0;
+        while i < np {
+            let sub = match_rec(pats[i], vargs[i]);
+            if sub == nil { return nil };
+            all = vec_append(all, sub);
+            i = i + 1
+        };
+        return all
+    };
+    if t == "Struct" {
+        if not is_map(value) { return nil };
+        let fields = get(pat, "fields");
+        let nf = count(fields);
+        let all = [];
+        let i = 0;
+        while i < nf {
+            let fpat = fields[i];
+            let fname = get(fpat, "name");
+            if not has_key(value, fname) { return nil };
+            let sub = match_rec(get(fpat, "pattern"), get(value, fname));
+            if sub == nil { return nil };
+            all = vec_append(all, sub);
+            i = i + 1
+        };
+        return all
+    };
+    if t == "Guard" {
+        return nil
+    };
+    nil
+}
+
+// Top-level pattern match: returns { "matched": bool, "bindings": Vec }
+fn vm_match(pat, value) {
+    let r = match_rec(pat, value);
+    if r != nil {
+        { "matched": true, "bindings": r }
+    } else {
+        { "matched": false, "bindings": [] }
+    }
+}
+
+// ---------- Exception handling ----------
+
+// Handle a raised exception: find nearest handler, unwinding frames as needed.
+// Returns:
+//   { "status": "ok" } — handler found, jumped to rescue/ensure pc
+//   { "status": "uncaught", "value": v } — no handler anywhere
+// Mirrors src/vm/vm.rs handle_signal UserException branch.
+fn handle_exception(vm, value) {
+    let exc_val = value;
+    loop {
+        let cur_depth = count(vm.frames);
+        let handlers = vm.exception_handlers;
+        let n = count(handlers);
+        // find last handler with frame_depth == cur_depth
+        let idx = -1;
+        let i = n - 1;
+        while i >= 0 {
+            if handlers[i].frame_depth == cur_depth {
+                idx = i;
+                break
+            };
+            i = i - 1
+        };
+        if idx >= 0 {
+            let h = handlers[idx];
+            // Truncate handler stack: keep 0..idx (drop idx and above).
+            let kept = [];
+            let j = 0;
+            while j < idx {
+                kept = push(kept, handlers[j]);
+                j = j + 1
+            };
+            vm.exception_handlers = kept;
+            // Set pending exception.
+            vm.pending_exception = exc_val;
+            vm.has_pending_exception = true;
+            // Truncate stack to handler's stack_depth, push exception value.
+            vm_truncate(vm, h.stack_depth);
+            vm_push(vm, exc_val);
+            // Jump to rescue_pc if present, else ensure_pc, else re-raise.
+            let rescue_pc = get(h, "rescue_pc");
+            let ensure_pc = get(h, "ensure_pc");
+            if rescue_pc != nil {
+                set_ip(vm, rescue_pc);
+                return nil
+            };
+            if ensure_pc != nil {
+                set_ip(vm, ensure_pc);
+                return nil
+            };
+            // Neither rescue nor ensure: clear pending and re-raise
+            // (loop to find next handler in current frame).
+            vm.has_pending_exception = false;
+            vm.pending_exception = nil;
+            // Continue loop with same exc_val.
+        } else {
+            // No handler in current frame — propagate to caller.
+            if cur_depth > 1 {
+                let frame = vm_cur_frame(vm);
+                let base = frame.stack_base;
+                close_upvalues_above(vm, base);
+                vm.frames = pop_last(vm.frames);
+                vm_truncate(vm, base);
+                // Continue loop to look for handler in caller frame.
+            } else {
+                // Top-level uncaught.
+                return { "status": "uncaught", "value": exc_val }
+            }
+        }
+    }
+}
+
+// ---------- Step: dispatch one opcode ----------
+
+fn step(vm) {
+    // Cache frame/chunk/ip_box once per opcode to avoid repeated
+    // vm_cur_frame/vm_cur_chunk/vm_cur_closure Map lookups (each is 3+
+    // SharedRef field accesses, and each field access clones the vm Map).
+    let frame = vm_cur_frame(vm);
+    let chunk = frame.closure.chunk;
+    let ip_box = frame.ip_box;
+    let ip_val = ip_box.val;
+    let op = chunk.code[ip_val];
+    ip_box.val = ip_val + 1;
+
+    // --- literals ---
+    if op == OP_NIL {
+        vm.stack = push(vm.stack, nil);
+        return nil
+    };
+    if op == OP_TRUE {
+        vm.stack = push(vm.stack, true);
+        return nil
+    };
+    if op == OP_FALSE {
+        vm.stack = push(vm.stack, false);
+        return nil
+    };
+
+    // --- constants ---
+    if op == OP_CONST {
+        let idx = fetch_u8(chunk, ip_box);
+        vm.stack = push(vm.stack, chunk.consts[idx]);
+        return nil
+    };
+
+    // --- locals ---
+    if op == OP_LOAD_LOCAL {
+        let slot = fetch_u8(chunk, ip_box);
+        let base = frame.stack_base;
+        let v = vm.stack[base + slot];
+        // Auto-deref SharedRef cells (mirrors Rust VM).
+        let dv = vm_deref(v);
+        vm.stack = push(vm.stack, dv);
+        return nil
+    };
+    if op == OP_LOAD_LOCAL_REF {
+        // Pass the cell itself (no deref) so callee can write-through.
+        let slot = fetch_u8(chunk, ip_box);
+        let base = frame.stack_base;
+        vm.stack = push(vm.stack, vm.stack[base + slot]);
+        return nil
+    };
+    if op == OP_STORE_LOCAL {
+        let slot = fetch_u8(chunk, ip_box);
+        let st = vm.stack;
+        let n = count(st);
+        let v = st[n - 1];
+        vm.stack = truncate_vec(st, n - 1);
+        let base = frame.stack_base;
+        vm_stack_set(vm, base + slot, v);
+        return nil
+    };
+    if op == OP_ASSIGN_LOCAL {
+        // Reassignment (x = ...). Mirrors Rust VM: if current slot holds a
+        // SharedRef cell, write-through (set .value); else replace.
+        let slot = fetch_u8(chunk, ip_box);
+        let st = vm.stack;
+        let n = count(st);
+        let v = st[n - 1];
+        vm.stack = truncate_vec(st, n - 1);
+        let base = frame.stack_base;
+        let cur = vm.stack[base + slot];
+        if is_shared_cell(cur) {
+            cur.value = v
+        } else {
+            vm_stack_set(vm, base + slot, v)
+        };
+        return nil
+    };
+
+    // --- upvalues ---
+    if op == OP_LOAD_UPVALUE {
+        let idx = fetch_u8(chunk, ip_box);
+        let clos = frame.closure;
+        let uv_id = clos.upvalues[idx];
+        let v = upvalue_read(vm, uv_id);
+        vm_push(vm, vm_deref(v));
+        return nil
+    };
+    if op == OP_LOAD_UPVALUE_REF {
+        let idx = fetch_u8(chunk, ip_box);
+        let clos = frame.closure;
+        let uv_id = clos.upvalues[idx];
+        let v = upvalue_read(vm, uv_id);
+        vm_push(vm, v);
+        return nil
+    };
+    if op == OP_STORE_UPVALUE {
+        let idx = fetch_u8(chunk, ip_box);
+        let v = vm_pop(vm);
+        let clos = frame.closure;
+        let uv_id = clos.upvalues[idx];
+        upvalue_write(vm, uv_id, v);
+        return nil
+    };
+    if op == OP_ASSIGN_UPVALUE {
+        let idx = fetch_u8(chunk, ip_box);
+        let v = vm_pop(vm);
+        let clos = frame.closure;
+        let uv_id = clos.upvalues[idx];
+        let cur = upvalue_read(vm, uv_id);
+        if is_shared_cell(cur) {
+            cur.value = v
+        } else {
+            upvalue_write(vm, uv_id, v)
+        };
+        return nil
+    };
+
+    // --- globals ---
+    if op == OP_LOAD_GLOBAL {
+        let idx = fetch_u8(chunk, ip_box);
+        let name = chunk.consts[idx];
+        let v = get(vm.globals, name);
+        if v == nil {
+            return { "status": "error", "msg": "undefined global: " + to_str(name) }
+        };
+        vm_push(vm, vm_deref(v));
+        return nil
+    };
+    if op == OP_LOAD_GLOBAL_REF {
+        // Pass the cell itself (no deref).
+        let idx = fetch_u8(chunk, ip_box);
+        let name = chunk.consts[idx];
+        let v = get(vm.globals, name);
+        if v == nil {
+            return { "status": "error", "msg": "undefined global: " + to_str(name) }
+        };
+        vm_push(vm, v);
+        return nil
+    };
+    if op == OP_DEFINE_GLOBAL {
+        let idx = fetch_u8(chunk, ip_box);
+        let name = chunk.consts[idx];
+        let v = vm_pop(vm);
+        vm.globals = assoc(vm.globals, name, v);
+        return nil
+    };
+    if op == OP_STORE_GLOBAL {
+        let idx = fetch_u8(chunk, ip_box);
+        let name = chunk.consts[idx];
+        let v = vm_pop(vm);
+        vm.globals = assoc(vm.globals, name, v);
+        return nil
+    };
+    if op == OP_ASSIGN_GLOBAL {
+        // Reassignment. Mirrors Rust VM: if current global holds a SharedRef
+        // cell, write-through (set .value); else rebind.
+        let idx = fetch_u8(chunk, ip_box);
+        let name = chunk.consts[idx];
+        let v = vm_pop(vm);
+        let cur = get(vm.globals, name);
+        if is_shared_cell(cur) {
+            cur.value = v
+        } else {
+            vm.globals = assoc(vm.globals, name, v)
+        };
+        return nil
+    };
+
+    // --- stack manipulation ---
+    if op == OP_POP {
+        vm_pop(vm);
+        return nil
+    };
+    if op == OP_POP_N {
+        let n = fetch_u8(chunk, ip_box);
+        let new_len = count(vm.stack) - n;
+        vm_truncate(vm, new_len);
+        return nil
+    };
+    if op == OP_POP_LOCAL_KEEP {
+        let n = fetch_u8(chunk, ip_box);
+        let top = vm_pop(vm);
+        let new_len = count(vm.stack) - n;
+        // Close open upvalues pointing into the region we're about to
+        // discard, BEFORE truncating. (Mirrors Rust VM: the locals must
+        // still be on the stack so their values can be captured.)
+        close_upvalues_above(vm, new_len);
+        vm_truncate(vm, new_len);
+        vm_push(vm, top);
+        return nil
+    };
+    if op == OP_DUP {
+        let v = vm_peek(vm);
+        vm_push(vm, v);
+        return nil
+    };
+
+    // --- collection literals ---
+    if op == OP_NEW_VEC {
+        let n = fetch_u8(chunk, ip_box);
+        let stack_len = count(vm.stack);
+        let start = stack_len - n;
+        let items = [];
+        let i = 0;
+        while i < n {
+            items = push(items, vm.stack[start + i]);
+            i = i + 1
+        };
+        vm_truncate(vm, start);
+        vm_push(vm, items);
+        return nil
+    };
+    if op == OP_NEW_MAP {
+        let n = fetch_u8(chunk, ip_box);
+        let stack_len = count(vm.stack);
+        let start = stack_len - 2 * n;
+        let m = {};
+        let i = 0;
+        while i < n {
+            let k = vm.stack[start + 2 * i];
+            let v = vm.stack[start + 2 * i + 1];
+            m = assoc(m, k, v);
+            i = i + 1
+        };
+        vm_truncate(vm, start);
+        vm_push(vm, m);
+        return nil
+    };
+    if op == OP_NEW_SET {
+        // Construct a proper Set via the `set` builtin (dedup + correct type).
+        let n = fetch_u8(chunk, ip_box);
+        let stack_len = count(vm.stack);
+        let start = stack_len - n;
+        let items = [];
+        let i = 0;
+        while i < n {
+            items = push(items, vm.stack[start + i]);
+            i = i + 1
+        };
+        vm_truncate(vm, start);
+        vm_push(vm, set(items));
+        return nil
+    };
+    if op == OP_SHARED_EXPR {
+        // Wrap the popped value in a SharedRef cell:
+        //   shared { "value": v, "__shared_cell__": true }
+        // OP_LOAD_LOCAL/UPVALUE/GLOBAL auto-deref such cells;
+        // OP_ASSIGN_* write-through (set .value).
+        let v = vm_pop(vm);
+        let cell = shared { "value": v, "__shared_cell__": true, "__cell_id__": vm.next_upvalue_id };
+        vm.next_upvalue_id = vm.next_upvalue_id + 1;
+        vm_push(vm, cell);
+        return nil
+    };
+
+    // --- arithmetic ---
+    // Inlined: cache stack once, do pop/pop/push inline to avoid
+    // vm_push/vm_pop function call overhead and repeated vm Map clones
+    // (each vm.stack access clones the 12-field vm Map).
+    if op == OP_ADD {
+        let st = vm.stack;
+        let n = count(st);
+        let b = st[n - 1];
+        let a = st[n - 2];
+        vm.stack = push(truncate_vec(st, n - 2), a + b);
+        return nil
+    };
+    if op == OP_SUB {
+        let st = vm.stack;
+        let n = count(st);
+        let b = st[n - 1];
+        let a = st[n - 2];
+        vm.stack = push(truncate_vec(st, n - 2), a - b);
+        return nil
+    };
+    if op == OP_MUL {
+        let st = vm.stack;
+        let n = count(st);
+        let b = st[n - 1];
+        let a = st[n - 2];
+        vm.stack = push(truncate_vec(st, n - 2), a * b);
+        return nil
+    };
+    if op == OP_DIV {
+        let st = vm.stack;
+        let n = count(st);
+        let b = st[n - 1];
+        let a = st[n - 2];
+        vm.stack = push(truncate_vec(st, n - 2), a / b);
+        return nil
+    };
+    if op == OP_MOD {
+        let st = vm.stack;
+        let n = count(st);
+        let b = st[n - 1];
+        let a = st[n - 2];
+        vm.stack = push(truncate_vec(st, n - 2), a % b);
+        return nil
+    };
+    if op == OP_NEG {
+        let st = vm.stack;
+        let n = count(st);
+        let a = st[n - 1];
+        vm.stack = push(truncate_vec(st, n - 1), -a);
+        return nil
+    };
+    if op == OP_NOT {
+        let st = vm.stack;
+        let n = count(st);
+        let a = st[n - 1];
+        let nv = if is_truthy(a) { false } else { true };
+        vm.stack = push(truncate_vec(st, n - 1), nv);
+        return nil
+    };
+
+    // --- comparison ---
+    if op == OP_EQ {
+        let st = vm.stack;
+        let n = count(st);
+        let b = st[n - 1];
+        let a = st[n - 2];
+        vm.stack = push(truncate_vec(st, n - 2), a == b);
+        return nil
+    };
+    if op == OP_NEQ {
+        let st = vm.stack;
+        let n = count(st);
+        let b = st[n - 1];
+        let a = st[n - 2];
+        vm.stack = push(truncate_vec(st, n - 2), a != b);
+        return nil
+    };
+    if op == OP_LT {
+        let st = vm.stack;
+        let n = count(st);
+        let b = st[n - 1];
+        let a = st[n - 2];
+        vm.stack = push(truncate_vec(st, n - 2), a < b);
+        return nil
+    };
+    if op == OP_GT {
+        let st = vm.stack;
+        let n = count(st);
+        let b = st[n - 1];
+        let a = st[n - 2];
+        vm.stack = push(truncate_vec(st, n - 2), a > b);
+        return nil
+    };
+    if op == OP_LTE {
+        let st = vm.stack;
+        let n = count(st);
+        let b = st[n - 1];
+        let a = st[n - 2];
+        vm.stack = push(truncate_vec(st, n - 2), a <= b);
+        return nil
+    };
+    if op == OP_GTE {
+        let st = vm.stack;
+        let n = count(st);
+        let b = st[n - 1];
+        let a = st[n - 2];
+        vm.stack = push(truncate_vec(st, n - 2), a >= b);
+        return nil
+    };
+
+    // --- index / field access ---
+    if op == OP_INDEX {
+        // Stack: [target, idx] → result
+        let idx = vm_pop(vm);
+        let target = vm_pop(vm);
+        // For Vec: integer index. For Map: key lookup (returns nil if missing).
+        if is_map(target) {
+            vm_push(vm, get(target, idx));
+            return nil
+        };
+        // Vec index
+        let v = target[idx];
+        vm_push(vm, v);
+        return nil
+    };
+    if op == OP_INDEX_ASSIGN {
+        // Stack: [value, coll, idx] → new_coll
+        let idx = vm_pop(vm);
+        let coll = vm_pop(vm);
+        let value = vm_pop(vm);
+        let new_coll = assoc(coll, idx, value);
+        vm_push(vm, new_coll);
+        return nil
+    };
+    if op == OP_FIELD {
+        // field name is a constant
+        let idx = fetch_u8(chunk, ip_box);
+        let name = chunk.consts[idx];
+        let target = vm_pop(vm);
+        // For Map: field access = key lookup with string key
+        if is_map(target) {
+            vm_push(vm, get(target, name));
+            return nil
+        };
+        // For other types: error (no struct support yet)
+        return { "status": "error", "msg": "field access on non-map value" }
+    };
+    if op == OP_FIELD_ASSIGN {
+        // FieldAssign: pops value and target, pushes nil (per Rust VM)
+        let _idx = fetch_u8(chunk, ip_box);
+        let _value = vm_pop(vm);
+        let _target = vm_pop(vm);
+        vm_push(vm, nil);
+        return nil
+    };
+
+    // --- stack manipulation (extra) ---
+    if op == OP_SWAP {
+        let n = count(vm.stack);
+        let a = vm.stack[n - 1];
+        let b = vm.stack[n - 2];
+        vm.stack = assoc(vm.stack, n - 1, b);
+        vm.stack = assoc(vm.stack, n - 2, a);
+        return nil
+    };
+    if op == OP_ROT3 {
+        // [a, b, c] → [b, c, a]
+        let n = count(vm.stack);
+        let a = vm.stack[n - 3];
+        let b = vm.stack[n - 2];
+        let c = vm.stack[n - 1];
+        vm.stack = assoc(vm.stack, n - 3, b);
+        vm.stack = assoc(vm.stack, n - 2, c);
+        vm.stack = assoc(vm.stack, n - 1, a);
+        return nil
+    };
+
+    // --- jumps ---
+    if op == OP_JUMP {
+        let addr = fetch_u16(chunk, ip_box);
+        ip_box.val = addr;
+        return nil
+    };
+    if op == OP_JUMP_IF_FALSE {
+        let addr = fetch_u16(chunk, ip_box);
+        let v = vm_pop(vm);
+        if not is_truthy(v) {
+            ip_box.val = addr
+        };
+        return nil
+    };
+    if op == OP_JUMP_IF_TRUE {
+        let addr = fetch_u16(chunk, ip_box);
+        let v = vm_pop(vm);
+        if is_truthy(v) {
+            ip_box.val = addr
+        };
+        return nil
+    };
+    if op == OP_LOOP {
+        let addr = fetch_u16(chunk, ip_box);
+        ip_box.val = addr;
+        return nil
+    };
+
+    // --- loop handlers ---
+    if op == OP_PUSH_LOOP {
+        let continue_addr = fetch_u16(chunk, ip_box);
+        let break_addr = fetch_u16(chunk, ip_box);
+        let h = shared {
+            "continue_addr": continue_addr,
+            "break_addr": break_addr,
+            "stack_depth": count(vm.stack),
+            "frame_depth": count(vm.frames)
+        };
+        vm.loop_handlers = push(vm.loop_handlers, h);
+        return nil
+    };
+    if op == OP_POP_LOOP {
+        vm.loop_handlers = pop_last(vm.loop_handlers);
+        return nil
+    };
+
+    // --- closures ---
+    if op == OP_CLOSURE {
+        let chunk_idx = fetch_u8(chunk, ip_box);
+        let cur_clos = frame.closure;
+        let sub_chunk = cur_clos.chunk.sub_chunks[chunk_idx];
+        let upvalue_count = sub_chunk.upvalue_count;
+        let upvalues = [];
+        let i = 0;
+        while i < upvalue_count {
+            let is_local = fetch_u8(chunk, ip_box);
+            let index = fetch_u8(chunk, ip_box);
+            if is_local == 1 {
+                // Capture a local of the current frame as a new open upvalue.
+                let base = frame.stack_base;
+                let stack_idx = base + index;
+                let uv_id = alloc_upvalue(vm, true, stack_idx, nil);
+                vm.open_upvalues = push(vm.open_upvalues, uv_id);
+                upvalues = push(upvalues, uv_id)
+            } else {
+                // Capture an upvalue of the current closure (reuse ID).
+                let uv_id = cur_clos.upvalues[index];
+                upvalues = push(upvalues, uv_id)
+            };
+            i = i + 1
+        };
+        let closure = { "chunk": sub_chunk, "upvalues": upvalues };
+        vm_push(vm, closure);
+        return nil
+    };
+
+    // --- calls ---
+    if op == OP_CALL {
+        let nargs = fetch_u8(chunk, ip_box);
+        let stack_len = count(vm.stack);
+        // stack layout: [..., callee, arg0, ..., arg_{nargs-1}]
+        let callee_idx = stack_len - 1 - nargs;
+        let callee = vm.stack[callee_idx];
+        // extract args
+        let args = [];
+        let i = 0;
+        while i < nargs {
+            args = push(args, vm.stack[callee_idx + 1 + i]);
+            i = i + 1
+        };
+        // pop callee + args off the stack
+        vm_truncate(vm, callee_idx);
+        return call_value(vm, callee, args)
+    };
+    if op == OP_CONSTRUCT_VARIANT {
+        // Mirrors Rust VM OpCode::ConstructVariant:
+        //   name_idx (u8), nargs (u8)
+        // Pops `nargs` args off the stack, pushes
+        //   { "__variant__": name, "args": [...args] }
+        let name_idx = fetch_u8(chunk, ip_box);
+        let nargs = fetch_u8(chunk, ip_box);
+        let name = chunk.consts[name_idx];
+        let stack_len = count(vm.stack);
+        let start = stack_len - nargs;
+        let args = [];
+        let i = 0;
+        while i < nargs {
+            args = push(args, vm.stack[start + i]);
+            i = i + 1
+        };
+        vm_truncate(vm, start);
+        vm_push(vm, { "__variant__": name, "args": args });
+        return nil
+    };
+    if op == OP_CONSTRUCT_STRUCT {
+        // Mirrors Rust VM OpCode::ConstructStruct:
+        //   name_idx (u8), nargs (u8, must be 1)
+        // Pops the Map argument, pushes the map directly as the struct value.
+        // (1y has no distinct Struct type; we use the Map as-is, so field access
+        //  and Struct pattern matching work without special-casing. The struct
+        //  name is consumed but not stored — 1y is dynamically typed.)
+        let name_idx = fetch_u8(chunk, ip_box);
+        let nargs = fetch_u8(chunk, ip_box);
+        let name = chunk.consts[name_idx];
+        if nargs != 1 {
+            return { "status": "error", "msg": "ConstructStruct: expected 1 arg, got " + to_str(nargs) }
+        };
+        let map_val = vm_pop(vm);
+        if not is_map(map_val) {
+            return { "status": "error", "msg": "ConstructStruct: expected Map, got " + to_str(map_val) }
+        };
+        vm_push(vm, map_val);
+        return nil
+    };
+    if op == OP_METHOD_CALL {
+        // Mirrors Rust VM OpCode::MethodCall:
+        //   method_idx (u8), nargs (u8)
+        // Stack: [recv, arg0, ..., arg_{nargs-1}]
+        let m_idx = fetch_u8(chunk, ip_box);
+        let nargs = fetch_u8(chunk, ip_box);
+        let method_name = chunk.consts[m_idx];
+        let stack_len = count(vm.stack);
+        let args_start = stack_len - nargs;
+        // extract args
+        let args = [];
+        let i = 0;
+        while i < nargs {
+            args = push(args, vm.stack[args_start + i]);
+            i = i + 1
+        };
+        // pop args, then recv
+        vm_truncate(vm, args_start);
+        let recv = vm_pop(vm);
+        // Module dispatch: if recv is a map with "__module__" field, look up
+        // method_name in recv.exports and call WITHOUT receiver as first arg.
+        if is_map(recv) and has_key(recv, "__module__") {
+            let exports = get(recv, "exports");
+            let func = get(exports, method_name);
+            if func == nil {
+                return { "status": "error", "msg": "module has no export: " + to_str(method_name) }
+            };
+            // Call WITHOUT receiver.
+            return call_value(vm, func, args)
+        };
+        // Default: look up method_name as a global, call WITH receiver as
+        // the first argument.
+        let callee = get(vm.globals, method_name);
+        if callee == nil {
+            return { "status": "error", "msg": "undefined method: " + to_str(method_name) }
+        };
+        // Build [recv, ...args]
+        let fa = [recv];
+        let k = 0;
+        while k < nargs {
+            fa = push(fa, args[k]);
+            k = k + 1
+        };
+        return call_value(vm, callee, fa)
+    };
+
+    // --- return ---
+    if op == OP_RETURN {
+        let ret = vm_pop(vm);
+        return_from_frame(vm, ret);
+        return nil
+    };
+    if op == OP_RETURN_SIGNAL {
+        let has_value = fetch_u16(chunk, ip_box);
+        let v = if has_value != 0 { vm_pop(vm) } else { nil };
+        return { "status": "return", "value": v }
+    };
+
+    // --- break / continue ---
+    if op == OP_BREAK {
+        let has_value = fetch_u16(chunk, ip_box);
+        let v = if has_value != 0 { vm_pop(vm) } else { nil };
+        return { "status": "break", "value": v }
+    };
+    if op == OP_CONTINUE {
+        fetch_u16(chunk, ip_box);  // reserved
+        return { "status": "continue" }
+    };
+
+    // --- pattern matching ---
+    if op == OP_MATCH {
+        let pat_idx = fetch_u8(chunk, ip_box);
+        let pat = chunk.patterns[pat_idx];
+        let value = vm_pop(vm);
+        let r = vm_match(pat, value);
+        if get(r, "matched") {
+            // Push bindings in order, then true.
+            let bindings = get(r, "bindings");
+            let n = count(bindings);
+            let i = 0;
+            while i < n {
+                vm_push(vm, bindings[i]);
+                i = i + 1
+            };
+            vm_push(vm, true)
+        } else {
+            vm_push(vm, false)
+        };
+        return nil
+    };
+
+    // --- exceptions ---
+    if op == OP_RAISE {
+        let v = vm_pop(vm);
+        return { "status": "exception", "value": v }
+    };
+    if op == OP_PUSH_TRY {
+        let rescue_pc = fetch_u16(chunk, ip_box);
+        let ensure_pc = fetch_u16(chunk, ip_box);
+        let h = shared {
+            "rescue_pc": if rescue_pc == 0 { nil } else { rescue_pc },
+            "ensure_pc": if ensure_pc == 0 { nil } else { ensure_pc },
+            "stack_depth": count(vm.stack),
+            "frame_depth": count(vm.frames)
+        };
+        vm.exception_handlers = push(vm.exception_handlers, h);
+        return nil
+    };
+    if op == OP_POP_TRY {
+        vm.exception_handlers = pop_last(vm.exception_handlers);
+        return nil
+    };
+    if op == OP_RESCUE_MATCH {
+        let type_idx = fetch_u8(chunk, ip_box);
+        let exc = vm_peek(vm);
+        let matches = false;
+        if type_idx == 0 {
+            // catch-all
+            matches = true
+        } else {
+            let type_name = chunk.consts[type_idx];
+            // Check if exc is a Variant or Struct with matching name.
+            if is_map(exc) {
+                if has_key(exc, "__variant__") {
+                    matches = exc.__variant__ == type_name
+                } else {
+                    if has_key(exc, "__struct__") {
+                        matches = exc.__struct__ == type_name
+                    }
+                }
+            }
+        };
+        vm_push(vm, matches);
+        return nil
+    };
+    if op == OP_CLEAR_PENDING {
+        vm.has_pending_exception = false;
+        vm.pending_exception = nil;
+        return nil
+    };
+    if op == OP_ENSURE_EXIT {
+        if vm.has_pending_exception {
+            let v = vm.pending_exception;
+            vm.has_pending_exception = false;
+            vm.pending_exception = nil;
+            return { "status": "exception", "value": v }
+        };
+        // Else: no-op.
+        return nil
+    };
+    if op == OP_IMPORT {
+        let path_idx = fetch_u8(chunk, ip_box);
+        let alias_idx = fetch_u8(chunk, ip_box);
+        let is_lazy = fetch_u8(chunk, ip_box) != 0;
+        let path = chunk.consts[path_idx];
+        let alias = nil;
+        if alias_idx != 0 {
+            alias = chunk.consts[alias_idx]
+        };
+        // Resolve the module value.
+        let mod_val = nil;
+        if not is_lazy {
+            // Check cache first.
+            if has_key(vm.modules_cache, path) {
+                mod_val = vm.modules_cache[path]
+            } else {
+                if vm.module_loader != nil {
+                    mod_val = vm.module_loader(path);
+                    vm.modules_cache = assoc(vm.modules_cache, path, mod_val)
+                }
+            }
+        } else {
+            // Lazy import: defer; bind nil for now (no LazyImport value type in 1y).
+            mod_val = nil
+        };
+        // Bind according to alias / dotted path rules (mirrors Rust VM bind_current).
+        let is_script = frame.closure.name == "<script>";
+        let bind_name = path;
+        if alias != nil {
+            bind_name = alias
+        } else {
+            // Simple name: take last segment after '.'.
+            // (Rust VM takes first segment for dotted paths and builds a namespace tree;
+            //  we approximate by binding the last segment to the module directly.)
+            let segs = split(path, ".");
+            let nsegs = count(segs);
+            if nsegs > 0 {
+                bind_name = segs[nsegs - 1]
+            }
+        };
+        if is_script {
+            vm.globals = assoc(vm.globals, bind_name, mod_val)
+        } else {
+            // Push onto current frame's stack as a fresh local.
+            vm_push(vm, mod_val)
+        };
+        return nil
+    };
+
+    { "status": "error", "msg": "unknown opcode: " + to_str(op) }
+}
+
+// Call a native 1y func with args (dispatch by arity, up to 8 args).
+fn call_native(callee, args) {
+    let n = count(args);
+    if n == 0 { return callee() };
+    if n == 1 { return callee(args[0]) };
+    if n == 2 { return callee(args[0], args[1]) };
+    if n == 3 { return callee(args[0], args[1], args[2]) };
+    if n == 4 { return callee(args[0], args[1], args[2], args[3]) };
+    if n == 5 { return callee(args[0], args[1], args[2], args[3], args[4]) };
+    if n == 6 { return callee(args[0], args[1], args[2], args[3], args[4], args[5]) };
+    if n == 7 { return callee(args[0], args[1], args[2], args[3], args[4], args[5], args[6]) };
+    callee(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7])
+}
+
+// Dispatch a call to `callee` (closure map or native func) with `args`.
+// Assumes callee + args have already been popped off the stack; this
+// helper pushes args back as locals (for closure calls) or invokes the
+// native directly. Returns a step status map.
+fn call_value(vm, callee, args) {
+    let nargs = count(args);
+    if is_map(callee) and has_key(callee, "chunk") {
+        // closure call: push args as locals, push frame.
+        // Args keep their SharedRef cells (if any) so the function body
+        // can write-through via ASSIGN_LOCAL.
+        let base = count(vm.stack);
+        let j = 0;
+        while j < nargs {
+            vm_push(vm, args[j]);
+            j = j + 1
+        };
+        let new_f = new_frame(callee, 0, base);
+        vm.frames = push(vm.frames, new_f);
+        return nil
+    };
+    if is_func(callee) {
+        // Native call: 1y builtins don't know about __shared_cell__, so
+        // deref any shared-cell args before calling.
+        let derefd_args = [];
+        let j = 0;
+        while j < nargs {
+            derefd_args = push(derefd_args, vm_deref(args[j]));
+            j = j + 1
+        };
+        let result = call_native(callee, derefd_args);
+        vm_push(vm, result);
+        return nil
+    };
+    { "status": "error", "msg": "call non-callable value" }
+}
+
+// ---------- Main run loop ----------
+
+fn run_chunk(vm, chunk) {
+    let closure = { "chunk": chunk, "upvalues": [] };
+    let f = new_frame(closure, 0, 0);
+    vm.frames = push(vm.frames, f);
+
+    loop {
+        if count(vm.frames) == 0 { break };
+        let s = step(vm);
+        // Fast path: step returned nil for OK status (most common case,
+        // avoids per-opcode Map construction).
+        if s == nil { continue };
+        let status = get(s, "status");
+        if status == "return" {
+            let v = get(s, "value");
+            if count(vm.frames) > 1 {
+                return_from_frame(vm, v)
+            } else {
+                // script frame — pop it, push v, break
+                vm.frames = pop_last(vm.frames);
+                vm_push(vm, v)
+            }
+        } else if status == "break" {
+            let r = handle_break(vm, get(s, "value"));
+            if r != nil {
+                println("runtime error: " + to_str(get(r, "msg")));
+                vm.frames = []
+            }
+        } else if status == "continue" {
+            let r = handle_continue(vm);
+            if r != nil {
+                println("runtime error: " + to_str(get(r, "msg")));
+                vm.frames = []
+            }
+        } else if status == "exception" {
+            // Raised exception — find handler or propagate.
+            let exc_val = get(s, "value");
+            let r = handle_exception(vm, exc_val);
+            if r == nil {
+                // Handler found, jumped to rescue/ensure pc. Continue stepping.
+            } else if get(r, "status") == "uncaught" {
+                println("uncaught exception: " + to_str(get(r, "value")));
+                vm.frames = []
+            }
+        } else if status == "error" {
+            println("runtime error: " + to_str(get(s, "msg")));
+            vm.frames = []
+        }
+    };
+
+    // result is top of stack
+    let n = count(vm.stack);
+    if n > 0 { vm.stack[n - 1] } else { nil }
+}
+
+// ---------- High-level entry: compile + run ----------
+
+fn run_source(src) {
+    let toks = lex(src);
+    let prog = parse(toks);
+    let chunk = compile_program(prog);
+    let vm = new_vm();
+    run_chunk(vm, chunk)
+}

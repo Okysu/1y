@@ -1,0 +1,4 @@
+// Test that import statements don't crash (modules bound to nil without a loader).
+import io;
+let r = 1 + 2;
+println("r = " + to_str(r))

@@ -104,6 +104,10 @@ When `!` (ActorSend) queues a message containing a closure, the VM eagerly close
 
 ## Future Work
 
-- VM support for `for`, `break`/`continue`, string interpolation, `try`/`transact` (see [Bytecode VM](../philosophy/bytecode-vm) — "What's Not Yet in the VM")
-- Tail-call optimization for deeper recursion in the VM
+- Tail-call optimization in the VM for deeper recursion
 - Multi-threaded VM (currently single-threaded; the tree-walker's `parallel` module is not yet VM-aware)
+- Byte type and byte buffer (the self-hosted VM currently uses `Vec<Int>` for bytecode)
+
+> **Done**: self-hosting the 1y VM in 1y — see [Bytecode VM](../philosophy/bytecode-vm#self-bootstrapping)
+> and `bootstrap/selfvm.1y`. `1y selfvm <file.1y>` now runs the full
+> lex → parse → compile → VM pipeline implemented in 1y itself.

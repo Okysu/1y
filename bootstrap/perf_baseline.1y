@@ -1,0 +1,45 @@
+// perf_baseline.1y — performance baseline benchmark
+// Run with: 1y run bootstrap/perf_baseline.1y
+// Measures: tight arithmetic loop, recursive fib, string build.
+
+fn bench_arith(n) {
+    let i = 0;
+    let acc = 0;
+    while i < n {
+        acc = acc + i * 2 - 1;
+        i = i + 1
+    };
+    acc
+}
+
+fn bench_fib(n) {
+    if n < 2 { return n };
+    bench_fib(n - 1) + bench_fib(n - 2)
+}
+
+fn bench_string(n) {
+    let i = 0;
+    let s = "";
+    while i < n {
+        s = s + "x";
+        i = i + 1
+    };
+    count(s)
+}
+
+println("--- perf baseline ---");
+let t0 = 0;  // 1y has no clock builtin; we measure externally via cargo run timing
+
+// 1. arithmetic: 1_000_000 iterations
+let r1 = bench_arith(1000000);
+println("arith 1M: " + to_str(r1));
+
+// 2. fib(25) recursive
+let r2 = bench_fib(25);
+println("fib(25): " + to_str(r2));
+
+// 3. string build 10_000 chars
+let r3 = bench_string(10000);
+println("string 10k: " + to_str(r3));
+
+r1 + r2 + r3
